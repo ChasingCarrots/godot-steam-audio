@@ -40,18 +40,11 @@ void SteamAudioServer::tick() {
 			continue;
 		}
 
-		Vector3 src_pos = ls->src.player->get_global_position();
-		ls->dir_to_listener = src_pos - self->listener->get_global_position();
-
 		IPLDistanceAttenuationModel attn_model{};
 		attn_model.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
 		attn_model.minDistance = ls->cfg.min_attn_dist;
 
-		IPLCoordinateSpace3 src_coords;
-		src_coords.ahead = IPLVector3{};
-		src_coords.up = IPLVector3{};
-		src_coords.right = IPLVector3{};
-		src_coords.origin = ipl_vec3_from(src_pos);
+		IPLCoordinateSpace3 src_coords = ipl_coords_from(ls->src.player->get_global_transform());
 
 		IPLSimulationInputs inputs{};
 		inputs.flags = IPL_SIMULATIONFLAGS_DIRECT;
@@ -67,7 +60,7 @@ void SteamAudioServer::tick() {
 		inputs.numTransmissionRays = ls->cfg.transm_rays;
 
 		SteamAudio::log(SteamAudio::log_debug, "tick: setting inputs");
-		iplSourceSetInputs(ls->src.src, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+		iplSourceSetInputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
 	}
 	SteamAudio::log(SteamAudio::log_debug, "tick: direct inputs set");
 
@@ -89,7 +82,7 @@ void SteamAudioServer::tick() {
 		}
 
 		IPLSimulationOutputs outputs{};
-		iplSourceGetOutputs(ls->src.src, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 		ls->direct_outputs = outputs.direct;
 	}
 
@@ -98,7 +91,7 @@ void SteamAudioServer::tick() {
 		return;
 	}
 
-	global_state.refl_ir_lock.lock();
+	global_state.simulation_lock.lock();
 	for (auto ls : local_states) {
 		if (ls->src.player == nullptr) {
 			UtilityFunctions::push_warning(
@@ -113,10 +106,10 @@ void SteamAudioServer::tick() {
 		}
 
 		IPLSimulationOutputs outputs;
-		iplSourceGetOutputs(ls->src.src, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
 		ls->refl_outputs = outputs.reflections;
 	}
-	global_state.refl_ir_lock.unlock();
+	global_state.simulation_lock.unlock();
 
 	for (auto ls : self->local_states) {
 		if (ls->src.player == nullptr) {
@@ -141,7 +134,7 @@ void SteamAudioServer::tick() {
 		inputs.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
 		inputs.source = src_coords;
 
-		iplSourceSetInputs(ls->src.src, IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
+		iplSourceSetInputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
 	}
 
 	shared_inputs = IPLSimulationSharedInputs{};

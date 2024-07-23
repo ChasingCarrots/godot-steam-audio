@@ -32,12 +32,12 @@ struct GlobalSteamAudioState {
 	IPLSimulationSettings sim_cfg;
 	IPLSimulator sim;
 	IPLCoordinateSpace3 listener_coords;
-	std::mutex refl_ir_lock;
+	std::mutex simulation_lock;
 };
 
 struct SteamAudioSource {
 	AudioStreamPlayer3D *player = nullptr;
-	IPLSource src;
+	IPLSource simulationSource;
 };
 
 struct SteamAudioSourceConfig {
@@ -51,34 +51,40 @@ struct SteamAudioSourceConfig {
 	bool is_ambisonics_on;
 	bool is_occlusion_on;
 	bool is_reflection_on;
+	bool is_air_absorption_on;
+	bool is_directivity_on;
+	float directivity_dipole_weight;
+	float directivity_dipole_power;
+	bool is_transmission_on;
+	int transmission_type;
+	bool is_binaural_on;
 };
 
 struct SteamAudioEffects {
+	IPLPanningEffect panning;
 	IPLDirectEffect direct;
+	IPLBinauralEffect binaural;
 	IPLReflectionEffect refl;
-	IPLAmbisonicsDecodeEffect dec;
-	IPLAmbisonicsDecodeEffect refl_dec;
-	IPLAmbisonicsEncodeEffect enc;
+	IPLAmbisonicsDecodeEffect ambisonics;
 };
 
 struct LocalSteamAudioBuffers {
 	IPLAudioBuffer in;
 	IPLAudioBuffer direct;
 	IPLAudioBuffer mono;
-	IPLAudioBuffer refl_ambi;
+	IPLAudioBuffer refl;
 	IPLAudioBuffer refl_out;
-	IPLAudioBuffer ambi;
 	IPLAudioBuffer out;
 };
 
 struct LocalSteamAudioState {
 	SteamAudioSource src;
-	Vector3 dir_to_listener;
-	IPLDirectEffectParams direct_outputs{ {} };
-	IPLReflectionEffectParams refl_outputs{ {} };
+	IPLDirectEffectParams direct_outputs {};
+	IPLReflectionEffectParams refl_outputs {};
 	LocalSteamAudioBuffers bufs;
 	SteamAudioEffects fx;
 	SteamAudioSourceConfig cfg;
+	IPLHRTFInterpolation hrtfInterpolation;
 	std::shared_mutex mux;
 };
 

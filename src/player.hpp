@@ -63,6 +63,12 @@ public:
 	void set_ambisonics_order(int p_ambisonics_order);
 	float get_max_reflection_dist();
 	void set_max_reflection_dist(float p_max_reflection_dist);
+	float get_directivity_dipole_weight();
+	void set_directivity_dipole_weight(float p_directivity_dipole_weight);
+	float get_directivity_dipole_power();
+	void set_directivity_dipole_power(float p_directivity_dipole_power);
+	int get_transmission_type();
+	void set_transmission_type(int p_transmission_type);
 
 	bool is_dist_attn_on();
 	void set_dist_attn_on(bool p_dist_attn_on);
@@ -70,6 +76,14 @@ public:
 	void set_reflection_on(bool p_reflection_on);
 	bool is_occlusion_on();
 	void set_occlusion_on(bool p_occlusion_on);
+	bool is_air_absorption_on();
+	void set_air_absorption_on(bool p_air_absorption_on);
+	bool is_directivity_on();
+	void set_directivity_on(bool p_directivity_on);
+	bool is_transmission_on();
+	void set_transmission_on(bool p_transmission_on);
+	bool is_binaural_on();
+	void set_binaural_on(bool p_binaural_on);
 
 	void play_stream(const Ref<AudioStream> &p_stream, float p_from_offset, float p_volume_db, float p_pitch_scale);
 	Ref<AudioStream> get_inner_stream();

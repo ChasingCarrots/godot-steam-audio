@@ -8,6 +8,7 @@
 #include <phonon.h>
 #include <godot_cpp/core/object.hpp>
 #include <godot_cpp/core/property_info.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 
 SteamAudioStream::SteamAudioStream() {}
 SteamAudioStream::~SteamAudioStream() {}
@@ -31,6 +32,84 @@ Ref<AudioStream> SteamAudioStream::get_stream() { return this->stream; }
 
 SteamAudioStreamPlayback::SteamAudioStreamPlayback() {}
 SteamAudioStreamPlayback::~SteamAudioStreamPlayback() {}
+
+IPLDirectEffectParams getDirectParams(GlobalSteamAudioState* gs,
+									  LocalSteamAudioState* ls,
+                                      IPLCoordinateSpace3 source,
+                                      IPLCoordinateSpace3 listener)
+{
+	auto params = ls->direct_outputs;
+
+    params.transmissionType = ls->cfg.transmission_type == 0
+		? IPL_TRANSMISSIONTYPE_FREQINDEPENDENT
+		: IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+
+    params.flags = static_cast<IPLDirectEffectFlags>(0);
+    if (!ls->cfg.is_dist_attn_on)
+    {
+        params.distanceAttenuation = 1.0f;
+    }
+    else
+    {
+    	params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
+        IPLDistanceAttenuationModel distanceAttenuationModel{};
+        distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
+    	distanceAttenuationModel.minDistance = ls->cfg.min_attn_dist;
+
+        params.distanceAttenuation = iplDistanceAttenuationCalculate(gs->ctx, source.origin, listener.origin, &distanceAttenuationModel);
+    }
+
+    if (!ls->cfg.is_air_absorption_on)
+    {
+        params.airAbsorption[0] = 1.0f;
+        params.airAbsorption[1] = 1.0f;
+        params.airAbsorption[2] = 1.0f;
+    }
+    else
+    {
+    	params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
+        IPLAirAbsorptionModel airAbsorptionModel{};
+        airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+
+        iplAirAbsorptionCalculate(gs->ctx, source.origin, listener.origin, &airAbsorptionModel, params.airAbsorption);
+    }
+
+    if (!ls->cfg.is_directivity_on)
+    {
+        params.directivity = 1.0f;
+    }
+    else
+    {
+        params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY);
+        IPLDirectivity directivity{};
+        directivity.dipoleWeight = ls->cfg.directivity_dipole_weight;
+        directivity.dipolePower = ls->cfg.directivity_dipole_power;
+
+        params.directivity = iplDirectivityCalculate(gs->ctx, source, listener.origin, &directivity);
+    }
+
+    if (!ls->cfg.is_occlusion_on)
+    {
+        params.occlusion = 1.0f;
+    }
+    else
+    {
+        params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
+    }
+
+    if (!ls->cfg.is_transmission_on)
+    {
+        params.transmission[0] = 1.0f;
+        params.transmission[1] = 1.0f;
+        params.transmission[2] = 1.0f;
+    }
+    else
+    {
+    	params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+    }
+
+    return params;
+}
 
 int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, int32_t frames) {
 	if (parent == nullptr) {
@@ -66,6 +145,10 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, in
 	if (ls == nullptr || !ls->src.player) {
 		return frames;
 	}
+	auto sourceCoordinates = ipl_coords_from(ls->src.player->get_global_transform());
+	auto listenerCoordinates = gs->listener_coords;
+	auto sourcePosition = sourceCoordinates.origin;
+	auto direction = iplCalculateRelativeDirection(gs->ctx, sourcePosition, listenerCoordinates.origin, listenerCoordinates.ahead, listenerCoordinates.up);
 
 	PackedVector2Array mixed_frames = stream_playback->get_raw_audio(rate_scale, frames);
 	frames = int(mixed_frames.size());
@@ -75,64 +158,58 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, in
 		ls->bufs.in.data[1][i] = mixed_frames[i].y;
 	}
 
-	if (ls->cfg.is_dist_attn_on) {
-		ls->direct_outputs.flags = static_cast<IPLDirectEffectFlags>(
-				ls->direct_outputs.flags |
-				IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
-	}
-	if (ls->cfg.is_occlusion_on) {
-		ls->direct_outputs.flags = static_cast<IPLDirectEffectFlags>(
-				ls->direct_outputs.flags |
-				IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-				IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
-	}
+	IPLDirectEffectParams directParams = getDirectParams(gs, ls, sourceCoordinates, listenerCoordinates);
 
-	if (ls->direct_outputs.flags != 0) {
-		iplDirectEffectApply(
-				ls->fx.direct, &ls->direct_outputs,
-				&ls->bufs.in, &ls->bufs.direct);
+	iplDirectEffectApply(
+			ls->fx.direct, &directParams,
+			&ls->bufs.in, &ls->bufs.direct);
+
+	if (ls->cfg.is_binaural_on) {
+		IPLBinauralEffectParams binauralParams{};
+		binauralParams.direction = direction;
+		binauralParams.interpolation = ls->hrtfInterpolation;
+		binauralParams.spatialBlend = 1.0f;
+		// TODO the steamaudio fmod plugin uses 2 hrtfs here, maybe we need that as well?
+		binauralParams.hrtf = gs->hrtf;
+
+		iplBinauralEffectApply(ls->fx.binaural, &binauralParams, &ls->bufs.direct, &ls->bufs.out);
 	} else {
-		iplAudioBufferMix(gs->ctx, &ls->bufs.in, &ls->bufs.direct);
+		iplAudioBufferDownmix(gs->ctx, &ls->bufs.direct, &ls->bufs.mono);
+
+		IPLPanningEffectParams panningParams{};
+		panningParams.direction = direction;
+
+		iplPanningEffectApply(ls->fx.panning, &panningParams, &ls->bufs.mono, &ls->bufs.out);
 	}
 
-	IPLAmbisonicsDecodeEffectParams dec_params{};
-	dec_params.orientation = gs->listener_coords;
-	dec_params.order = ls->cfg.ambisonics_order;
-	dec_params.hrtf = gs->hrtf;
-	dec_params.binaural = IPL_TRUE;
+	gs->simulation_lock.lock();
+	if(ls->src.simulationSource && ls->cfg.is_reflection_on /* TODO: || pathing_on */) {
+		if (ls->cfg.is_reflection_on && ls->refl_outputs.ir != nullptr) {
+			iplAudioBufferDownmix(gs->ctx, &ls->bufs.in, &ls->bufs.mono);
+			IPLReflectionEffectParams reflectionParams = ls->refl_outputs;
+			reflectionParams.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+			reflectionParams.numChannels = ambisonic_channels_from(ls->cfg.ambisonics_order);
+			reflectionParams.irSize = (int)UtilityFunctions::ceili(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
+			reflectionParams.tanDevice = nullptr;
 
-	if (ls->cfg.is_ambisonics_on) {
-		IPLAmbisonicsEncodeEffectParams enc_params{};
-		enc_params.direction = ipl_vec3_from(ls->dir_to_listener);
-		enc_params.order = ls->cfg.ambisonics_order;
-		iplAmbisonicsEncodeEffectApply(
-				ls->fx.enc, &enc_params,
-				&ls->bufs.direct, &ls->bufs.ambi);
+			iplReflectionEffectApply(ls->fx.refl, &reflectionParams, &ls->bufs.mono, &ls->bufs.refl, nullptr);
+			SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
+			IPLAmbisonicsDecodeEffectParams ambisonicsParams;
+			ambisonicsParams.order = ls->cfg.ambisonics_order;
+			ambisonicsParams.hrtf = gs->hrtf;
+			ambisonicsParams.orientation = listenerCoordinates;
+			ambisonicsParams.binaural = IPL_TRUE;
 
-		iplAmbisonicsDecodeEffectApply(
-				ls->fx.dec, &dec_params,
-				&ls->bufs.ambi, &ls->bufs.out);
-		SteamAudio::log(SteamAudio::log_debug, "mixing: finished ambisonics");
-	} else {
-		iplAudioBufferMix(gs->ctx, &ls->bufs.direct, &ls->bufs.out);
+			iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.refl_out);
+
+			iplAudioBufferMix(gs->ctx, &ls->bufs.refl_out, &ls->bufs.out);
+		}
+
+		// TODO: skipped the "PathingEffect" for now, but here would be the place.
+		// (line 1420 in fmod/src/spatialize_effect.cpp)
 	}
+	gs->simulation_lock.unlock();
 
-	gs->refl_ir_lock.lock();
-	if (ls->refl_outputs.ir != nullptr && ls->cfg.is_reflection_on) {
-		iplAudioBufferDownmix(gs->ctx, &ls->bufs.in, &ls->bufs.mono);
-		ls->refl_outputs.numChannels = ambisonic_channels_from(ls->cfg.ambisonics_order);
-		ls->refl_outputs.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-		ls->refl_outputs.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
-		iplReflectionEffectApply(ls->fx.refl, &ls->refl_outputs, &ls->bufs.mono, &ls->bufs.refl_ambi, nullptr);
-
-		iplAmbisonicsDecodeEffectApply(
-				ls->fx.refl_dec, &dec_params,
-				&ls->bufs.refl_ambi, &ls->bufs.refl_out);
-
-		SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
-		iplAudioBufferMix(gs->ctx, &ls->bufs.refl_out, &ls->bufs.out);
-	}
-	gs->refl_ir_lock.unlock();
 
 	for (int i = 0; i < frames; i++) {
 		buffer[i].left = ls->bufs.out.data[0][i];

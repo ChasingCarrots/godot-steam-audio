@@ -23,6 +23,14 @@ void SteamAudioPlayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_occlusion_on", "p_occlusion_on"), &SteamAudioPlayer::set_occlusion_on);
 	ClassDB::bind_method(D_METHOD("is_reflection_on"), &SteamAudioPlayer::is_reflection_on);
 	ClassDB::bind_method(D_METHOD("set_reflection_on", "p_reflection_on"), &SteamAudioPlayer::set_reflection_on);
+	ClassDB::bind_method(D_METHOD("is_air_absorption_on"), &SteamAudioPlayer::is_air_absorption_on);
+	ClassDB::bind_method(D_METHOD("set_air_absorption_on", "p_air_absorption_on"), &SteamAudioPlayer::set_air_absorption_on);
+	ClassDB::bind_method(D_METHOD("is_directivity_on"), &SteamAudioPlayer::is_directivity_on);
+	ClassDB::bind_method(D_METHOD("set_directivity_on", "p_directivity_on"), &SteamAudioPlayer::set_directivity_on);
+	ClassDB::bind_method(D_METHOD("is_transmission_on"), &SteamAudioPlayer::is_transmission_on);
+	ClassDB::bind_method(D_METHOD("set_transmission_on", "p_transmission_on"), &SteamAudioPlayer::set_transmission_on);
+	ClassDB::bind_method(D_METHOD("is_binaural_on"), &SteamAudioPlayer::is_binaural_on);
+	ClassDB::bind_method(D_METHOD("set_binaural_on", "p_binaural_on"), &SteamAudioPlayer::set_binaural_on);
 	ClassDB::bind_method(D_METHOD("get_occlusion_radius"), &SteamAudioPlayer::get_occlusion_radius);
 	ClassDB::bind_method(D_METHOD("set_occlusion_radius", "p_occlusion_radius"), &SteamAudioPlayer::set_occlusion_radius);
 	ClassDB::bind_method(D_METHOD("get_occlusion_samples"), &SteamAudioPlayer::get_occlusion_samples);
@@ -31,15 +39,34 @@ void SteamAudioPlayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_transmission_rays", "p_transmission_rays"), &SteamAudioPlayer::set_transmission_rays);
 	ClassDB::bind_method(D_METHOD("get_ambisonics_order"), &SteamAudioPlayer::get_ambisonics_order);
 	ClassDB::bind_method(D_METHOD("set_ambisonics_order", "p_ambisonics_order"), &SteamAudioPlayer::set_ambisonics_order);
+	ClassDB::bind_method(D_METHOD("get_transmission_type"), &SteamAudioPlayer::get_transmission_type);
+	ClassDB::bind_method(D_METHOD("set_transmission_type", "p_transmission_type"), &SteamAudioPlayer::set_transmission_type);
+	ClassDB::bind_method(D_METHOD("get_directivity_dipole_weight"), &SteamAudioPlayer::get_directivity_dipole_weight);
+	ClassDB::bind_method(D_METHOD("set_directivity_dipole_weight", "p_directivity_dipole_weight"), &SteamAudioPlayer::set_directivity_dipole_weight);
+	ClassDB::bind_method(D_METHOD("get_directivity_dipole_power"), &SteamAudioPlayer::get_directivity_dipole_power);
+	ClassDB::bind_method(D_METHOD("set_directivity_dipole_power", "p_directivity_dipole_power"), &SteamAudioPlayer::set_directivity_dipole_power);
+
+	ADD_GROUP("Binaural", "");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "binaural"), "set_binaural_on", "is_binaural_on");
 
 	ADD_GROUP("Distance Attenuation", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "distance_attenuation"), "set_dist_attn_on", "is_dist_attn_on");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_attenuation_distance", PROPERTY_HINT_RANGE, "0.0,100.0,0.1"), "set_min_attenuation_distance", "get_min_attenuation_distance");
 
+	ADD_GROUP("Air Absorption", "");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "air_absorption"), "set_air_absorption_on", "is_air_absorption_on");
+
+	ADD_GROUP("Directivity", "");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "directivity"), "set_directivity_on", "is_directivity_on");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "dipole_weight", PROPERTY_HINT_RANGE, "0.0,1.0,0.05"), "set_directivity_dipole_weight", "get_directivity_dipole_weight");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "dipole_power", PROPERTY_HINT_RANGE, "0.0,10.0,0.1"), "set_directivity_dipole_power", "get_directivity_dipole_power");
+
 	ADD_GROUP("Occlusion and Transmission", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "occlusion"), "set_occlusion_on", "is_occlusion_on");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "occlusion_radius", PROPERTY_HINT_RANGE, "0.0,20.0,0.1"), "set_occlusion_radius", "get_occlusion_radius");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "occlusion_samples", PROPERTY_HINT_RANGE, "0,512,1"), "set_occlusion_samples", "get_occlusion_samples");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "transmission"), "set_transmission_on", "is_transmission_on");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "transmission_type", PROPERTY_HINT_ENUM, "FrequencyIndependent,FrequencyDependent"), "set_transmission_type", "get_transmission_type");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "transmission_rays", PROPERTY_HINT_RANGE, "0,512,1"), "set_transmission_rays", "get_transmission_rays");
 
 	ADD_GROUP("Ambisonics", "");
@@ -84,16 +111,15 @@ SteamAudioPlayer::~SteamAudioPlayer() {
 	is_local_state_init.store(false);
 	auto gs = SteamAudioServer::get_singleton()->get_global_state();
 
-	iplSourceRemove(local_state.src.src, gs->sim);
-	iplSourceRelease(&local_state.src.src);
+	iplSourceRemove(local_state.src.simulationSource, gs->sim);
+	iplSourceRelease(&local_state.src.simulationSource);
 	iplDirectEffectRelease(&local_state.fx.direct);
 
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.in);
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.direct);
-	iplAudioBufferFree(gs->ctx, &local_state.bufs.ambi);
+	iplAudioBufferFree(gs->ctx, &local_state.bufs.refl);
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.out);
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.mono);
-	iplAudioBufferFree(gs->ctx, &local_state.bufs.refl_ambi);
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.refl_out);
 
 	if (!pb.is_null()) {
@@ -119,8 +145,8 @@ void SteamAudioPlayer::init_local_state() {
 
 	IPLSourceSettings src_cfg{};
 	src_cfg.flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
-	iplSourceCreate(gs->sim, &src_cfg, &local_state.src.src);
-	iplSourceAdd(local_state.src.src, gs->sim);
+	iplSourceCreate(gs->sim, &src_cfg, &local_state.src.simulationSource);
+	iplSourceAdd(local_state.src.simulationSource, gs->sim);
 	iplSimulatorCommit(gs->sim);
 
 	// TODO: check if we can't create effects globally and use their Reset functions.
@@ -130,25 +156,29 @@ void SteamAudioPlayer::init_local_state() {
 	dir_effect_cfg.numChannels = 2;
 	iplDirectEffectCreate(gs->ctx, &gs->audio_cfg, &dir_effect_cfg, &local_state.fx.direct);
 
+	// TODO: make binaural configurable and don't even create the effect when not neccessary
+	IPLBinauralEffectSettings effectSettings;
+	effectSettings.hrtf = gs->hrtf;
+	iplBinauralEffectCreate(gs->ctx, &gs->audio_cfg, &effectSettings, &local_state.fx.binaural);
+
 	IPLReflectionEffectSettings refl_effect_cfg{};
 	refl_effect_cfg.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-	refl_effect_cfg.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
+	refl_effect_cfg.irSize = (int)godot::UtilityFunctions::ceili(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
 	refl_effect_cfg.numChannels = ambisonic_channels_from(local_state.cfg.ambisonics_order);
 	iplReflectionEffectCreate(gs->ctx, &gs->audio_cfg, &refl_effect_cfg, &local_state.fx.refl);
 
-	local_state.fx.dec = create_ambisonics_decode_effect(
-			gs->ctx, gs->audio_cfg, gs->hrtf);
-	local_state.fx.refl_dec = create_ambisonics_decode_effect(
-			gs->ctx, gs->audio_cfg, gs->hrtf);
-	local_state.fx.enc = create_ambisonics_encode_effect(
-			gs->ctx, gs->audio_cfg);
+	IPLAmbisonicsDecodeEffectSettings ambi_effectSettings;
+	ambi_effectSettings.speakerLayout = { IPL_SPEAKERLAYOUTTYPE_STEREO, 2, nullptr };
+	ambi_effectSettings.hrtf = gs->hrtf;
+	ambi_effectSettings.maxOrder = local_state.cfg.ambisonics_order;
+
+	iplAmbisonicsDecodeEffectCreate(gs->ctx, &gs->audio_cfg, &ambi_effectSettings, &local_state.fx.ambisonics);
 
 	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.in);
 	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.direct);
-	iplAudioBufferAllocate(gs->ctx, ambisonic_channels_from(local_state.cfg.ambisonics_order), gs->audio_cfg.frameSize, &local_state.bufs.ambi);
+	iplAudioBufferAllocate(gs->ctx, ambisonic_channels_from(local_state.cfg.ambisonics_order), gs->audio_cfg.frameSize, &local_state.bufs.refl);
 	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.out);
 	iplAudioBufferAllocate(gs->ctx, 1, gs->audio_cfg.frameSize, &local_state.bufs.mono);
-	iplAudioBufferAllocate(gs->ctx, ambisonic_channels_from(local_state.cfg.ambisonics_order), gs->audio_cfg.frameSize, &local_state.bufs.refl_ambi);
 	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.refl_out);
 	local_state.src.player = this;
 
@@ -288,6 +318,12 @@ int SteamAudioPlayer::get_ambisonics_order() { return cfg.ambisonics_order; }
 void SteamAudioPlayer::set_ambisonics_order(int p_ambisonics_order) { cfg.ambisonics_order = p_ambisonics_order; }
 float SteamAudioPlayer::get_max_reflection_dist() { return cfg.max_refl_dist; }
 void SteamAudioPlayer::set_max_reflection_dist(float p_max_reflection_dist) { cfg.max_refl_dist = p_max_reflection_dist; }
+float SteamAudioPlayer::get_directivity_dipole_weight() { return cfg.directivity_dipole_weight; }
+void SteamAudioPlayer::set_directivity_dipole_weight(float p_directivity_dipole_weight) { cfg.directivity_dipole_weight = p_directivity_dipole_weight; }
+float SteamAudioPlayer::get_directivity_dipole_power() { return cfg.directivity_dipole_power; }
+void SteamAudioPlayer::set_directivity_dipole_power(float p_directivity_dipole_power) { cfg.directivity_dipole_power = p_directivity_dipole_power; }
+int SteamAudioPlayer::get_transmission_type() { return cfg.transmission_type; }
+void SteamAudioPlayer::set_transmission_type(int p_transmission_type) { cfg.transmission_type = p_transmission_type; }
 
 bool SteamAudioPlayer::is_dist_attn_on() { return cfg.is_dist_attn_on; }
 void SteamAudioPlayer::set_dist_attn_on(bool p_dist_attn_on) { cfg.is_dist_attn_on = p_dist_attn_on; }
@@ -295,6 +331,14 @@ bool SteamAudioPlayer::is_reflection_on() { return cfg.is_reflection_on; }
 void SteamAudioPlayer::set_reflection_on(bool p_reflection_on) { cfg.is_reflection_on = p_reflection_on; }
 bool SteamAudioPlayer::is_occlusion_on() { return cfg.is_occlusion_on; }
 void SteamAudioPlayer::set_occlusion_on(bool p_occlusion_on) { cfg.is_occlusion_on = p_occlusion_on; }
+bool SteamAudioPlayer::is_air_absorption_on() { return cfg.is_air_absorption_on; }
+void SteamAudioPlayer::set_air_absorption_on(bool p_air_absorption_on) { cfg.is_air_absorption_on = p_air_absorption_on; }
+bool SteamAudioPlayer::is_directivity_on() { return cfg.is_directivity_on; }
+void SteamAudioPlayer::set_directivity_on(bool p_directivity_on) { cfg.is_directivity_on = p_directivity_on; }
+bool SteamAudioPlayer::is_transmission_on() { return cfg.is_transmission_on; }
+void SteamAudioPlayer::set_transmission_on(bool p_transmission_on) { cfg.is_transmission_on = p_transmission_on; }
+bool SteamAudioPlayer::is_binaural_on() { return cfg.is_binaural_on; }
+void SteamAudioPlayer::set_binaural_on(bool p_binaural_on) { cfg.is_binaural_on = p_binaural_on; }
 
 PackedStringArray SteamAudioPlayer::_get_configuration_warnings() const {
 	PackedStringArray res;
