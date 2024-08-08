@@ -79,8 +79,6 @@ struct LocalSteamAudioBuffers {
 
 struct LocalSteamAudioState {
 	SteamAudioSource src;
-	IPLDirectEffectParams direct_outputs {};
-	IPLReflectionEffectParams refl_outputs {};
 	LocalSteamAudioBuffers bufs;
 	SteamAudioEffects fx;
 	SteamAudioSourceConfig cfg;

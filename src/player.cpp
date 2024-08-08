@@ -159,11 +159,13 @@ void SteamAudioPlayer::init_local_state() {
 	// TODO: make binaural configurable and don't even create the effect when not neccessary
 	IPLBinauralEffectSettings effectSettings;
 	effectSettings.hrtf = gs->hrtf;
+	// TODO: make interpolation configurable
+	local_state.hrtfInterpolation = IPL_HRTFINTERPOLATION_NEAREST;
 	iplBinauralEffectCreate(gs->ctx, &gs->audio_cfg, &effectSettings, &local_state.fx.binaural);
 
 	IPLReflectionEffectSettings refl_effect_cfg{};
 	refl_effect_cfg.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-	refl_effect_cfg.irSize = (int)godot::UtilityFunctions::ceili(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
+	refl_effect_cfg.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
 	refl_effect_cfg.numChannels = ambisonic_channels_from(local_state.cfg.ambisonics_order);
 	iplReflectionEffectCreate(gs->ctx, &gs->audio_cfg, &refl_effect_cfg, &local_state.fx.refl);
 

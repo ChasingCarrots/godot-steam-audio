@@ -8,8 +8,10 @@
 #include "steam_audio.hpp"
 #include <algorithm>
 #include <godot_cpp/variant/utility_functions.hpp>
+#include "profiling.h"
 
 void SteamAudioServer::tick() {
+	PROFILE_FUNCTION()
 	if (Engine::get_singleton()->is_editor_hint()) {
 		return;
 	}
@@ -22,8 +24,12 @@ void SteamAudioServer::tick() {
 
 	SteamAudio::log(SteamAudio::log_debug, "tick");
 
-	if (!is_refl_thread_processing.load()) {
+	if (refl_thread_wait_for_commit.load() && !is_refl_thread_processing.load()) {
+		PROFILE_FUNCTION_NAMED(ipl_Scene_Commit);
 		iplSceneCommit(self->global_state.scene);
+		refl_thread_wait_for_commit.store(false);
+		// do not notify the thread right away, but only after
+		// we set the inputs (which requires notifying it anyways)
 	}
 
 	SteamAudio::log(SteamAudio::log_debug, "tick: committed scene");
@@ -68,48 +74,12 @@ void SteamAudioServer::tick() {
 	shared_inputs.listener = self->global_state.listener_coords;
 	iplSimulatorSetSharedInputs(self->global_state.sim,
 			IPL_SIMULATIONFLAGS_DIRECT, &shared_inputs);
-	iplSimulatorRunDirect(self->global_state.sim);
+	{
+		PROFILE_FUNCTION_NAMED(run_simulator_direct)
+		iplSimulatorRunDirect(self->global_state.sim);
+	}
 
 	SteamAudio::log(SteamAudio::log_debug, "tick: direct sim complete");
-
-	for (auto ls : self->local_states) {
-		if (ls->src.player == nullptr) {
-			UtilityFunctions::push_warning(
-					"local state has empty player, not updating simulation state");
-		}
-		if (!ls->src.player->is_playing()) {
-			continue;
-		}
-
-		IPLSimulationOutputs outputs{};
-		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
-		ls->direct_outputs = outputs.direct;
-	}
-
-	if (is_refl_thread_processing.load()) {
-		SteamAudio::log(SteamAudio::log_debug, "tick: done, skipping reflections");
-		return;
-	}
-
-	global_state.simulation_lock.lock();
-	for (auto ls : local_states) {
-		if (ls->src.player == nullptr) {
-			UtilityFunctions::push_warning(
-					"local state has empty player, not updating simulation state");
-		}
-		if (!ls->src.player->is_playing()) {
-			continue;
-		}
-
-		if (ls->src.player->get_global_position().distance_to(listener->get_global_position()) > ls->cfg.max_refl_dist) {
-			continue;
-		}
-
-		IPLSimulationOutputs outputs;
-		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
-		ls->refl_outputs = outputs.reflections;
-	}
-	global_state.simulation_lock.unlock();
 
 	for (auto ls : self->local_states) {
 		if (ls->src.player == nullptr) {
@@ -146,10 +116,10 @@ void SteamAudioServer::tick() {
 	shared_inputs.irradianceMinDistance = listener->get_irradiance_min_dist();
 	iplSimulatorSetSharedInputs(global_state.sim, IPL_SIMULATIONFLAGS_REFLECTIONS, &shared_inputs);
 
-	{
-		// notify reflection thread and tell it it can start running again
+	new_inputs_set.store(true);
+	if (!is_refl_thread_processing.load()) {
+		// notify the thread of new inputs, so that it runs for another round
 		std::unique_lock<std::mutex> lock(refl_mux);
-		is_refl_thread_processing.store(true);
 		cv.notify_one();
 	}
 
@@ -205,19 +175,19 @@ void SteamAudioServer::start_refl_sim() {
 }
 
 void SteamAudioServer::run_refl_sim() {
+	PROFILING_THREAD("run_refl_sim")
 	while (this->is_running.load()) {
-		{
+		if(refl_thread_wait_for_commit.load() || !new_inputs_set.load()) {
 			std::unique_lock<std::mutex> lock(this->refl_mux);
-			cv.wait(lock, [&] { return is_refl_thread_processing.load() || !is_running.load(); });
+			cv.wait(lock, [&] { return
+				(!refl_thread_wait_for_commit.load() && new_inputs_set.load()) ||
+				!is_running.load(); });
+			if(!is_running.load())
+				break;
 		}
-		// if someone removed a local state, then the reflection sim might crash, so
-		// we need it to wait for another tick.
-		// XXX: what happens if a local state is removed in the middle of a sim run...?
-		if (local_states_have_changed.load()) {
-			local_states_have_changed.store(false);
-			is_refl_thread_processing.store(false);
-			return;
-		}
+		PROFILE_FUNCTION_NAMED(run_simulation_refl)
+		is_refl_thread_processing.store(true);
+		new_inputs_set.store(false);
 		SteamAudio::log(SteamAudio::log_debug, "running reflection sim");
 		iplSimulatorRunReflections(global_state.sim);
 		is_refl_thread_processing.store(false);
@@ -226,10 +196,12 @@ void SteamAudioServer::run_refl_sim() {
 
 void SteamAudioServer::add_listener(SteamAudioListener *lis) {
 	self->listener = lis;
+	refl_thread_wait_for_commit.store(true);
 }
 
 void SteamAudioServer::add_local_state(LocalSteamAudioState *ls) {
 	self->local_states.push_back(ls);
+	refl_thread_wait_for_commit.store(true);
 }
 
 void SteamAudioServer::remove_local_state(LocalSteamAudioState *ls) {
@@ -238,12 +210,13 @@ void SteamAudioServer::remove_local_state(LocalSteamAudioState *ls) {
 		return;
 	}
 	local_states.erase(it);
-	local_states_have_changed.store(true);
+	refl_thread_wait_for_commit.store(true);
 }
 
 void SteamAudioServer::add_static_mesh(IPLStaticMesh mesh) {
 	if (is_global_state_init.load()) {
 		iplStaticMeshAdd(mesh, global_state.scene);
+		refl_thread_wait_for_commit.store(true);
 	} else {
 		static_meshes_to_add.push_back(mesh);
 	}
@@ -252,6 +225,7 @@ void SteamAudioServer::add_static_mesh(IPLStaticMesh mesh) {
 void SteamAudioServer::remove_static_mesh(IPLStaticMesh mesh) {
 	if (is_global_state_init.load()) {
 		iplStaticMeshRemove(mesh, global_state.scene);
+		refl_thread_wait_for_commit.store(true);
 	} else {
 		// Probably won't happen?
 		auto it = std::find(static_meshes_to_add.begin(), static_meshes_to_add.end(), mesh);
@@ -264,6 +238,7 @@ void SteamAudioServer::remove_static_mesh(IPLStaticMesh mesh) {
 void SteamAudioServer::add_dynamic_mesh(IPLInstancedMesh mesh) {
 	if (is_global_state_init.load()) {
 		iplInstancedMeshAdd(mesh, global_state.scene);
+		refl_thread_wait_for_commit.store(true);
 	} else {
 		SteamAudio::log(SteamAudio::log_error, "Adding a dynamic mesh, but SteamAudio is not initialized. Probably crashing soon.");
 	}
@@ -275,6 +250,7 @@ void SteamAudioServer::remove_dynamic_mesh(IPLInstancedMesh mesh) {
 	}
 
 	iplInstancedMeshRemove(mesh, global_state.scene);
+	refl_thread_wait_for_commit.store(true);
 }
 
 SteamAudioServer::SteamAudioServer() {
@@ -282,7 +258,8 @@ SteamAudioServer::SteamAudioServer() {
 	is_global_state_init.store(false);
 	is_refl_thread_processing.store(false);
 	is_running.store(true);
-	local_states_have_changed.store(false);
+	refl_thread_wait_for_commit.store(true);
+	new_inputs_set.store(false);
 }
 
 SteamAudioServer::~SteamAudioServer() {

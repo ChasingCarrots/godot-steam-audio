@@ -5,6 +5,7 @@
 #include "godot_cpp/variant/packed_vector2_array.hpp"
 #include "server.hpp"
 #include "steam_audio.hpp"
+#include "profiling.h"
 #include <phonon.h>
 #include <godot_cpp/core/object.hpp>
 #include <godot_cpp/core/property_info.hpp>
@@ -38,80 +39,82 @@ IPLDirectEffectParams getDirectParams(GlobalSteamAudioState* gs,
                                       IPLCoordinateSpace3 source,
                                       IPLCoordinateSpace3 listener)
 {
-	auto params = ls->direct_outputs;
+	IPLSimulationOutputs outputs{};
+	iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 
-    params.transmissionType = ls->cfg.transmission_type == 0
+    outputs.direct.transmissionType = ls->cfg.transmission_type == 0
 		? IPL_TRANSMISSIONTYPE_FREQINDEPENDENT
 		: IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
 
-    params.flags = static_cast<IPLDirectEffectFlags>(0);
+    outputs.direct.flags = static_cast<IPLDirectEffectFlags>(0);
     if (!ls->cfg.is_dist_attn_on)
     {
-        params.distanceAttenuation = 1.0f;
+        outputs.direct.distanceAttenuation = 1.0f;
     }
     else
     {
-    	params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
+    	outputs.direct.flags = static_cast<IPLDirectEffectFlags>(outputs.direct.flags | IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
         IPLDistanceAttenuationModel distanceAttenuationModel{};
         distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
     	distanceAttenuationModel.minDistance = ls->cfg.min_attn_dist;
 
-        params.distanceAttenuation = iplDistanceAttenuationCalculate(gs->ctx, source.origin, listener.origin, &distanceAttenuationModel);
+        outputs.direct.distanceAttenuation = iplDistanceAttenuationCalculate(gs->ctx, source.origin, listener.origin, &distanceAttenuationModel);
     }
 
     if (!ls->cfg.is_air_absorption_on)
     {
-        params.airAbsorption[0] = 1.0f;
-        params.airAbsorption[1] = 1.0f;
-        params.airAbsorption[2] = 1.0f;
+        outputs.direct.airAbsorption[0] = 1.0f;
+        outputs.direct.airAbsorption[1] = 1.0f;
+        outputs.direct.airAbsorption[2] = 1.0f;
     }
     else
     {
-    	params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
+    	outputs.direct.flags = static_cast<IPLDirectEffectFlags>(outputs.direct.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
         IPLAirAbsorptionModel airAbsorptionModel{};
         airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
 
-        iplAirAbsorptionCalculate(gs->ctx, source.origin, listener.origin, &airAbsorptionModel, params.airAbsorption);
+        iplAirAbsorptionCalculate(gs->ctx, source.origin, listener.origin, &airAbsorptionModel, outputs.direct.airAbsorption);
     }
 
     if (!ls->cfg.is_directivity_on)
     {
-        params.directivity = 1.0f;
+        outputs.direct.directivity = 1.0f;
     }
     else
     {
-        params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY);
+        outputs.direct.flags = static_cast<IPLDirectEffectFlags>(outputs.direct.flags | IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY);
         IPLDirectivity directivity{};
         directivity.dipoleWeight = ls->cfg.directivity_dipole_weight;
         directivity.dipolePower = ls->cfg.directivity_dipole_power;
 
-        params.directivity = iplDirectivityCalculate(gs->ctx, source, listener.origin, &directivity);
+        outputs.direct.directivity = iplDirectivityCalculate(gs->ctx, source, listener.origin, &directivity);
     }
 
     if (!ls->cfg.is_occlusion_on)
     {
-        params.occlusion = 1.0f;
+        outputs.direct.occlusion = 1.0f;
     }
     else
     {
-        params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
+        outputs.direct.flags = static_cast<IPLDirectEffectFlags>(outputs.direct.flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
     }
 
     if (!ls->cfg.is_transmission_on)
     {
-        params.transmission[0] = 1.0f;
-        params.transmission[1] = 1.0f;
-        params.transmission[2] = 1.0f;
+        outputs.direct.transmission[0] = 1.0f;
+        outputs.direct.transmission[1] = 1.0f;
+        outputs.direct.transmission[2] = 1.0f;
     }
     else
     {
-    	params.flags = static_cast<IPLDirectEffectFlags>(params.flags | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+    	outputs.direct.flags = static_cast<IPLDirectEffectFlags>(outputs.direct.flags | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
     }
 
-    return params;
+    return outputs.direct;
 }
 
 int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, int32_t frames) {
+	PROFILE_FUNCTION()
 	if (parent == nullptr) {
 		return frames;
 	}
@@ -165,6 +168,7 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, in
 			&ls->bufs.in, &ls->bufs.direct);
 
 	if (ls->cfg.is_binaural_on) {
+		PROFILE_FUNCTION_NAMED(apply_binaural)
 		IPLBinauralEffectParams binauralParams{};
 		binauralParams.direction = direction;
 		binauralParams.interpolation = ls->hrtfInterpolation;
@@ -174,6 +178,7 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, in
 
 		iplBinauralEffectApply(ls->fx.binaural, &binauralParams, &ls->bufs.direct, &ls->bufs.out);
 	} else {
+		PROFILE_FUNCTION_NAMED(apply_panning)
 		iplAudioBufferDownmix(gs->ctx, &ls->bufs.direct, &ls->bufs.mono);
 
 		IPLPanningEffectParams panningParams{};
@@ -182,17 +187,18 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, in
 		iplPanningEffectApply(ls->fx.panning, &panningParams, &ls->bufs.mono, &ls->bufs.out);
 	}
 
-	gs->simulation_lock.lock();
 	if(ls->src.simulationSource && ls->cfg.is_reflection_on /* TODO: || pathing_on */) {
-		if (ls->cfg.is_reflection_on && ls->refl_outputs.ir != nullptr) {
+		IPLSimulationOutputs outputs;
+		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+		if (outputs.reflections.ir != nullptr) {
+			PROFILE_FUNCTION_NAMED(apply_reflection)
 			iplAudioBufferDownmix(gs->ctx, &ls->bufs.in, &ls->bufs.mono);
-			IPLReflectionEffectParams reflectionParams = ls->refl_outputs;
-			reflectionParams.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-			reflectionParams.numChannels = ambisonic_channels_from(ls->cfg.ambisonics_order);
-			reflectionParams.irSize = (int)UtilityFunctions::ceili(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
-			reflectionParams.tanDevice = nullptr;
+			outputs.reflections.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+			outputs.reflections.numChannels = ambisonic_channels_from(ls->cfg.ambisonics_order);
+			outputs.reflections.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
+			outputs.reflections.tanDevice = nullptr;
 
-			iplReflectionEffectApply(ls->fx.refl, &reflectionParams, &ls->bufs.mono, &ls->bufs.refl, nullptr);
+			iplReflectionEffectApply(ls->fx.refl, &outputs.reflections, &ls->bufs.mono, &ls->bufs.refl, nullptr);
 			SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
 			IPLAmbisonicsDecodeEffectParams ambisonicsParams;
 			ambisonicsParams.order = ls->cfg.ambisonics_order;
@@ -208,12 +214,14 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, in
 		// TODO: skipped the "PathingEffect" for now, but here would be the place.
 		// (line 1420 in fmod/src/spatialize_effect.cpp)
 	}
-	gs->simulation_lock.unlock();
 
 
-	for (int i = 0; i < frames; i++) {
-		buffer[i].left = ls->bufs.out.data[0][i];
-		buffer[i].right = ls->bufs.out.data[1][i];
+	{
+		PROFILE_FUNCTION_NAMED(writing_out_buffer)
+		for (int i = 0; i < frames; i++) {
+			buffer[i].left = ls->bufs.out.data[0][i];
+			buffer[i].right = ls->bufs.out.data[1][i];
+		}
 	}
 
 	SteamAudio::log(SteamAudio::log_debug, "mixing: done");

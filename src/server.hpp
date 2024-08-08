@@ -22,7 +22,8 @@ private:
 	std::atomic<bool> is_global_state_init;
 	std::atomic<bool> is_refl_thread_processing;
 	std::atomic<bool> is_running;
-	std::atomic<bool> local_states_have_changed;
+	std::atomic<bool> refl_thread_wait_for_commit;
+	std::atomic<bool> new_inputs_set;
 	std::mutex init_mux;
 	std::mutex refl_mux;
 	std::condition_variable cv;
