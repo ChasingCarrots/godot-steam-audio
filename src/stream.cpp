@@ -113,7 +113,7 @@ IPLDirectEffectParams getDirectParams(GlobalSteamAudioState* gs,
     return outputs.direct;
 }
 
-int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, int32_t frames) {
+int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int32_t frames) {
 	PROFILE_FUNCTION()
 	if (parent == nullptr) {
 		return frames;
