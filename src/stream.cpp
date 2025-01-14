@@ -153,7 +153,7 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, double rate_scale, in
 	auto sourcePosition = sourceCoordinates.origin;
 	auto direction = iplCalculateRelativeDirection(gs->ctx, sourcePosition, listenerCoordinates.origin, listenerCoordinates.ahead, listenerCoordinates.up);
 
-	PackedVector2Array mixed_frames = stream_playback->get_raw_audio(rate_scale, frames);
+	PackedVector2Array mixed_frames = stream_playback->mix_audio(rate_scale, frames);
 	frames = int(mixed_frames.size());
 
 	for (int i = 0; i < frames; i++) {
