@@ -179,7 +179,7 @@ private:
     uint8_t m_val[6];
 };
 
-struct Int48Sort { bool operator()( const Int48& lhs, const Int48& rhs ) { return lhs.Val() < rhs.Val(); }; };
+struct Int48Sort { bool operator()( const Int48& lhs, const Int48& rhs ) const { return lhs.Val() < rhs.Val(); }; };
 
 
 struct SourceLocationBase
@@ -264,7 +264,7 @@ struct SampleData
 
 enum { SampleDataSize = sizeof( SampleData ) };
 
-struct SampleDataSort { bool operator()( const SampleData& lhs, const SampleData& rhs ) { return lhs.time.Val() < rhs.time.Val(); }; };
+struct SampleDataSort { bool operator()( const SampleData& lhs, const SampleData& rhs ) const { return lhs.time.Val() < rhs.time.Val(); }; };
 
 
 struct SampleDataRange
@@ -688,6 +688,7 @@ struct ThreadData
     uint8_t isFiber;
     ThreadData* fiber;
     uint8_t* stackCount;
+    int32_t groupHint;
 
     tracy_force_inline void IncStackCount( int16_t srcloc ) { stackCount[uint16_t(srcloc)]++; }
     tracy_force_inline bool DecStackCount( int16_t srcloc ) { return --stackCount[uint16_t(srcloc)] != 0; }
@@ -741,7 +742,7 @@ enum class PlotValueFormatting : uint8_t
 
 struct PlotData
 {
-    struct PlotItemSort { bool operator()( const PlotItem& lhs, const PlotItem& rhs ) { return lhs.time.Val() < rhs.time.Val(); }; };
+    struct PlotItemSort { bool operator()( const PlotItem& lhs, const PlotItem& rhs ) const { return lhs.time.Val() < rhs.time.Val(); }; };
 
     uint64_t name;
     double min;
@@ -843,6 +844,16 @@ struct SymbolStats
 };
 
 enum { SymbolStatsSize = sizeof( SymbolStats ) };
+
+
+struct FlameGraphItem
+{
+    int64_t srcloc;
+    int64_t time;
+    StringIdx name;
+    int64_t begin;
+    std::vector<FlameGraphItem> children;
+};
 
 }
 

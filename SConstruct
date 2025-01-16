@@ -23,11 +23,11 @@ if env["platform"] == "linux":
     env.Append(LIBPATH=[f'{steam_audio_lib_path}/linux-x64'])
     env.Append(LIBS=["libphonon.so"])
 elif env["platform"] == "windows":
-    env.Append(LIBPATH=[f'{steam_audio_lib_path}/windows-x64', f'{tracy_lib_path}/library/win32'])
-    env.Append(LIBS=["phonon", "TracyProfiler"])
+    env.Append(LIBPATH=[f'{steam_audio_lib_path}/windows-x64',])
+    env.Append(LIBS=["phonon",])
     if env["profiling_enabled"]:
-        env.Append(LIBPATH=[f'{tracy_lib_path}/library/win32'])
-        env.Append(LIBS=["TracyProfiler"])
+        env.Append(LIBPATH=[f'{tracy_lib_path}/lib'])
+        env.Append(LIBS=["TracyClient"])
         env.Append(CPPDEFINES=["PROFILING_ENABLED"])
         env.Append(CPPDEFINES=["TRACY_ENABLE"])
         env.Append(CPPDEFINES=["TRACY_ON_DEMAND"])

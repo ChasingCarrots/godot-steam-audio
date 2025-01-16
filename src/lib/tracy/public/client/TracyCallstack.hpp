@@ -9,7 +9,8 @@
 
 namespace tracy
 {
-static tracy_force_inline void* Callstack( int /*depth*/ ) { return nullptr; }
+static constexpr bool has_callstack() { return false; }
+static tracy_force_inline void* Callstack( int32_t /*depth*/ ) { return nullptr; }
 }
 
 #else
@@ -37,6 +38,8 @@ static tracy_force_inline void* Callstack( int /*depth*/ ) { return nullptr; }
 
 namespace tracy
 {
+
+static constexpr bool has_callstack() { return true; }
 
 struct CallstackSymbolData
 {
@@ -83,7 +86,7 @@ extern "C"
     TRACY_API extern ___tracy_t_RtlWalkFrameChain ___tracy_RtlWalkFrameChain;
 }
 
-static tracy_force_inline void* Callstack( int depth )
+static tracy_force_inline void* Callstack( int32_t depth )
 {
     assert( depth >= 1 && depth < 63 );
     auto trace = (uintptr_t*)tracy_malloc( ( 1 + depth ) * sizeof( uintptr_t ) );
@@ -112,7 +115,7 @@ static _Unwind_Reason_Code tracy_unwind_callback( struct _Unwind_Context* ctx, v
     return _URC_NO_REASON;
 }
 
-static tracy_force_inline void* Callstack( int depth )
+static tracy_force_inline void* Callstack( int32_t depth )
 {
     assert( depth >= 1 && depth < 63 );
 
@@ -127,7 +130,7 @@ static tracy_force_inline void* Callstack( int depth )
 
 #elif TRACY_HAS_CALLSTACK == 3 || TRACY_HAS_CALLSTACK == 4 || TRACY_HAS_CALLSTACK == 6
 
-static tracy_force_inline void* Callstack( int depth )
+static tracy_force_inline void* Callstack( int32_t depth )
 {
     assert( depth >= 1 );
 

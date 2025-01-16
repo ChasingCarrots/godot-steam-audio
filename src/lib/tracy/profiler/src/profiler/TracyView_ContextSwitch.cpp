@@ -6,6 +6,7 @@
 #include "TracyTimelineContext.hpp"
 #include "TracyTimelineDraw.hpp"
 #include "TracyView.hpp"
+#include "tracy_pdqsort.h"
 
 namespace tracy
 {
@@ -440,7 +441,16 @@ void View::DrawWaitStacks()
     bool threadsChanged = false;
     auto expand = ImGui::TreeNode( ICON_FA_SHUFFLE " Visible threads:" );
     ImGui::SameLine();
-    ImGui::TextDisabled( "(%zu)", m_threadOrder.size() );
+    size_t visibleThreads = 0;
+    for( const auto& t : m_threadOrder ) if( WaitStackThread( t->id ) ) visibleThreads++;
+    if( visibleThreads == m_threadOrder.size() )
+    {
+        ImGui::TextDisabled( "(%zu)", m_threadOrder.size() );
+    }
+    else
+    {
+        ImGui::TextDisabled( "(%zi/%zu)", visibleThreads, m_threadOrder.size() );
+    }
     if( expand )
     {
         auto& crash = m_worker.GetCrashEvent();
@@ -498,7 +508,11 @@ void View::DrawWaitStacks()
     ImGui::BeginChild( "##waitstacks" );
     if( stacks.empty() )
     {
-        ImGui::TextUnformatted( "No wait stacks to display." );
+        ImGui::PushFont( m_bigFont );
+        ImGui::Dummy( ImVec2( 0, ( ImGui::GetContentRegionAvail().y - ImGui::GetTextLineHeight() * 2 ) * 0.5f ) );
+        TextCentered( ICON_FA_KIWI_BIRD );
+        TextCentered( "No wait stacks to display" );
+        ImGui::PopFont();
     }
     else
     {

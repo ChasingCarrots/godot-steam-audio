@@ -22,6 +22,7 @@
 #include "TracyUtility.hpp"
 #include "TracyViewData.hpp"
 #include "../server/TracyFileWrite.hpp"
+#include "../server/TracyTaskDispatch.hpp"
 #include "../server/TracyShortPtr.hpp"
 #include "../server/TracyWorker.hpp"
 #include "../server/tracy_robin_hood.h"
@@ -36,7 +37,9 @@ constexpr const char* GpuContextNames[] = {
     "Vulkan",
     "OpenCL",
     "Direct3D 12",
-    "Direct3D 11"
+    "Direct3D 11",
+    "Metal",
+    "Custom"
 };
 
 struct MemoryPage;
@@ -51,6 +54,7 @@ struct CpuUsageDraw;
 struct CpuCtxDraw;
 struct LockDraw;
 struct PlotDraw;
+struct FlameGraphContext;
 
 
 class View
@@ -147,7 +151,7 @@ public:
 
     void HighlightThread( uint64_t thread );
     void ZoomToRange( int64_t start, int64_t end, bool pause = true );
-    bool DrawPlot( const TimelineContext& ctx, PlotData& plot, const std::vector<uint32_t>& plotDraw, int& offset );
+    bool DrawPlot( const TimelineContext& ctx, PlotData& plot, const std::vector<uint32_t>& plotDraw, int& offset, bool rightEnd );
     void DrawThread( const TimelineContext& ctx, const ThreadData& thread, const std::vector<TimelineDraw>& draw, const std::vector<ContextSwitchDraw>& ctxDraw, const std::vector<SamplesDraw>& samplesDraw, const std::vector<std::unique_ptr<LockDraw>>& lockDraw, int& offset, int depth, bool hasCtxSwitches, bool hasSamples );
     void DrawThreadMessagesList( const TimelineContext& ctx, const std::vector<MessagesDraw>& drawList, int offset, uint64_t tid );
     void DrawThreadOverlays( const ThreadData& thread, const ImVec2& ul, const ImVec2& dr );
@@ -271,6 +275,13 @@ private:
     void DrawRangeEntry( Range& range, const char* label, uint32_t color, const char* popupLabel, int id );
     void DrawSourceTooltip( const char* filename, uint32_t line, int before = 3, int after = 3, bool separateTooltip = true );
     void DrawWaitStacks();
+    void DrawFlameGraph();
+    void DrawFlameGraphHeader( uint64_t timespan );
+    void DrawFlameGraphLevel( const std::vector<FlameGraphItem>& data, FlameGraphContext& ctx, int depth, bool samples );
+    void DrawFlameGraphItem( const FlameGraphItem& item, FlameGraphContext& ctx, int depth, bool samples );
+    void BuildFlameGraph( const Worker& worker, std::vector<FlameGraphItem>& data, const Vector<short_ptr<ZoneEvent>>& zones );
+    void BuildFlameGraph( const Worker& worker, std::vector<FlameGraphItem>& data, const Vector<short_ptr<ZoneEvent>>& zones, const ContextSwitch* ctx );
+    void BuildFlameGraph( const Worker& worker, std::vector<FlameGraphItem>& data, const Vector<SampleData>& samples );
 
     void ListMemData( std::vector<const MemEvent*>& vec, const std::function<void(const MemEvent*)>& DrawAddress, int64_t startTime = -1, uint64_t pool = 0 );
 
@@ -303,12 +314,13 @@ private:
 
     void AddAnnotation( int64_t start, int64_t end );
 
+    bool IsFrameExternal( const char* filename, const char* image );
     uint32_t GetThreadColor( uint64_t thread, int depth );
     uint32_t GetSrcLocColor( const SourceLocation& srcloc, int depth );
     uint32_t GetRawSrcLocColor( const SourceLocation& srcloc, int depth );
     uint32_t GetZoneColor( const ZoneEvent& ev, uint64_t thread, int depth );
     uint32_t GetZoneColor( const GpuEvent& ev );
-    ZoneColorData GetZoneColorData( const ZoneEvent& ev, uint64_t thread, int depth );
+    ZoneColorData GetZoneColorData( const ZoneEvent& ev, uint64_t thread, int depth, uint32_t inheritedColor );
     ZoneColorData GetZoneColorData( const GpuEvent& ev );
 
     void ZoomToZone( const ZoneEvent& ev );
@@ -377,9 +389,11 @@ private:
 
     unordered_flat_map<uint64_t, bool> m_visibleMsgThread;
     unordered_flat_map<uint64_t, bool> m_waitStackThread;
+    unordered_flat_map<uint64_t, bool> m_flameGraphThread;
     unordered_flat_map<const void*, int> m_gpuDrift;
     unordered_flat_map<const PlotData*, PlotView> m_plotView;
     Vector<const ThreadData*> m_threadOrder;
+    Vector<const ThreadData*> m_threadReinsert;
     Vector<float> m_threadDnd;
 
     tracy_force_inline bool& VisibleMsgThread( uint64_t thread )
@@ -398,6 +412,16 @@ private:
         if( it == m_waitStackThread.end() )
         {
             it = m_waitStackThread.emplace( thread, true ).first;
+        }
+        return it->second;
+    }
+
+    tracy_force_inline bool& FlameGraphThread( uint64_t thread )
+    {
+        auto it = m_flameGraphThread.find( thread );
+        if( it == m_flameGraphThread.end() )
+        {
+            it = m_flameGraphThread.emplace( thread, true ).first;
         }
         return it->second;
     }
@@ -488,10 +512,16 @@ private:
     bool m_showCpuDataWindow = false;
     bool m_showAnnotationList = false;
     bool m_showWaitStacks = false;
+    bool m_showFlameGraph = false;
 
     AccumulationMode m_statAccumulationMode = AccumulationMode::SelfOnly;
     bool m_statSampleTime = true;
     int m_statMode = 0;
+    int m_flameMode = 0;
+    bool m_flameSort = false;
+    bool m_flameRunningTime = false;
+    bool m_flameExternal = true;
+    bool m_flameExternalTail = true;
     int m_statSampleLocation = 2;
     bool m_statHideUnknown = true;
     bool m_showAllSymbols = false;
@@ -501,6 +531,7 @@ private:
     bool m_statSeparateInlines = false;
     bool m_mergeInlines = false;
     bool m_relativeInlines = false;
+    bool m_topInline = false;
     bool m_statShowAddress = false;
     bool m_statShowKernel = true;
     bool m_groupChildrenLocations = false;
@@ -570,10 +601,10 @@ private:
     std::atomic<size_t> m_srcFileBytes { 0 };
     std::atomic<size_t> m_dstFileBytes { 0 };
 
-    void* m_frameTexture = nullptr;
+    ImTextureID m_frameTexture = 0;
     const void* m_frameTexturePtr = nullptr;
 
-    void* m_frameTextureConn = nullptr;
+    ImTextureID m_frameTextureConn = 0;
     const void* m_frameTextureConnPtr = nullptr;
 
     std::vector<std::unique_ptr<Annotation>> m_annotations;
@@ -614,6 +645,7 @@ private:
             int64_t time = 0;
         };
 
+        bool hasResults = false;
         bool show = false;
         bool ignoreCase = false;
         std::vector<int16_t> match;
@@ -638,6 +670,7 @@ private:
         size_t sortedNum = 0, selSortNum, selSortActive;
         float average, selAverage;
         float median, selMedian;
+        float p75, p90;
         int64_t total, selTotal;
         int64_t selTime;
         bool drawAvgMed = true;
@@ -671,6 +704,7 @@ private:
             selGroup = Unselected;
             highlight.active = false;
             samples.counts.clear();
+            hasResults = false;
         }
 
         void ResetMatch()
@@ -680,6 +714,8 @@ private:
             sortedNum = 0;
             average = 0;
             median = 0;
+            p75 = 0;
+            p90 = 0;
             total = 0;
             tmin = std::numeric_limits<int64_t>::max();
             tmax = std::numeric_limits<int64_t>::min();
@@ -830,7 +866,7 @@ private:
     } m_cache;
 
     struct {
-        void* texture = nullptr;
+        ImTextureID texture = 0;
         float timeLeft = 0;
         float speed = 1;
         uint32_t frame = 0;
@@ -873,6 +909,23 @@ private:
 
     AchievementsMgr* m_achievementsMgr;
     bool m_achievements = false;
+
+    double m_horizontalScrollMultiplier = 1.0;
+    double m_verticalScrollMultiplier = 1.0;
+
+    TaskDispatch m_td;
+    std::vector<FlameGraphItem> m_flameGraphData;
+    struct
+    {
+        uint64_t count = 0;
+        uint64_t lastTime = 0;
+
+        void Reset()
+        {
+            count = 0;
+            lastTime = 0;
+        }
+    } m_flameGraphInvariant;
 };
 
 }

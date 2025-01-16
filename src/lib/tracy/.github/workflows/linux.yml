@@ -6,17 +6,22 @@ on:
   pull_request:
     branches: [ master ]
 
+env:
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/cpm-cache
+
 jobs:
   build:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
     - name: Install dependencies
-      run: pacman -Syu --noconfirm && pacman -S --noconfirm --needed freetype2 tbb debuginfod wayland dbus libxkbcommon libglvnd meson cmake git wayland-protocols nodejs
+      run: pacman -Syu --noconfirm && pacman -S --noconfirm --needed freetype2 debuginfod wayland dbus libxkbcommon libglvnd meson cmake git wayland-protocols nodejs
+    - name: Trust git repo
+      run: git config --global --add safe.directory '*'
     - uses: actions/checkout@v4
     - name: Profiler GUI
       run: |
-        cmake -B profiler/build -S profiler -DCMAKE_BUILD_TYPE=Release
+        cmake -B profiler/build -S profiler -DCMAKE_BUILD_TYPE=Release -DGIT_REV=${{ github.sha }}
         cmake --build profiler/build --parallel
     - name: Update utility
       run: |
@@ -30,14 +35,10 @@ jobs:
       run: |
         cmake -B csvexport/build -S csvexport -DCMAKE_BUILD_TYPE=Release
         cmake --build csvexport/build --parallel
-    - name: Import-chrome utility
+    - name: Import utilities
       run: |
-        cmake -B import-chrome/build -S import-chrome -DCMAKE_BUILD_TYPE=Release
-        cmake --build import-chrome/build --parallel
-    - name: Import-fuchsia utility
-      run: |
-        cmake -B import-fuchsia/build -S import-fuchsia -DCMAKE_BUILD_TYPE=Release
-        cmake --build import-fuchsia/build --parallel
+        cmake -B import/build -S import -DCMAKE_BUILD_TYPE=Release
+        cmake --build import/build --parallel
     - name: Library
       run: meson setup -Dprefix=$GITHUB_WORKSPACE/bin/lib build && meson compile -C build && meson install -C build
     - name: Test application
@@ -70,8 +71,8 @@ jobs:
         cp update/build/tracy-update bin
         cp capture/build/tracy-capture bin
         cp csvexport/build/tracy-csvexport bin
-        cp import-chrome/build/tracy-import-chrome bin
-        cp import-fuchsia/build/tracy-import-fuchsia bin
+        cp import/build/tracy-import-chrome bin
+        cp import/build/tracy-import-fuchsia bin
         strip bin/tracy-*
     - uses: actions/upload-artifact@v4
       with:

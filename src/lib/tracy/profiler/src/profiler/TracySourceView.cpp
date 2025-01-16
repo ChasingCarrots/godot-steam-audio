@@ -13,11 +13,11 @@
 #include "TracyImGui.hpp"
 #include "TracyMicroArchitecture.hpp"
 #include "TracyPrint.hpp"
-#include "TracySort.hpp"
 #include "TracySourceView.hpp"
 #include "TracyUtility.hpp"
 #include "TracyView.hpp"
 #include "TracyWorker.hpp"
+#include "tracy_pdqsort.h"
 
 #include "IconsFontAwesome6.h"
 
@@ -712,7 +712,7 @@ bool SourceView::Disassemble( uint64_t symAddr, const Worker& worker )
         rval = cs_open( CS_ARCH_ARM, CS_MODE_ARM, &handle );
         break;
     case CpuArchArm64:
-        rval = cs_open( CS_ARCH_ARM64, CS_MODE_ARM, &handle );
+        rval = cs_open( CS_ARCH_AARCH64, CS_MODE_ARM, &handle );
         break;
     default:
         assert( false );
@@ -777,9 +777,9 @@ bool SourceView::Disassemble( uint64_t symAddr, const Worker& worker )
                     }
                     break;
                 case CpuArchArm64:
-                    if( detail.arm64.op_count == 1 && detail.arm64.operands[0].type == ARM64_OP_IMM )
+                    if( detail.aarch64.op_count == 1 && detail.aarch64.operands[0].type == AARCH64_OP_IMM )
                     {
-                        jumpAddr = (uint64_t)detail.arm64.operands[0].imm;
+                        jumpAddr = (uint64_t)detail.aarch64.operands[0].imm;
                     }
                     break;
                 default:
@@ -864,18 +864,18 @@ bool SourceView::Disassemble( uint64_t symAddr, const Worker& worker )
                 }
                 break;
             case CpuArchArm64:
-                for( uint8_t i=0; i<detail.arm64.op_count; i++ )
+                for( uint8_t i=0; i<detail.aarch64.op_count; i++ )
                 {
                     uint8_t type = 0;
-                    switch( detail.arm64.operands[i].type )
+                    switch( detail.aarch64.operands[i].type )
                     {
-                    case ARM64_OP_IMM:
+                    case AARCH64_OP_IMM:
                         type = 0;
                         break;
-                    case ARM64_OP_REG:
+                    case AARCH64_OP_REG:
                         type = 1;
                         break;
-                    case ARM64_OP_MEM:
+                    case AARCH64_OP_MEM:
                         type = 2;
                         break;
                     default:
@@ -1848,7 +1848,7 @@ static uint32_t GetGoodnessColor( float inRatio )
 void SourceView::RenderSymbolSourceView( const AddrStatData& as, Worker& worker, const View& view, bool hasInlines )
 {
     const auto scale = GetScale();
-    if( hasInlines && !m_calcInlineStats && ( as.ipTotalAsm.local + as.ipTotalAsm.ext ) > 0 || ( view.m_statRange.active && worker.GetSamplesForSymbol( m_baseAddr ) ) )
+    if( hasInlines && !m_calcInlineStats && ( ( as.ipTotalAsm.local + as.ipTotalAsm.ext ) > 0 || ( view.m_statRange.active && worker.GetSamplesForSymbol( m_baseAddr ) ) ) )
     {
         const auto samplesReady = worker.AreSymbolSamplesReady();
         if( !samplesReady )
@@ -1990,10 +1990,8 @@ void SourceView::RenderSymbolSourceView( const AddrStatData& as, Worker& worker,
                     if( !widthSet )
                     {
                         widthSet = true;
-                        const auto w = ImGui::GetWindowWidth();
                         const auto c0 = ImGui::CalcTextSize( "12345678901234567890" ).x;
                         ImGui::SetColumnWidth( 0, c0 );
-                        ImGui::SetColumnWidth( 1, w - c0 );
                     }
                 }
                 for( auto& v : fileCountsVec )
@@ -2872,6 +2870,9 @@ uint64_t SourceView::RenderSymbolAsmView( const AddrStatData& as, Worker& worker
         }
         if( ImGui::BeginPopup( "localCallstackPopup" ) )
         {
+            ImGui::PushFont( m_smallFont );
+            TextDisabledUnformatted( "Local call stack:" );
+            ImGui::PopFont();
             const auto lcs = m_localCallstackPopup;
             for( uint8_t i=0; i<lcs->size; i++ )
             {
@@ -3952,14 +3953,15 @@ void SourceView::RenderAsmLine( AsmLine& line, const AddrStat& ipcnt, const Addr
                 SetFont();
                 if( ImGui::IsItemClicked( 0 ) )
                 {
-                    m_targetLine = srcline;
                     if( m_source.filename() == fileName )
                     {
+                        m_targetLine = srcline;
                         SelectLine( srcline, &worker, false );
                         m_displayMode = DisplayMixed;
                     }
                     else if( SourceFileValid( fileName, worker.GetCaptureTime(), view, worker ) )
                     {
+                        m_targetLine = srcline;
                         ParseSource( fileName, worker, view );
                         SelectLine( srcline, &worker, false );
                         SelectViewMode();
