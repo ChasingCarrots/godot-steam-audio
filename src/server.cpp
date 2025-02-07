@@ -281,6 +281,7 @@ SteamAudioServer::~SteamAudioServer() {
 	iplSimulatorRelease(&self->global_state.sim);
 	iplSceneRelease(&self->global_state.scene);
 	iplContextRelease(&self->global_state.ctx);
+	self = nullptr;
 }
 
 void SteamAudioServer::_bind_methods() {

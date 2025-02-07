@@ -147,7 +147,6 @@ void SteamAudioPlayer::init_local_state() {
 	src_cfg.flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
 	iplSourceCreate(gs->sim, &src_cfg, &local_state.src.simulationSource);
 	iplSourceAdd(local_state.src.simulationSource, gs->sim);
-	iplSimulatorCommit(gs->sim);
 
 	// TODO: check if we can't create effects globally and use their Reset functions.
 	// If we create these globally and use them for all sources, then strange things happen
