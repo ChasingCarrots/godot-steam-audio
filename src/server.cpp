@@ -172,6 +172,12 @@ GlobalSteamAudioState *SteamAudioServer::get_global_state(bool should_init) {
 }
 
 void SteamAudioServer::start_refl_sim() {
+	if(refl_thread.is_valid()) {
+		SteamAudio::log(SteamAudio::log_error, "Refl thread already running");
+		return;
+	}
+	SteamAudio::log(SteamAudio::log_info, "Creating and starting reflection simulation thread.");
+	refl_thread.instantiate();
 	refl_thread->start(callable_mp(this, &SteamAudioServer::run_refl_sim));
 }
 
@@ -261,14 +267,14 @@ SteamAudioServer::SteamAudioServer() {
 	is_running.store(true);
 	refl_thread_wait_for_commit.store(true);
 	new_inputs_set.store(false);
-	refl_thread = memnew(Thread);
 }
 
 SteamAudioServer::~SteamAudioServer() {
 	is_running.store(false);
-	refl_thread->wait_to_finish();
-	memdelete(refl_thread);
-	refl_thread = nullptr;
+	if(refl_thread.is_valid()) {
+		refl_thread->wait_to_finish();
+		refl_thread.unref();
+	}
 
 	if (!self->is_global_state_init.load()) {
 		return;
