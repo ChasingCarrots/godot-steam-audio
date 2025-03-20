@@ -272,6 +272,10 @@ SteamAudioServer::SteamAudioServer() {
 SteamAudioServer::~SteamAudioServer() {
 	is_running.store(false);
 	if(refl_thread.is_valid()) {
+		{
+			std::unique_lock<std::mutex> lock(refl_mux);
+			cv.notify_one();
+		}
 		refl_thread->wait_to_finish();
 		refl_thread.unref();
 	}

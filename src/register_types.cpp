@@ -43,9 +43,7 @@ void init_ext(ModuleInitializationLevel p_level) {
 
 void uninit_ext(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
-		// Should call this to not leak, but thread->wait_for_finish() crashes...
-		// the program is exiting anyway so I'm not too concerned
-		// memdelete(srv);
+		memdelete(srv);
 	}
 }
 
