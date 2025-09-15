@@ -25,16 +25,6 @@ void SteamAudioServer::tick() {
 
 	SteamAudio::log(SteamAudio::log_debug, "tick");
 
-	if (refl_thread_wait_for_commit.load() && !is_refl_thread_processing.load()) {
-		PROFILE_FUNCTION_NAMED(ipl_Scene_Commit);
-		iplSceneCommit(self->global_state.scene);
-		refl_thread_wait_for_commit.store(false);
-		// do not notify the thread right away, but only after
-		// we set the inputs (which requires notifying it anyways)
-	}
-
-	SteamAudio::log(SteamAudio::log_debug, "tick: committed scene");
-
 	self->global_state.listener_coords =
 			ipl_coords_from(self->listener->get_global_transform());
 
@@ -75,12 +65,6 @@ void SteamAudioServer::tick() {
 	shared_inputs.listener = self->global_state.listener_coords;
 	iplSimulatorSetSharedInputs(self->global_state.sim,
 			IPL_SIMULATIONFLAGS_DIRECT, &shared_inputs);
-	{
-		PROFILE_FUNCTION_NAMED(run_simulator_direct)
-		iplSimulatorRunDirect(self->global_state.sim);
-	}
-
-	SteamAudio::log(SteamAudio::log_debug, "tick: direct sim complete");
 
 	for (auto ls : self->local_states) {
 		if (ls->src.player == nullptr) {
@@ -116,6 +100,31 @@ void SteamAudioServer::tick() {
 	shared_inputs.order = listener->get_refl_ambisonics_order();
 	shared_inputs.irradianceMinDistance = listener->get_irradiance_min_dist();
 	iplSimulatorSetSharedInputs(global_state.sim, IPL_SIMULATIONFLAGS_REFLECTIONS, &shared_inputs);
+
+	if (refl_thread_wait_for_commit.load() && !is_refl_thread_processing.load()) {
+		if (scene_dirty) {
+			PROFILE_FUNCTION_NAMED(ipl_Scene_Commit);
+			iplSceneCommit(self->global_state.scene);
+			scene_dirty = false;
+		}
+		if (simulator_dirty) {
+			PROFILE_FUNCTION_NAMED(ipl_Simulator_Commit);
+			iplSimulatorCommit(global_state.sim);
+			simulator_dirty = false;
+		}
+		refl_thread_wait_for_commit.store(false);
+		// do not notify the thread right away, but only after
+		// we set the inputs (which requires notifying it anyways)
+	}
+
+	SteamAudio::log(SteamAudio::log_debug, "tick: committed scene");
+
+	{
+		PROFILE_FUNCTION_NAMED(run_simulator_direct)
+		iplSimulatorRunDirect(self->global_state.sim);
+	}
+
+	SteamAudio::log(SteamAudio::log_debug, "tick: direct sim complete");
 
 	new_inputs_set.store(true);
 	if (!is_refl_thread_processing.load()) {
@@ -203,11 +212,13 @@ void SteamAudioServer::run_refl_sim() {
 
 void SteamAudioServer::add_listener(SteamAudioListener *lis) {
 	self->listener = lis;
+	simulator_dirty = true;
 	refl_thread_wait_for_commit.store(true);
 }
 
 void SteamAudioServer::add_local_state(LocalSteamAudioState *ls) {
 	self->local_states.push_back(ls);
+	simulator_dirty = true;
 	refl_thread_wait_for_commit.store(true);
 }
 
@@ -217,12 +228,14 @@ void SteamAudioServer::remove_local_state(LocalSteamAudioState *ls) {
 		return;
 	}
 	local_states.erase(it);
+	simulator_dirty = true;
 	refl_thread_wait_for_commit.store(true);
 }
 
 void SteamAudioServer::add_static_mesh(IPLStaticMesh mesh) {
 	if (is_global_state_init.load()) {
 		iplStaticMeshAdd(mesh, global_state.scene);
+		scene_dirty = true;
 		refl_thread_wait_for_commit.store(true);
 	} else {
 		static_meshes_to_add.push_back(mesh);
@@ -232,6 +245,7 @@ void SteamAudioServer::add_static_mesh(IPLStaticMesh mesh) {
 void SteamAudioServer::remove_static_mesh(IPLStaticMesh mesh) {
 	if (is_global_state_init.load()) {
 		iplStaticMeshRemove(mesh, global_state.scene);
+		scene_dirty = true;
 		refl_thread_wait_for_commit.store(true);
 	} else {
 		// Probably won't happen?
@@ -245,6 +259,7 @@ void SteamAudioServer::remove_static_mesh(IPLStaticMesh mesh) {
 void SteamAudioServer::add_dynamic_mesh(IPLInstancedMesh mesh) {
 	if (is_global_state_init.load()) {
 		iplInstancedMeshAdd(mesh, global_state.scene);
+		scene_dirty = true;
 		refl_thread_wait_for_commit.store(true);
 	} else {
 		SteamAudio::log(SteamAudio::log_error, "Adding a dynamic mesh, but SteamAudio is not initialized. Probably crashing soon.");
@@ -257,7 +272,24 @@ void SteamAudioServer::remove_dynamic_mesh(IPLInstancedMesh mesh) {
 	}
 
 	iplInstancedMeshRemove(mesh, global_state.scene);
+	scene_dirty = true;
 	refl_thread_wait_for_commit.store(true);
+}
+
+void SteamAudioServer::add_source_to_sim(IPLSource source) {
+	iplSourceAdd(source, global_state.sim);
+	simulator_dirty = true;
+	refl_thread_wait_for_commit.store(true);
+	num_sources_in_sim += 1;
+	// print_line("adding source to sim. num_in_sim: ", num_sources_in_sim);
+}
+
+void SteamAudioServer::remove_source_from_sim(IPLSource source) {
+	iplSourceRemove(source, global_state.sim);
+	simulator_dirty = true;
+	refl_thread_wait_for_commit.store(true);
+	num_sources_in_sim -= 1;
+	// print_line("removing source from sim. num_in_sim: ", num_sources_in_sim);
 }
 
 SteamAudioServer::SteamAudioServer() {

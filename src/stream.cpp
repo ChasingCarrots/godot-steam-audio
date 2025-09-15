@@ -115,6 +115,10 @@ IPLDirectEffectParams getDirectParams(GlobalSteamAudioState* gs,
 
 int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int32_t frames) {
 	PROFILE_FUNCTION()
+	if (!is_active) {
+		return 0;
+	}
+
 	if (parent == nullptr) {
 		return frames;
 	}
@@ -154,9 +158,8 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 	auto direction = iplCalculateRelativeDirection(gs->ctx, sourcePosition, listenerCoordinates.origin, listenerCoordinates.ahead, listenerCoordinates.up);
 
 	PackedVector2Array mixed_frames = stream_playback->mix_audio(rate_scale, frames);
-	frames = int(mixed_frames.size());
-
-	for (int i = 0; i < frames; i++) {
+	int num_frames_from_stream = mixed_frames.size();
+	for (int i = 0; i < num_frames_from_stream; i++) {
 		ls->bufs.in.data[0][i] = mixed_frames[i].x;
 		ls->bufs.in.data[1][i] = mixed_frames[i].y;
 	}
@@ -173,7 +176,6 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 		binauralParams.direction = direction;
 		binauralParams.interpolation = ls->hrtfInterpolation;
 		binauralParams.spatialBlend = 1.0f;
-		// TODO the steamaudio fmod plugin uses 2 hrtfs here, maybe we need that as well?
 		binauralParams.hrtf = gs->hrtf;
 
 		iplBinauralEffectApply(ls->fx.binaural, &binauralParams, &ls->bufs.direct, &ls->bufs.out);
@@ -187,6 +189,7 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 		iplPanningEffectApply(ls->fx.panning, &panningParams, &ls->bufs.mono, &ls->bufs.out);
 	}
 
+	bool reflection_tail_active = false;
 	if(ls->src.simulationSource && ls->cfg.is_reflection_on /* TODO: || pathing_on */) {
 		IPLSimulationOutputs outputs;
 		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
@@ -198,7 +201,16 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 			outputs.reflections.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
 			outputs.reflections.tanDevice = nullptr;
 
-			iplReflectionEffectApply(ls->fx.refl, &outputs.reflections, &ls->bufs.mono, &ls->bufs.refl, nullptr);
+			if (num_frames_from_stream > 0) {
+				// this should only be called when we have actual samples from the inner stream left!
+				iplReflectionEffectApply(ls->fx.refl, &outputs.reflections, &ls->bufs.mono, &ls->bufs.refl, nullptr);
+				reflection_tail_active = true;
+			}
+			else {
+				// when we don't have any samples left, call this and only then will we be able to determine the end of this stream!
+				IPLAudioEffectState reflection_state = iplReflectionEffectGetTail(ls->fx.refl, &ls->bufs.refl, nullptr);
+				reflection_tail_active = reflection_state == IPL_AUDIOEFFECTSTATE_TAILREMAINING;
+			}
 			SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
 			IPLAmbisonicsDecodeEffectParams ambisonicsParams;
 			ambisonicsParams.order = ls->cfg.ambisonics_order;
@@ -213,6 +225,12 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 
 		// TODO: skipped the "PathingEffect" for now, but here would be the place.
 		// (line 1420 in fmod/src/spatialize_effect.cpp)
+	}
+	if (!reflection_tail_active) {
+		frames = num_frames_from_stream;
+		if (frames == 0) {
+			is_active = false;
+		}
 	}
 
 
@@ -237,6 +255,7 @@ int SteamAudioStreamPlayback::play_stream(const Ref<AudioStream> &p_stream, floa
 		return 0;
 	}
 
+	is_active = true;
 	stream = p_stream;
 	stream_playback = stream->instantiate_playback();
 	stream_playback->start(p_from_offset);

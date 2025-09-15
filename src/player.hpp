@@ -8,6 +8,7 @@
 #include <phonon.h>
 #include <godot_cpp/classes/audio_stream_player3d.hpp>
 
+class SteamAudioStream;
 using namespace godot;
 
 class SteamAudioPlayer : public AudioStreamPlayer3D {
@@ -16,7 +17,7 @@ class SteamAudioPlayer : public AudioStreamPlayer3D {
 private:
 	// This ref is kept because at destruction we can't get the playback
 	// since the player has stopped (even though the playback still mixes...)
-	Ref<AudioStreamPlayback> pb;
+	Ref<SteamAudioStream> pb;
 
 	// TODO: we can probably move these values inside local state
 	// for cleanup and the ability to adjust them at runtime
@@ -34,6 +35,7 @@ private:
 	};
 
 	LocalSteamAudioState local_state;
+	std::atomic<bool> is_source_in_simulation = false;
 	std::atomic<bool> is_local_state_init;
 	std::atomic<bool> can_load_local_state;
 

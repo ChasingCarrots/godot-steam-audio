@@ -111,7 +111,10 @@ SteamAudioPlayer::~SteamAudioPlayer() {
 	is_local_state_init.store(false);
 	auto gs = SteamAudioServer::get_singleton()->get_global_state();
 
-	iplSourceRemove(local_state.src.simulationSource, gs->sim);
+	if (is_source_in_simulation) {
+		is_source_in_simulation = false;
+		SteamAudioServer::get_singleton()->remove_source_from_sim(local_state.src.simulationSource);
+	}
 	iplSourceRelease(&local_state.src.simulationSource);
 	iplDirectEffectRelease(&local_state.fx.direct);
 
@@ -145,42 +148,51 @@ void SteamAudioPlayer::init_local_state() {
 
 	IPLSourceSettings src_cfg{};
 	src_cfg.flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
-	iplSourceCreate(gs->sim, &src_cfg, &local_state.src.simulationSource);
-	iplSourceAdd(local_state.src.simulationSource, gs->sim);
+	IPLerror err = iplSourceCreate(gs->sim, &src_cfg, &local_state.src.simulationSource);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplSourceCreate failed", err);
+	is_source_in_simulation = true;
+	SteamAudioServer::get_singleton()->add_source_to_sim(local_state.src.simulationSource);
 
-	// TODO: check if we can't create effects globally and use their Reset functions.
-	// If we create these globally and use them for all sources, then strange things happen
-	// (e.g. one source may start to play audio from all sources and positioning gets screwed)
-	IPLDirectEffectSettings dir_effect_cfg;
+	IPLDirectEffectSettings dir_effect_cfg{};
 	dir_effect_cfg.numChannels = 2;
-	iplDirectEffectCreate(gs->ctx, &gs->audio_cfg, &dir_effect_cfg, &local_state.fx.direct);
+	err = iplDirectEffectCreate(gs->ctx, &gs->audio_cfg, &dir_effect_cfg, &local_state.fx.direct);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplDirectEffectCreate failed", err);
 
 	// TODO: make binaural configurable and don't even create the effect when not neccessary
-	IPLBinauralEffectSettings effectSettings;
+	IPLBinauralEffectSettings effectSettings{};
 	effectSettings.hrtf = gs->hrtf;
 	// TODO: make interpolation configurable
 	local_state.hrtfInterpolation = IPL_HRTFINTERPOLATION_NEAREST;
-	iplBinauralEffectCreate(gs->ctx, &gs->audio_cfg, &effectSettings, &local_state.fx.binaural);
+	err = iplBinauralEffectCreate(gs->ctx, &gs->audio_cfg, &effectSettings, &local_state.fx.binaural);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplBinauralEffectCreate failed", err);
 
 	IPLReflectionEffectSettings refl_effect_cfg{};
 	refl_effect_cfg.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
 	refl_effect_cfg.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
 	refl_effect_cfg.numChannels = ambisonic_channels_from(local_state.cfg.ambisonics_order);
-	iplReflectionEffectCreate(gs->ctx, &gs->audio_cfg, &refl_effect_cfg, &local_state.fx.refl);
+	err = iplReflectionEffectCreate(gs->ctx, &gs->audio_cfg, &refl_effect_cfg, &local_state.fx.refl);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplReflEffectCreate failed", err);
 
-	IPLAmbisonicsDecodeEffectSettings ambi_effectSettings;
+	IPLAmbisonicsDecodeEffectSettings ambi_effectSettings{};
 	ambi_effectSettings.speakerLayout = { IPL_SPEAKERLAYOUTTYPE_STEREO, 2, nullptr };
 	ambi_effectSettings.hrtf = gs->hrtf;
 	ambi_effectSettings.maxOrder = local_state.cfg.ambisonics_order;
 
-	iplAmbisonicsDecodeEffectCreate(gs->ctx, &gs->audio_cfg, &ambi_effectSettings, &local_state.fx.ambisonics);
+	err = iplAmbisonicsDecodeEffectCreate(gs->ctx, &gs->audio_cfg, &ambi_effectSettings, &local_state.fx.ambisonics);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplAmbisonicsDecodeEffectCreate failed", err);
 
-	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.in);
-	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.direct);
-	iplAudioBufferAllocate(gs->ctx, ambisonic_channels_from(local_state.cfg.ambisonics_order), gs->audio_cfg.frameSize, &local_state.bufs.refl);
-	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.out);
-	iplAudioBufferAllocate(gs->ctx, 1, gs->audio_cfg.frameSize, &local_state.bufs.mono);
-	iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.refl_out);
+	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.in);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate in buf failed", err);
+	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.direct);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate direct buf failed", err);
+	err = iplAudioBufferAllocate(gs->ctx, ambisonic_channels_from(local_state.cfg.ambisonics_order), gs->audio_cfg.frameSize, &local_state.bufs.refl);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate refl buf failed", err);
+	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.out);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate out buf failed", err);
+	err = iplAudioBufferAllocate(gs->ctx, 1, gs->audio_cfg.frameSize, &local_state.bufs.mono);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate mono buf failed", err);
+	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.refl_out);
+	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate refl_out buf failed", err);
 	local_state.src.player = this;
 
 	SteamAudio::log(SteamAudio::log_debug, "init local state done");
@@ -236,6 +248,9 @@ void SteamAudioPlayer::ready_internal() {
 	if (cfg.occ_samples > SteamAudioConfig::max_num_occ_samples) {
 		cfg.occ_samples = SteamAudioConfig::max_num_occ_samples;
 	}
+
+	// initialize the steam audio stuff right away:
+	get_local_state();
 }
 
 void SteamAudioPlayer::process_internal(double delta) {
@@ -250,6 +265,14 @@ void SteamAudioPlayer::process_internal(double delta) {
 
 	if (is_playing() && !get_stream_playback().is_null()) {
 		pb = get_stream_playback();
+	}
+	if (is_source_in_simulation && !is_playing()) {
+		is_source_in_simulation = false;
+		SteamAudioServer::get_singleton()->remove_source_from_sim(local_state.src.simulationSource);
+	}
+	if (!is_source_in_simulation && is_playing()) {
+		is_source_in_simulation = true;
+		SteamAudioServer::get_singleton()->add_source_to_sim(local_state.src.simulationSource);
 	}
 }
 
@@ -281,6 +304,11 @@ void SteamAudioPlayer::play_stream(const Ref<AudioStream> &p_stream, float p_fro
 	}
 
 	playback_ptr->play_stream(p_stream, p_from_offset, p_volume_db, p_pitch_scale);
+
+	if (!is_source_in_simulation) {
+		is_source_in_simulation = true;
+		SteamAudioServer::get_singleton()->add_source_to_sim(local_state.src.simulationSource);
+	}
 }
 
 Ref<AudioStream> SteamAudioPlayer::get_inner_stream() {

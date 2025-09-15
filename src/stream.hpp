@@ -26,6 +26,7 @@ public:
 	~SteamAudioStream();
 
 	Ref<AudioStreamPlayback> _instantiate_playback() const override;
+	double _get_length() const override { return 0; }
 	void set_stream(Ref<AudioStream> p_stream);
 	Ref<AudioStream> get_stream();
 
@@ -58,6 +59,7 @@ public:
 	void _start(double from_pos) override;
 	void _stop() override;
 	bool _is_playing() const override;
+
 
 	SteamAudioPlayer *parent = nullptr;
 };

@@ -19,6 +19,10 @@ private:
 	GlobalSteamAudioState global_state{};
 	std::vector<LocalSteamAudioState *> local_states;
 
+	int num_sources_in_sim = 0;
+	bool scene_dirty = false;
+	bool simulator_dirty = false;
+
 	std::atomic<bool> is_global_state_init;
 	std::atomic<bool> is_refl_thread_processing;
 	std::atomic<bool> is_running;
@@ -35,7 +39,6 @@ private:
 	// TODO: allow for multiple
 	SteamAudioListener *listener = nullptr;
 
-	void init_scene(IPLSceneSettings *scene_cfg);
 	void start_refl_sim();
 	void run_refl_sim();
 	Ref<Thread> refl_thread;
@@ -57,6 +60,8 @@ public:
 	void remove_static_mesh(IPLStaticMesh mesh);
 	void add_dynamic_mesh(IPLInstancedMesh mesh);
 	void remove_dynamic_mesh(IPLInstancedMesh mesh);
+	void add_source_to_sim(IPLSource source);
+	void remove_source_from_sim(IPLSource source);
 
 	void tick();
 };
