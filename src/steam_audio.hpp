@@ -58,6 +58,7 @@ struct SteamAudioSourceConfig {
 	bool is_transmission_on;
 	int transmission_type;
 	bool is_binaural_on;
+	bool skip_direct_audio;
 };
 
 struct SteamAudioEffects {
@@ -81,7 +82,18 @@ struct LocalSteamAudioState {
 	SteamAudioSource src;
 	LocalSteamAudioBuffers bufs;
 	SteamAudioEffects fx;
-	SteamAudioSourceConfig cfg;
+	SteamAudioSourceConfig cfg {
+		4.0f,
+		32,
+		16,
+		0.0f,
+		1,
+		10000.0f,
+		false,
+		true,
+		true,
+		false
+	};
 	IPLHRTFInterpolation hrtfInterpolation;
 	std::shared_mutex mux;
 };

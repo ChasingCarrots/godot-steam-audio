@@ -18,22 +18,6 @@ private:
 	// This ref is kept because at destruction we can't get the playback
 	// since the player has stopped (even though the playback still mixes...)
 	Ref<SteamAudioStream> pb;
-
-	// TODO: we can probably move these values inside local state
-	// for cleanup and the ability to adjust them at runtime
-	SteamAudioSourceConfig cfg{
-		4.0f,
-		32,
-		16,
-		0.0f,
-		1,
-		10000.0f,
-		false,
-		true,
-		true,
-		false
-	};
-
 	LocalSteamAudioState local_state;
 	std::atomic<bool> is_source_in_simulation = false;
 	std::atomic<bool> is_local_state_init;
@@ -86,6 +70,8 @@ public:
 	void set_transmission_on(bool p_transmission_on);
 	bool is_binaural_on();
 	void set_binaural_on(bool p_binaural_on);
+	bool SteamAudioPlayer::is_skip_direct_audio_on();
+	void SteamAudioPlayer::set_skip_direct_audio_on(bool p_direct_on);
 
 	void play_stream(const Ref<AudioStream> &p_stream, float p_from_offset, float p_volume_db, float p_pitch_scale);
 	Ref<AudioStream> get_inner_stream();

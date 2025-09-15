@@ -164,29 +164,31 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 		ls->bufs.in.data[1][i] = mixed_frames[i].y;
 	}
 
-	IPLDirectEffectParams directParams = getDirectParams(gs, ls, sourceCoordinates, listenerCoordinates);
+	if (!ls->cfg.skip_direct_audio) {
+		IPLDirectEffectParams directParams = getDirectParams(gs, ls, sourceCoordinates, listenerCoordinates);
 
-	iplDirectEffectApply(
-			ls->fx.direct, &directParams,
-			&ls->bufs.in, &ls->bufs.direct);
+		iplDirectEffectApply(
+				ls->fx.direct, &directParams,
+				&ls->bufs.in, &ls->bufs.direct);
 
-	if (ls->cfg.is_binaural_on) {
-		PROFILE_FUNCTION_NAMED(apply_binaural)
-		IPLBinauralEffectParams binauralParams{};
-		binauralParams.direction = direction;
-		binauralParams.interpolation = ls->hrtfInterpolation;
-		binauralParams.spatialBlend = 1.0f;
-		binauralParams.hrtf = gs->hrtf;
+		if (ls->cfg.is_binaural_on) {
+			PROFILE_FUNCTION_NAMED(apply_binaural)
+			IPLBinauralEffectParams binauralParams{};
+			binauralParams.direction = direction;
+			binauralParams.interpolation = ls->hrtfInterpolation;
+			binauralParams.spatialBlend = 1.0f;
+			binauralParams.hrtf = gs->hrtf;
 
-		iplBinauralEffectApply(ls->fx.binaural, &binauralParams, &ls->bufs.direct, &ls->bufs.out);
-	} else {
-		PROFILE_FUNCTION_NAMED(apply_panning)
-		iplAudioBufferDownmix(gs->ctx, &ls->bufs.direct, &ls->bufs.mono);
+			iplBinauralEffectApply(ls->fx.binaural, &binauralParams, &ls->bufs.direct, &ls->bufs.out);
+		} else {
+			PROFILE_FUNCTION_NAMED(apply_panning)
+			iplAudioBufferDownmix(gs->ctx, &ls->bufs.direct, &ls->bufs.mono);
 
-		IPLPanningEffectParams panningParams{};
-		panningParams.direction = direction;
+			IPLPanningEffectParams panningParams{};
+			panningParams.direction = direction;
 
-		iplPanningEffectApply(ls->fx.panning, &panningParams, &ls->bufs.mono, &ls->bufs.out);
+			iplPanningEffectApply(ls->fx.panning, &panningParams, &ls->bufs.mono, &ls->bufs.out);
+		}
 	}
 
 	bool reflection_tail_active = false;
@@ -211,16 +213,21 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 				IPLAudioEffectState reflection_state = iplReflectionEffectGetTail(ls->fx.refl, &ls->bufs.refl, nullptr);
 				reflection_tail_active = reflection_state == IPL_AUDIOEFFECTSTATE_TAILREMAINING;
 			}
-			SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
 			IPLAmbisonicsDecodeEffectParams ambisonicsParams;
 			ambisonicsParams.order = ls->cfg.ambisonics_order;
 			ambisonicsParams.hrtf = gs->hrtf;
 			ambisonicsParams.orientation = listenerCoordinates;
 			ambisonicsParams.binaural = IPL_TRUE;
 
-			iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.refl_out);
-
-			iplAudioBufferMix(gs->ctx, &ls->bufs.refl_out, &ls->bufs.out);
+			if (!ls->cfg.skip_direct_audio) {
+				SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
+				iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.refl_out);
+				iplAudioBufferMix(gs->ctx, &ls->bufs.refl_out, &ls->bufs.out);
+			}
+			else {
+				SteamAudio::log(SteamAudio::log_debug, "mixing: applying the ambisonics directly to the out buffer");
+				iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.out);
+			}
 		}
 
 		// TODO: skipped the "PathingEffect" for now, but here would be the place.
