@@ -37,24 +37,31 @@ void SteamAudioServer::tick() {
 			continue;
 		}
 
-		IPLDistanceAttenuationModel attn_model{};
-		attn_model.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
-		attn_model.minDistance = ls->cfg.min_attn_dist;
+		IPLSimulationInputs inputs{};
+
+		if (ls->cfg.is_dist_attn_on) {
+			IPLDistanceAttenuationModel attn_model{};
+			attn_model.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
+			attn_model.minDistance = ls->cfg.min_attn_dist;
+			inputs.distanceAttenuationModel = attn_model;
+		}
 
 		IPLCoordinateSpace3 src_coords = ipl_coords_from(ls->src.player->get_global_transform());
 
-		IPLSimulationInputs inputs{};
 		inputs.flags = IPL_SIMULATIONFLAGS_DIRECT;
-		inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
-				IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
-				IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
-				IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
-		inputs.distanceAttenuationModel = attn_model;
+		if (ls->cfg.is_dist_attn_on)
+			inputs.directFlags = static_cast<IPLDirectSimulationFlags>( inputs.directFlags | IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION);
+		if (ls->cfg.is_occlusion_on) {
+			inputs.directFlags = static_cast<IPLDirectSimulationFlags>( inputs.directFlags | IPL_DIRECTSIMULATIONFLAGS_OCCLUSION);
+			inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
+			inputs.occlusionRadius = ls->cfg.occ_radius;
+			inputs.numOcclusionSamples = ls->cfg.occ_samples;
+			inputs.numTransmissionRays = ls->cfg.transm_rays;
+		}
+		if (ls->cfg.is_transmission_on)
+			inputs.directFlags = static_cast<IPLDirectSimulationFlags>( inputs.directFlags | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+
 		inputs.source = src_coords;
-		inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
-		inputs.occlusionRadius = ls->cfg.occ_radius;
-		inputs.numOcclusionSamples = ls->cfg.occ_samples;
-		inputs.numTransmissionRays = ls->cfg.transm_rays;
 
 		SteamAudio::log(SteamAudio::log_debug, "tick: setting inputs");
 		iplSourceSetInputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
@@ -72,6 +79,9 @@ void SteamAudioServer::tick() {
 					"local state has empty player, not updating simulation state");
 		}
 		if (!ls->src.player->is_playing()) {
+			continue;
+		}
+		if (!ls->cfg.is_reflection_on) {
 			continue;
 		}
 		if (ls->src.player->get_global_position().distance_to(listener->get_global_position()) > ls->cfg.max_refl_dist) {
@@ -201,12 +211,14 @@ void SteamAudioServer::run_refl_sim() {
 			if(!is_running.load())
 				break;
 		}
-		PROFILE_FUNCTION_NAMED(run_simulation_refl)
-		is_refl_thread_processing.store(true);
-		new_inputs_set.store(false);
-		SteamAudio::log(SteamAudio::log_debug, "running reflection sim");
-		iplSimulatorRunReflections(global_state.sim);
-		is_refl_thread_processing.store(false);
+		{
+			PROFILE_FUNCTION_NAMED(run_simulation_refl)
+			is_refl_thread_processing.store(true);
+			new_inputs_set.store(false);
+			SteamAudio::log(SteamAudio::log_debug, "running reflection sim");
+			iplSimulatorRunReflections(global_state.sim);
+			is_refl_thread_processing.store(false);
+		}
 	}
 }
 

@@ -45,6 +45,7 @@ struct SteamAudioSourceConfig {
 	int occ_samples;
 	int transm_rays;
 	float min_attn_dist;
+	float max_attn_dist;
 	int ambisonics_order;
 	float max_refl_dist;
 	bool is_dist_attn_on;
@@ -58,6 +59,7 @@ struct SteamAudioSourceConfig {
 	bool is_transmission_on;
 	int transmission_type;
 	bool is_binaural_on;
+	bool is_binaural_interpolation_on;
 	bool skip_direct_audio;
 };
 
@@ -86,7 +88,8 @@ struct LocalSteamAudioState {
 		4.0f,
 		32,
 		16,
-		0.0f,
+		1.0f,
+		10.0f,
 		1,
 		10000.0f,
 		false,

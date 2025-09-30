@@ -42,6 +42,9 @@ IPLDirectEffectParams getDirectParams(GlobalSteamAudioState* gs,
 	IPLSimulationOutputs outputs{};
 	iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 
+	float dist = (Vector3(source.origin.x, source.origin.y, source.origin.z) -
+					Vector3(listener.origin.x, listener.origin.y, listener.origin.z)).length();
+
     outputs.direct.transmissionType = ls->cfg.transmission_type == 0
 		? IPL_TRANSMISSIONTYPE_FREQINDEPENDENT
 		: IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
@@ -54,11 +57,9 @@ IPLDirectEffectParams getDirectParams(GlobalSteamAudioState* gs,
     else
     {
     	outputs.direct.flags = static_cast<IPLDirectEffectFlags>(outputs.direct.flags | IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
-        IPLDistanceAttenuationModel distanceAttenuationModel{};
-        distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
-    	distanceAttenuationModel.minDistance = ls->cfg.min_attn_dist;
 
-        outputs.direct.distanceAttenuation = iplDistanceAttenuationCalculate(gs->ctx, source.origin, listener.origin, &distanceAttenuationModel);
+        outputs.direct.distanceAttenuation = 1.0f - Math::clamp(Math::inverse_lerp(ls->cfg.min_attn_dist, ls->cfg.max_attn_dist, dist), 0.0f, 1.0f);
+    	outputs.direct.distanceAttenuation *= outputs.direct.distanceAttenuation;
     }
 
     if (!ls->cfg.is_air_absorption_on)
@@ -220,11 +221,13 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 			ambisonicsParams.binaural = IPL_TRUE;
 
 			if (!ls->cfg.skip_direct_audio) {
+				PROFILE_FUNCTION_NAMED(ambisonic_mixing)
 				SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
 				iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.refl_out);
 				iplAudioBufferMix(gs->ctx, &ls->bufs.refl_out, &ls->bufs.out);
 			}
 			else {
+				PROFILE_FUNCTION_NAMED(ambisonic_mixing)
 				SteamAudio::log(SteamAudio::log_debug, "mixing: applying the ambisonics directly to the out buffer");
 				iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.out);
 			}

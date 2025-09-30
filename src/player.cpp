@@ -17,6 +17,8 @@ void SteamAudioPlayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_dist_attn_on", "p_dist_attn_on"), &SteamAudioPlayer::set_dist_attn_on);
 	ClassDB::bind_method(D_METHOD("get_min_attenuation_distance"), &SteamAudioPlayer::get_min_attenuation_dist);
 	ClassDB::bind_method(D_METHOD("set_min_attenuation_distance", "p_min_attenuation_distance"), &SteamAudioPlayer::set_min_attenuation_dist);
+	ClassDB::bind_method(D_METHOD("get_max_attenuation_distance"), &SteamAudioPlayer::get_max_attenuation_dist);
+	ClassDB::bind_method(D_METHOD("set_max_attenuation_distance", "p_max_attenuation_distance"), &SteamAudioPlayer::set_max_attenuation_dist);
 	ClassDB::bind_method(D_METHOD("set_max_reflection_distance", "p_max_reflection_distance"), &SteamAudioPlayer::set_max_reflection_dist);
 	ClassDB::bind_method(D_METHOD("get_max_reflection_distance"), &SteamAudioPlayer::get_max_reflection_dist);
 	ClassDB::bind_method(D_METHOD("is_occlusion_on"), &SteamAudioPlayer::is_occlusion_on);
@@ -31,6 +33,8 @@ void SteamAudioPlayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_transmission_on", "p_transmission_on"), &SteamAudioPlayer::set_transmission_on);
 	ClassDB::bind_method(D_METHOD("is_binaural_on"), &SteamAudioPlayer::is_binaural_on);
 	ClassDB::bind_method(D_METHOD("set_binaural_on", "p_binaural_on"), &SteamAudioPlayer::set_binaural_on);
+	ClassDB::bind_method(D_METHOD("is_binaural_interpolation_on"), &SteamAudioPlayer::is_binaural_interpolation_on);
+	ClassDB::bind_method(D_METHOD("set_binaural_interpolation_on", "p_binaural_interpolation_on"), &SteamAudioPlayer::set_binaural_interpolation_on);
 	ClassDB::bind_method(D_METHOD("is_skip_direct_audio_on"), &SteamAudioPlayer::is_skip_direct_audio_on);
 	ClassDB::bind_method(D_METHOD("set_skip_direct_audio_on", "p_binaural_on"), &SteamAudioPlayer::set_skip_direct_audio_on);
 	ClassDB::bind_method(D_METHOD("get_occlusion_radius"), &SteamAudioPlayer::get_occlusion_radius);
@@ -53,10 +57,12 @@ void SteamAudioPlayer::_bind_methods() {
 
 	ADD_GROUP("Binaural", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "binaural"), "set_binaural_on", "is_binaural_on");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "binaural_interpolation"), "set_binaural_interpolation_on", "is_binaural_interpolation_on");
 
 	ADD_GROUP("Distance Attenuation", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "distance_attenuation"), "set_dist_attn_on", "is_dist_attn_on");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_attenuation_distance", PROPERTY_HINT_RANGE, "0.0,100.0,0.1"), "set_min_attenuation_distance", "get_min_attenuation_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_attenuation_distance", PROPERTY_HINT_RANGE, "5.0,1000.0,0.1"), "set_max_attenuation_distance", "get_max_attenuation_distance");
 
 	ADD_GROUP("Air Absorption", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "air_absorption"), "set_air_absorption_on", "is_air_absorption_on");
@@ -151,7 +157,9 @@ void SteamAudioPlayer::init_local_state() {
 	auto gs = SteamAudioServer::get_singleton()->get_global_state();
 
 	IPLSourceSettings src_cfg{};
-	src_cfg.flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+	src_cfg.flags = IPL_SIMULATIONFLAGS_DIRECT;
+	if (local_state.cfg.is_reflection_on)
+		src_cfg.flags = static_cast<IPLSimulationFlags>(src_cfg.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
 	IPLerror err = iplSourceCreate(gs->sim, &src_cfg, &local_state.src.simulationSource);
 	if (err != IPL_STATUS_SUCCESS) print_line("iplSourceCreate failed", err);
 	is_source_in_simulation = true;
@@ -162,41 +170,46 @@ void SteamAudioPlayer::init_local_state() {
 	err = iplDirectEffectCreate(gs->ctx, &gs->audio_cfg, &dir_effect_cfg, &local_state.fx.direct);
 	if (err != IPL_STATUS_SUCCESS) print_line("iplDirectEffectCreate failed", err);
 
-	// TODO: make binaural configurable and don't even create the effect when not neccessary
 	IPLBinauralEffectSettings effectSettings{};
 	effectSettings.hrtf = gs->hrtf;
-	// TODO: make interpolation configurable
-	local_state.hrtfInterpolation = IPL_HRTFINTERPOLATION_NEAREST;
+	if (local_state.cfg.is_binaural_interpolation_on)
+		local_state.hrtfInterpolation = IPL_HRTFINTERPOLATION_BILINEAR;
+	else
+		local_state.hrtfInterpolation = IPL_HRTFINTERPOLATION_NEAREST;
 	err = iplBinauralEffectCreate(gs->ctx, &gs->audio_cfg, &effectSettings, &local_state.fx.binaural);
 	if (err != IPL_STATUS_SUCCESS) print_line("iplBinauralEffectCreate failed", err);
 
-	IPLReflectionEffectSettings refl_effect_cfg{};
-	refl_effect_cfg.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-	refl_effect_cfg.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
-	refl_effect_cfg.numChannels = ambisonic_channels_from(local_state.cfg.ambisonics_order);
-	err = iplReflectionEffectCreate(gs->ctx, &gs->audio_cfg, &refl_effect_cfg, &local_state.fx.refl);
-	if (err != IPL_STATUS_SUCCESS) print_line("iplReflEffectCreate failed", err);
+	if (local_state.cfg.is_reflection_on) {
+		IPLReflectionEffectSettings refl_effect_cfg{};
+		refl_effect_cfg.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+		refl_effect_cfg.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
+		refl_effect_cfg.numChannels = ambisonic_channels_from(local_state.cfg.ambisonics_order);
+		err = iplReflectionEffectCreate(gs->ctx, &gs->audio_cfg, &refl_effect_cfg, &local_state.fx.refl);
+		if (err != IPL_STATUS_SUCCESS) print_line("iplReflEffectCreate failed", err);
+		IPLAmbisonicsDecodeEffectSettings ambi_effectSettings{};
+		ambi_effectSettings.speakerLayout = { IPL_SPEAKERLAYOUTTYPE_STEREO, 2, nullptr };
+		ambi_effectSettings.hrtf = gs->hrtf;
+		ambi_effectSettings.maxOrder = local_state.cfg.ambisonics_order;
 
-	IPLAmbisonicsDecodeEffectSettings ambi_effectSettings{};
-	ambi_effectSettings.speakerLayout = { IPL_SPEAKERLAYOUTTYPE_STEREO, 2, nullptr };
-	ambi_effectSettings.hrtf = gs->hrtf;
-	ambi_effectSettings.maxOrder = local_state.cfg.ambisonics_order;
+		err = iplAmbisonicsDecodeEffectCreate(gs->ctx, &gs->audio_cfg, &ambi_effectSettings, &local_state.fx.ambisonics);
+		if (err != IPL_STATUS_SUCCESS) print_line("iplAmbisonicsDecodeEffectCreate failed", err);
 
-	err = iplAmbisonicsDecodeEffectCreate(gs->ctx, &gs->audio_cfg, &ambi_effectSettings, &local_state.fx.ambisonics);
-	if (err != IPL_STATUS_SUCCESS) print_line("iplAmbisonicsDecodeEffectCreate failed", err);
+		err = iplAudioBufferAllocate(gs->ctx, ambisonic_channels_from(local_state.cfg.ambisonics_order), gs->audio_cfg.frameSize, &local_state.bufs.refl);
+		if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate refl buf failed", err);
+		err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.refl_out);
+		if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate refl_out buf failed", err);
+	}
+
 
 	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.in);
 	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate in buf failed", err);
 	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.direct);
 	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate direct buf failed", err);
-	err = iplAudioBufferAllocate(gs->ctx, ambisonic_channels_from(local_state.cfg.ambisonics_order), gs->audio_cfg.frameSize, &local_state.bufs.refl);
-	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate refl buf failed", err);
 	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.out);
 	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate out buf failed", err);
 	err = iplAudioBufferAllocate(gs->ctx, 1, gs->audio_cfg.frameSize, &local_state.bufs.mono);
 	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate mono buf failed", err);
-	err = iplAudioBufferAllocate(gs->ctx, 2, gs->audio_cfg.frameSize, &local_state.bufs.refl_out);
-	if (err != IPL_STATUS_SUCCESS) print_line("iplAudioBufferAllocate refl_out buf failed", err);
+
 	local_state.src.player = this;
 
 	SteamAudio::log(SteamAudio::log_debug, "init local state done");
@@ -307,6 +320,7 @@ void SteamAudioPlayer::play_stream(const Ref<AudioStream> &p_stream, float p_fro
 		return;
 	}
 
+
 	playback_ptr->play_stream(p_stream, p_from_offset, p_volume_db, p_pitch_scale);
 
 	if (!is_source_in_simulation) {
@@ -347,6 +361,8 @@ int SteamAudioPlayer::get_transmission_rays() { return local_state.cfg.transm_ra
 void SteamAudioPlayer::set_transmission_rays(int p_transmission_rays) { local_state.cfg.transm_rays = p_transmission_rays; }
 float SteamAudioPlayer::get_min_attenuation_dist() { return local_state.cfg.min_attn_dist; }
 void SteamAudioPlayer::set_min_attenuation_dist(float p_min_attenuation_dist) { local_state.cfg.min_attn_dist = p_min_attenuation_dist; }
+float SteamAudioPlayer::get_max_attenuation_dist() { return local_state.cfg.max_attn_dist; }
+void SteamAudioPlayer::set_max_attenuation_dist(float p_max_attenuation_dist) { local_state.cfg.max_attn_dist = p_max_attenuation_dist; }
 int SteamAudioPlayer::get_ambisonics_order() { return local_state.cfg.ambisonics_order; }
 void SteamAudioPlayer::set_ambisonics_order(int p_ambisonics_order) { local_state.cfg.ambisonics_order = p_ambisonics_order; }
 float SteamAudioPlayer::get_max_reflection_dist() { return local_state.cfg.max_refl_dist; }
@@ -372,6 +388,8 @@ bool SteamAudioPlayer::is_transmission_on() { return local_state.cfg.is_transmis
 void SteamAudioPlayer::set_transmission_on(bool p_transmission_on) { local_state.cfg.is_transmission_on = p_transmission_on; }
 bool SteamAudioPlayer::is_binaural_on() { return local_state.cfg.is_binaural_on; }
 void SteamAudioPlayer::set_binaural_on(bool p_binaural_on) { local_state.cfg.is_binaural_on = p_binaural_on; }
+bool SteamAudioPlayer::is_binaural_interpolation_on() { return local_state.cfg.is_binaural_interpolation_on; }
+void SteamAudioPlayer::set_binaural_interpolation_on(bool p_binaural_interpolation_on) { local_state.cfg.is_binaural_interpolation_on = p_binaural_interpolation_on; }
 bool SteamAudioPlayer::is_skip_direct_audio_on() { return local_state.cfg.skip_direct_audio; }
 void SteamAudioPlayer::set_skip_direct_audio_on(bool p_direct_on) { local_state.cfg.skip_direct_audio = p_direct_on; }
 

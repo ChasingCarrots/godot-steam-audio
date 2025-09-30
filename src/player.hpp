@@ -45,6 +45,8 @@ public:
 	void set_transmission_rays(int p_transmission_rays);
 	float get_min_attenuation_dist();
 	void set_min_attenuation_dist(float p_min_attenuation_dist);
+	float get_max_attenuation_dist();
+	void set_max_attenuation_dist(float p_max_attenuation_dist);
 	int get_ambisonics_order();
 	void set_ambisonics_order(int p_ambisonics_order);
 	float get_max_reflection_dist();
@@ -70,6 +72,8 @@ public:
 	void set_transmission_on(bool p_transmission_on);
 	bool is_binaural_on();
 	void set_binaural_on(bool p_binaural_on);
+	bool is_binaural_interpolation_on();
+	void set_binaural_interpolation_on(bool p_binaural_on);
 	bool SteamAudioPlayer::is_skip_direct_audio_on();
 	void SteamAudioPlayer::set_skip_direct_audio_on(bool p_direct_on);
 
