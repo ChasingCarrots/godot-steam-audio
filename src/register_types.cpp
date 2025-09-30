@@ -9,6 +9,7 @@
 #include "player.hpp"
 #include "server.hpp"
 #include "stream.hpp"
+#include "parameterized_audio_stream.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/core/class_db.hpp>
@@ -33,6 +34,14 @@ void init_ext(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<SteamAudioMaterial>();
 		ClassDB::register_class<SteamAudioConfig>();
 		ClassDB::register_class<SteamAudioPlayer>();
+		ClassDB::register_abstract_class<ParameterCondition>();
+		ClassDB::register_class<ParameterConditionComparison>();
+		ClassDB::register_class<ParameterConditionRange>();
+		ClassDB::register_abstract_class<ParameterizedOutput>();
+		ClassDB::register_class<ParameterizedOutputRandomize>();
+		ClassDB::register_class<ParameterizedAudioStreamInput>();
+		ClassDB::register_class<AudioStreamParameterized>();
+		ClassDB::register_class<AudioStreamPlaybackParameterized>();
 	}
 
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
