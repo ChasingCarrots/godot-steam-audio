@@ -60,6 +60,7 @@ void ParameterConditionComparison::_bind_methods() {
 
 	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "parameter_name"), "set_parameter_name", "get_parameter_name");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "comparison_type", PROPERTY_HINT_ENUM, "EQ,LT,GT,LTE,GTE,NEQ"), "set_comparison_type", "get_comparison_type");
+
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "value"), "set_value", "get_value");
 }
 
@@ -204,6 +205,214 @@ ParameterizedOutputRuntimeInstanceBase *ParameterizedOutputRandomize::create_run
 
 void ParameterizedOutputRandomize::release_runtime_instance(ParameterizedOutputRuntimeInstanceBase *instance) {
 	delete dynamic_cast<ParameterizedOutputRandomizeRuntimeInstance*>(instance);
+}
+
+// -------------------- AudioStreamParameterized --------------------
+void ParameterizedOutputGranularLinearSweep::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_input_stream"), &ParameterizedOutputGranularLinearSweep::GetInputStream);
+	ClassDB::bind_method(D_METHOD("set_input_stream", "input_stream"), &ParameterizedOutputGranularLinearSweep::SetInputStream);
+
+	ClassDB::bind_method(D_METHOD("get_sweeping_parameter_name"), &ParameterizedOutputGranularLinearSweep::GetSweepingParameterName);
+	ClassDB::bind_method(D_METHOD("set_sweeping_parameter_name", "sweeping_parameter_name"), &ParameterizedOutputGranularLinearSweep::SetSweepingParameterName);
+
+	ClassDB::bind_method(D_METHOD("get_min_parameter_value"), &ParameterizedOutputGranularLinearSweep::GetMinParameterValue);
+	ClassDB::bind_method(D_METHOD("set_min_parameter_value", "min_parameter_value"), &ParameterizedOutputGranularLinearSweep::SetMinParameterValue);
+
+	ClassDB::bind_method(D_METHOD("get_max_parameter_value"), &ParameterizedOutputGranularLinearSweep::GetMaxParameterValue);
+	ClassDB::bind_method(D_METHOD("set_max_parameter_value", "max_parameter_value"), &ParameterizedOutputGranularLinearSweep::SetMaxParameterValue);
+
+	ClassDB::bind_method(D_METHOD("get_min_grain_size_milliseconds"), &ParameterizedOutputGranularLinearSweep::GetMinGrainSizeMilliseconds);
+	ClassDB::bind_method(D_METHOD("set_min_grain_size_milliseconds", "min_grain_size_milliseconds"), &ParameterizedOutputGranularLinearSweep::SetMinGrainSizeMilliseconds);
+
+	ClassDB::bind_method(D_METHOD("get_max_grain_size_milliseconds"), &ParameterizedOutputGranularLinearSweep::GetMaxGrainSizeMilliseconds);
+	ClassDB::bind_method(D_METHOD("set_max_grain_size_milliseconds", "max_grain_size_milliseconds"), &ParameterizedOutputGranularLinearSweep::SetMaxGrainSizeMilliseconds);
+	ClassDB::bind_method(D_METHOD("get_grain_jitter_percentage"), &ParameterizedOutputGranularLinearSweep::GetGrainJitterPercentage);
+	ClassDB::bind_method(D_METHOD("set_grain_jitter_percentage", "grain_jitter_percent"), &ParameterizedOutputGranularLinearSweep::SetGrainJitterPercentage);
+
+	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "input_stream"), "set_input_stream", "get_input_stream");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "sweeping_parameter_name"), "set_sweeping_parameter_name", "get_sweeping_parameter_name");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_parameter_value"), "set_min_parameter_value", "get_min_parameter_value");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_parameter_value"), "set_max_parameter_value", "get_max_parameter_value");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_grain_size_milliseconds"), "set_min_grain_size_milliseconds", "get_min_grain_size_milliseconds");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_grain_size_milliseconds"), "set_max_grain_size_milliseconds", "get_max_grain_size_milliseconds");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "grain_jitter_percentage"), "set_grain_jitter_percentage", "get_grain_jitter_percentage");
+}
+
+class ParameterizedOutputGranularLinearSweepRuntimeInstance : public ParameterizedOutputRuntimeInstanceBase {
+public:
+	godot::StringName sweeping_parameter_name;
+	float min_parameter_value;
+	float max_parameter_value;
+	float min_grain_size_milliseconds = 20;
+	float max_grain_size_milliseconds = 20;
+	int mix_rate = 44100;
+	float grain_jitter_percent = 0.01f;
+	int grain_fade_window_samples = 50;
+	Ref<RandomNumberGenerator> randomizer;
+	ParameterizedAudioStreamInput* sweep_buffer_input = nullptr;
+	const AudioStreamPlaybackParameterized* parent_playback = nullptr;
+
+	float total_num_samples;
+	float min_grain_samples;
+	float max_grain_samples;
+	float total_num_grains_in_input;
+	float linear_step_grains;
+	float current_jitter_offset = 0.0f;
+	static constexpr int NUM_NO_REPEAT_GRAINS = 8;
+	int last_played_grains[NUM_NO_REPEAT_GRAINS];
+	inline bool is_repeat(int grain_number) {
+		for (int i = 0; i < NUM_NO_REPEAT_GRAINS; i++) { if (grain_number == last_played_grains[i]) return true; }
+		return false;
+	}
+	void initialize_grain_calculation() {
+		for (int i = 0; i < NUM_NO_REPEAT_GRAINS; i++) { last_played_grains[i] = 0; }
+		total_num_samples = sweep_buffer_input->input_as_buffer.size();
+		min_grain_samples = Math::floor(min_grain_size_milliseconds * mix_rate / 1000.0f);
+		max_grain_samples = Math::floor(max_grain_size_milliseconds * mix_rate / 1000.0f);
+		total_num_grains_in_input = (2.0f * total_num_samples)
+			/ (min_grain_samples + max_grain_samples);
+		linear_step_grains = (max_grain_samples - min_grain_samples) / (total_num_grains_in_input - 1.0f);
+	}
+	int get_grain_number(float factor) {
+		if (min_grain_samples == max_grain_samples) {
+			return Math::floor(total_num_grains_in_input * factor);
+		}
+		float sample_index = factor * total_num_samples;
+		float a = min_grain_samples - linear_step_grains / 2.0f;
+		float grain_number = (-a + Math::sqrt(a*a + 2.0f * linear_step_grains * sample_index)) / linear_step_grains;
+		return Math::floor(grain_number);
+	}
+	int get_grain_start_index(int grain_number) {
+		float grain_float = static_cast<float>(grain_number);
+		return Math::floor( (linear_step_grains / 2.0f) * grain_float * grain_float +
+			(min_grain_samples - linear_step_grains / 2.0f) * grain_float );
+	}
+	int get_grain_size(int grain_number) {
+		return min_grain_samples + static_cast<float>(grain_number) * linear_step_grains;
+	}
+
+	struct ActiveGrainData {
+		int grain_number;
+		int input_start;
+		float current_frame_number;
+		int number_of_samples;
+		int elapsed_samples;
+	};
+	ActiveGrainData CurrentGrain;
+	ActiveGrainData NextGrain;
+
+	void triggered() override {
+		// we just sweep forever, no triggering neccessary
+	}
+
+	bool mix_output_into_buffer(AudioFrame *p_buffer, float p_rate_scale, int32_t p_frames) override {
+		PROFILE_FUNCTION();
+		for (int frame_index = 0; frame_index < p_frames; frame_index++) {
+			float current_volume = 1.0f;
+			float next_volume = 0.0f;
+			int remaining_in_current = CurrentGrain.number_of_samples - CurrentGrain.elapsed_samples;
+			if (remaining_in_current == grain_fade_window_samples) {
+				// start up the next grain!
+				NextGrain = spawn_new_grain();
+			}
+			if (remaining_in_current <= grain_fade_window_samples) {
+				float factor_to_next = 1.0f - Math::inverse_lerp(0.0f, grain_fade_window_samples, remaining_in_current);
+				current_volume = Math::sqrt(1.0f - factor_to_next);
+				next_volume = Math::sqrt(factor_to_next);
+			}
+
+			int current_buffer_index = CurrentGrain.input_start + CurrentGrain.elapsed_samples;
+			p_buffer[frame_index].left += sweep_buffer_input->input_as_buffer[current_buffer_index].x * current_volume;
+			p_buffer[frame_index].right += sweep_buffer_input->input_as_buffer[current_buffer_index].y * current_volume;
+			CurrentGrain.elapsed_samples ++;
+			if (next_volume > 0.0f) {
+				int next_buffer_index = NextGrain.input_start + NextGrain.elapsed_samples;
+				p_buffer[frame_index].left += sweep_buffer_input->input_as_buffer[next_buffer_index].x * next_volume;
+				p_buffer[frame_index].right += sweep_buffer_input->input_as_buffer[next_buffer_index].y * next_volume;
+				NextGrain.elapsed_samples ++;
+			}
+			if (CurrentGrain.elapsed_samples >= CurrentGrain.number_of_samples) {
+				// the fade to the next has been completed, let's swap!
+				CurrentGrain = NextGrain;
+			}
+		}
+
+		return true;
+	}
+
+	ActiveGrainData spawn_new_grain() {
+		PROFILE_FUNCTION();
+		float parameter_as_fraction = Math::inverse_lerp(min_parameter_value, max_parameter_value, parent_playback->GetCurrentParameterValue(sweeping_parameter_name));
+		// we'll randomize the fraction a little, to get variance...
+		current_jitter_offset += 0.1f * randomizer->randf_range(-grain_jitter_percent, grain_jitter_percent);
+		current_jitter_offset = Math::clamp(current_jitter_offset, -grain_jitter_percent, grain_jitter_percent);
+		parameter_as_fraction += current_jitter_offset;
+		parameter_as_fraction = Math::clamp(parameter_as_fraction, 0.0f, 1.0f);
+
+		int grain_number = get_grain_number(parameter_as_fraction);
+		while (grain_number >= total_num_grains_in_input-1 || is_repeat(grain_number)) {
+			if (grain_number >= total_num_grains_in_input-1) {
+				grain_number -= 1;
+			}
+			else {
+				grain_number += randomizer->randi_range(-2, 2);
+				if (grain_number < 0) grain_number = 1;
+			}
+		}
+		for (int i = 0; i < NUM_NO_REPEAT_GRAINS - 1; ++i) {
+			last_played_grains[i] = last_played_grains[i + 1];
+		}
+		last_played_grains[NUM_NO_REPEAT_GRAINS - 1] = grain_number;
+		int start_frame = get_grain_start_index(grain_number);
+		int num_frames = get_grain_size(grain_number);
+
+		ActiveGrainData d{};
+		d.grain_number = grain_number;
+		d.input_start = start_frame;
+		d.current_frame_number = 0;
+		d.number_of_samples = num_frames;
+		d.elapsed_samples = 0;
+		return d;
+	}
+};
+
+
+
+ParameterizedOutputRuntimeInstanceBase *ParameterizedOutputGranularLinearSweep::create_runtime_instance(const AudioStreamPlaybackParameterized &from_playback) {
+	PROFILE_FUNCTION();
+	auto* instance = new ParameterizedOutputGranularLinearSweepRuntimeInstance();
+	instance->parent_playback = &from_playback;
+	instance->sweeping_parameter_name = sweeping_parameter_name;
+	instance->min_parameter_value = min_parameter_value;
+	instance->max_parameter_value = max_parameter_value;
+	instance->min_grain_size_milliseconds = min_grain_size_milliseconds;
+	instance->max_grain_size_milliseconds = max_grain_size_milliseconds;
+	instance->grain_jitter_percent = grain_jitter_percentage;
+	for (int input_index=0; input_index < from_playback.GetParent().GetInputs().size(); ++input_index) {
+		const auto input = cast_to<ParameterizedAudioStreamInput>(from_playback.GetParent().GetInputs()[input_index]);
+		if (input->GetInputName() == input_stream) {
+			instance->sweep_buffer_input = input;
+			break;
+		}
+	}
+	if (instance->sweep_buffer_input == nullptr) {
+		print_error("ParameterizedOutputGranularLinearSweep could not find input stream with name ", input_stream);
+		delete instance;
+		return nullptr;
+	}
+	static int random_seed = 74637;
+	random_seed += 24462;
+	instance->randomizer.instantiate();
+	instance->randomizer->set_seed(random_seed);
+	instance->initialize_grain_calculation();
+	instance->CurrentGrain = instance->spawn_new_grain();
+
+
+	return instance;
+}
+
+void ParameterizedOutputGranularLinearSweep::release_runtime_instance(ParameterizedOutputRuntimeInstanceBase *instance) {
+	delete dynamic_cast<ParameterizedOutputGranularLinearSweepRuntimeInstance*>(instance);
 }
 
 // -------------------- AudioStreamParameterized --------------------

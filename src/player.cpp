@@ -154,6 +154,9 @@ LocalSteamAudioState *SteamAudioPlayer::get_local_state() {
 
 void SteamAudioPlayer::init_local_state() {
 	SteamAudio::log(SteamAudio::log_debug, "init local state");
+
+	std::unique_lock lock(local_state.mux);
+
 	auto gs = SteamAudioServer::get_singleton()->get_global_state();
 
 	IPLSourceSettings src_cfg{};

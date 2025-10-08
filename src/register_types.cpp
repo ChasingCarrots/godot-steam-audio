@@ -39,6 +39,7 @@ void init_ext(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<ParameterConditionRange>();
 		ClassDB::register_abstract_class<ParameterizedOutput>();
 		ClassDB::register_class<ParameterizedOutputRandomize>();
+		ClassDB::register_class<ParameterizedOutputGranularLinearSweep>();
 		ClassDB::register_class<ParameterizedAudioStreamInput>();
 		ClassDB::register_class<AudioStreamParameterized>();
 		ClassDB::register_class<AudioStreamPlaybackParameterized>();

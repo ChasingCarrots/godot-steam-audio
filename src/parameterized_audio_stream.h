@@ -51,7 +51,7 @@ public:
 	};
 private:
 	godot::StringName parameter_name;
-	Comparison comparison_type;
+	Comparison comparison_type = EQ;
 	float value;
 
 	void update_name() {
@@ -168,6 +168,39 @@ public:
 };
 
 
+class ParameterizedOutputGranularLinearSweep : public ParameterizedOutput {
+	GDCLASS(ParameterizedOutputGranularLinearSweep, ParameterizedOutput)
+
+	static void _bind_methods();
+
+	godot::StringName input_stream;
+	godot::StringName sweeping_parameter_name;
+	float min_parameter_value;
+	float max_parameter_value;
+	float min_grain_size_milliseconds = 20;
+	float max_grain_size_milliseconds = 20;
+	float grain_jitter_percentage = 0.01f;
+public:
+	godot::StringName GetInputStream() const { return input_stream; }
+	void SetInputStream(godot::StringName inputStream) { input_stream = inputStream; }
+	godot::StringName GetSweepingParameterName() const { return sweeping_parameter_name; }
+	void SetSweepingParameterName(godot::StringName sweepingParameterName) { sweeping_parameter_name = sweepingParameterName; }
+	float GetMinParameterValue() const { return min_parameter_value; }
+	void SetMinParameterValue(float minParameterValue) { min_parameter_value = minParameterValue; }
+	float GetMaxParameterValue() const { return max_parameter_value; }
+	void SetMaxParameterValue(float maxParameterValue) { max_parameter_value = maxParameterValue; }
+	float GetMinGrainSizeMilliseconds() const { return min_grain_size_milliseconds; }
+	void SetMinGrainSizeMilliseconds(float minGrainSizeMilliseconds) { min_grain_size_milliseconds = minGrainSizeMilliseconds; }
+	float GetMaxGrainSizeMilliseconds() const { return max_grain_size_milliseconds; }
+	void SetMaxGrainSizeMilliseconds(float maxGrainSizeMilliseconds) { max_grain_size_milliseconds = maxGrainSizeMilliseconds; }
+	float GetGrainJitterPercentage() const { return grain_jitter_percentage; }
+	void SetGrainJitterPercentage(float grainJitterPercentage) { grain_jitter_percentage = grainJitterPercentage; }
+
+	ParameterizedOutputRuntimeInstanceBase *create_runtime_instance(const AudioStreamPlaybackParameterized &from_playback) override;
+	void release_runtime_instance(ParameterizedOutputRuntimeInstanceBase *instance) override;
+};
+
+
 class AudioStreamParameterized : public godot::AudioStream {
 	GDCLASS(AudioStreamParameterized, AudioStream)
 
@@ -208,6 +241,12 @@ public:
 	~AudioStreamPlaybackParameterized() override;
 	const AudioStreamParameterized& GetParent() const { return *parent_stream.ptr(); }
 	const godot::HashMap<godot::StringName, float>& GetCurrentParameterValues() const { return parameters; }
+	float GetCurrentParameterValue(godot::StringName name) const {
+		const float* value_if_there = parameters.getptr(name);
+		if (value_if_there == nullptr)
+			return 0;
+		return *value_if_there;
+	}
 
 	void initialize(godot::Ref<AudioStreamParameterized> parent);
 	void set_parameter(godot::StringName parameter_name, float value);

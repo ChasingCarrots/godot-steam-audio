@@ -165,14 +165,14 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 		ls->bufs.in.data[1][i] = mixed_frames[i].y;
 	}
 
-	if (!ls->cfg.skip_direct_audio) {
+	if (!ls->cfg.skip_direct_audio && ls->fx.direct != nullptr) {
 		IPLDirectEffectParams directParams = getDirectParams(gs, ls, sourceCoordinates, listenerCoordinates);
 
 		iplDirectEffectApply(
 				ls->fx.direct, &directParams,
 				&ls->bufs.in, &ls->bufs.direct);
 
-		if (ls->cfg.is_binaural_on) {
+		if (ls->cfg.is_binaural_on && ls->fx.binaural != nullptr) {
 			PROFILE_FUNCTION_NAMED(apply_binaural)
 			IPLBinauralEffectParams binauralParams{};
 			binauralParams.direction = direction;
@@ -181,7 +181,7 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 			binauralParams.hrtf = gs->hrtf;
 
 			iplBinauralEffectApply(ls->fx.binaural, &binauralParams, &ls->bufs.direct, &ls->bufs.out);
-		} else {
+		} else if (ls->fx.panning != nullptr) {
 			PROFILE_FUNCTION_NAMED(apply_panning)
 			iplAudioBufferDownmix(gs->ctx, &ls->bufs.direct, &ls->bufs.mono);
 
@@ -193,7 +193,7 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 	}
 
 	bool reflection_tail_active = false;
-	if(ls->src.simulationSource && ls->cfg.is_reflection_on /* TODO: || pathing_on */) {
+	if(ls->src.simulationSource && ls->cfg.is_reflection_on && ls->fx.refl != nullptr && ls->fx.ambisonics != nullptr) {
 		IPLSimulationOutputs outputs;
 		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
 		if (outputs.reflections.ir != nullptr) {
