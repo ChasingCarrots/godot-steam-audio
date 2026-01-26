@@ -121,37 +121,35 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 	}
 
 	if (parent == nullptr) {
-		return frames;
+		return 0;
 	}
 
 	if (stream_playback.is_null()) {
-		return frames;
+		return 0;
 	}
 
 	if (Engine::get_singleton()->is_editor_hint()) {
-		return frames;
+		return 0;
 	}
 
 	auto gs = SteamAudioServer::get_singleton()->get_global_state(false);
 	if (gs == nullptr) {
-		return frames;
+		return 0;
 	}
-
-	SteamAudio::log(SteamAudio::log_debug, "mixing");
 
 	LocalSteamAudioState *ls = parent->get_local_state();
 	if (ls == nullptr) { // probably being destroyed
-		return frames;
+		return 0;
 	}
 	std::unique_lock lock(ls->mux);
 
 	// Some extra checks because at this point parent may have been deleted
 	if (parent == nullptr) {
-		return frames;
+		return 0;
 	}
 	ls = parent->get_local_state();
-	if (ls == nullptr || !ls->src.player) {
-		return frames;
+	if (ls == nullptr || !ls->src.player || !ls->src.player->is_inside_tree()) {
+		return 0;
 	}
 	auto sourceCoordinates = ipl_coords_from(ls->src.player->get_global_transform());
 	auto listenerCoordinates = gs->listener_coords;
@@ -222,13 +220,11 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 
 			if (!ls->cfg.skip_direct_audio) {
 				PROFILE_FUNCTION_NAMED(ambisonic_mixing)
-				SteamAudio::log(SteamAudio::log_debug, "mixing: mixing reflection and direct buffers");
 				iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.refl_out);
 				iplAudioBufferMix(gs->ctx, &ls->bufs.refl_out, &ls->bufs.out);
 			}
 			else {
 				PROFILE_FUNCTION_NAMED(ambisonic_mixing)
-				SteamAudio::log(SteamAudio::log_debug, "mixing: applying the ambisonics directly to the out buffer");
 				iplAmbisonicsDecodeEffectApply(ls->fx.ambisonics, &ambisonicsParams, &ls->bufs.refl, &ls->bufs.out);
 			}
 		}
@@ -252,7 +248,6 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 		}
 	}
 
-	SteamAudio::log(SteamAudio::log_debug, "mixing: done");
 	return frames;
 }
 

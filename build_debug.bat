@@ -1,0 +1,1 @@
+scons target=template_debug debug_symbols=true compiledb=yes optimize=debug

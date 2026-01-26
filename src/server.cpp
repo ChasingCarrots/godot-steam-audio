@@ -19,7 +19,7 @@ void SteamAudioServer::tick() {
 	if (!self->is_global_state_init.load()) {
 		return;
 	}
-	if (self->listener == nullptr) {
+	if (self->listener == nullptr || !self->listener->is_inside_tree()) {
 		return;
 	}
 
@@ -33,7 +33,7 @@ void SteamAudioServer::tick() {
 			UtilityFunctions::push_warning(
 					"local state has empty player, not updating simulation state");
 		}
-		if (!ls->src.player->is_playing()) {
+		if (!ls->src.player->is_playing() || !ls->src.player->is_inside_tree()) {
 			continue;
 		}
 

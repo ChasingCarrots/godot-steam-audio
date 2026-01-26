@@ -1,9 +1,24 @@
 #ifndef __TRACYCALLSTACK_HPP__
 #define __TRACYCALLSTACK_HPP__
 
+#include <stdint.h>
+
 #include "../common/TracyApi.h"
 #include "../common/TracyForceInline.hpp"
 #include "TracyCallstack.h"
+
+namespace tracy
+{
+
+struct ImageEntry
+{
+    uint64_t m_startAddress = 0;
+    uint64_t m_endAddress = 0;
+    char* m_name = nullptr;
+    char* m_path = nullptr;
+};
+
+}
 
 #ifndef TRACY_HAS_CALLSTACK
 
@@ -82,8 +97,7 @@ debuginfod_client* GetDebuginfodClient();
 
 extern "C"
 {
-    typedef unsigned long (__stdcall *___tracy_t_RtlWalkFrameChain)( void**, unsigned long, unsigned long );
-    TRACY_API extern ___tracy_t_RtlWalkFrameChain ___tracy_RtlWalkFrameChain;
+    TRACY_API unsigned long ___tracy_RtlWalkFrameChain( void**, unsigned long, unsigned long );
 }
 
 static tracy_force_inline void* Callstack( int32_t depth )

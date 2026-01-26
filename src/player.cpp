@@ -131,10 +131,13 @@ SteamAudioPlayer::~SteamAudioPlayer() {
 
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.in);
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.direct);
-	iplAudioBufferFree(gs->ctx, &local_state.bufs.refl);
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.out);
 	iplAudioBufferFree(gs->ctx, &local_state.bufs.mono);
-	iplAudioBufferFree(gs->ctx, &local_state.bufs.refl_out);
+
+	if (local_state.cfg.is_reflection_on) {
+		iplAudioBufferFree(gs->ctx, &local_state.bufs.refl);
+		iplAudioBufferFree(gs->ctx, &local_state.bufs.refl_out);
+	}
 
 	if (!pb.is_null()) {
 		auto playback = dynamic_cast<SteamAudioStreamPlayback *>(pb.ptr());

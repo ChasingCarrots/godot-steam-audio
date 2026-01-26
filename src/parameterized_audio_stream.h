@@ -52,7 +52,7 @@ public:
 private:
 	godot::StringName parameter_name;
 	Comparison comparison_type = EQ;
-	float value;
+	float value = 0;
 
 	void update_name() {
 		set_name(godot::vformat("%s %s %f",
@@ -95,8 +95,8 @@ class ParameterConditionRange : public ParameterCondition {
 	static void _bind_methods();
 
 	godot::StringName parameter_name;
-	float min_value;
-	float max_value;
+	float min_value = 0;
+	float max_value = 1;
 	void update_name() {
 		set_name(godot::vformat("%f <= %s >= %f", min_value, parameter_name, max_value));
 	}
@@ -162,6 +162,48 @@ public:
 	void SetRandomizeVolume(float randomizeVolume) { randomize_volume = randomizeVolume; }
 	godot::TypedArray<godot::StringName> GetInputStreams() const { return input_streams; }
 	void SetInputStreams(godot::TypedArray<godot::StringName> inputStreams) { input_streams = inputStreams; }
+
+	ParameterizedOutputRuntimeInstanceBase *create_runtime_instance(const AudioStreamPlaybackParameterized &from_playback) override;
+	void release_runtime_instance(ParameterizedOutputRuntimeInstanceBase *instance) override;
+};
+
+class ParameterizedOutputLooping : public ParameterizedOutput {
+	GDCLASS(ParameterizedOutputLooping, ParameterizedOutput)
+
+	static void _bind_methods();
+
+
+	godot::StringName input_stream;
+	godot::StringName modifying_parameter_name;
+	float min_volume = 0;
+	float max_volume = 0;
+	float parameter_value_min_volume;
+	float parameter_value_max_volume;
+	float min_pitch = 1;
+	float max_pitch = 1;
+	float parameter_value_min_pitch;
+	float parameter_value_max_pitch;
+public:
+	godot::StringName GetInputStream() const { return input_stream; }
+	void SetInputStream(godot::StringName inputStream) { input_stream = inputStream; }
+	godot::StringName GetModifyingParameterName() const { return modifying_parameter_name; }
+	void SetModifyingParameterName(godot::StringName modifyingParameterName) { modifying_parameter_name = modifyingParameterName; }
+	float GetMinVolume() const { return min_volume; }
+	void SetMinVolume(float minVolume) { min_volume = minVolume; }
+	float GetMaxVolume() const { return max_volume; }
+	void SetMaxVolume(float maxVolume) { max_volume = maxVolume; }
+	float GetParameterValueMinVolume() const { return parameter_value_min_volume; }
+	void SetParameterValueMinVolume(float parameterValueMinVolume) { parameter_value_min_volume = parameterValueMinVolume; }
+	float GetParameterValueMaxVolume() const { return parameter_value_max_volume; }
+	void SetParameterValueMaxVolume(float parameterValueMaxVolume) { parameter_value_max_volume = parameterValueMaxVolume; }
+	float GetMinPitch() const { return min_pitch; }
+	void SetMinPitch(float minPitch) { min_pitch = minPitch; }
+	float GetMaxPitch() const { return max_pitch; }
+	void SetMaxPitch(float maxPitch) { max_pitch = maxPitch; }
+	float GetParameterValueMinPitch() const { return parameter_value_min_pitch; }
+	void SetParameterValueMinPitch(float parameterValueMinPitch) { parameter_value_min_pitch = parameterValueMinPitch; }
+	float GetParameterValueMaxPitch() const { return parameter_value_max_pitch; }
+	void SetParameterValueMaxPitch(float parameterValueMaxPitch) { parameter_value_max_pitch = parameterValueMaxPitch; }
 
 	ParameterizedOutputRuntimeInstanceBase *create_runtime_instance(const AudioStreamPlaybackParameterized &from_playback) override;
 	void release_runtime_instance(ParameterizedOutputRuntimeInstanceBase *instance) override;

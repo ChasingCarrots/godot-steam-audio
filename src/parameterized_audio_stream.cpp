@@ -207,7 +207,79 @@ void ParameterizedOutputRandomize::release_runtime_instance(ParameterizedOutputR
 	delete dynamic_cast<ParameterizedOutputRandomizeRuntimeInstance*>(instance);
 }
 
-// -------------------- AudioStreamParameterized --------------------
+// -------------------- ParameterizedOutputLooping --------------------
+
+void ParameterizedOutputLooping::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_input_stream"), &ParameterizedOutputLooping::GetInputStream);
+	ClassDB::bind_method(D_METHOD("set_input_stream", "input_stream"), &ParameterizedOutputLooping::SetInputStream);
+
+	ClassDB::bind_method(D_METHOD("get_modifying_parameter_name"), &ParameterizedOutputLooping::GetModifyingParameterName);
+	ClassDB::bind_method(D_METHOD("set_modifying_parameter_name", "modifying_parameter_name"), &ParameterizedOutputLooping::SetModifyingParameterName);
+
+	ClassDB::bind_method(D_METHOD("get_min_volume"), &ParameterizedOutputLooping::GetMinVolume);
+	ClassDB::bind_method(D_METHOD("set_min_volume", "min_volume"), &ParameterizedOutputLooping::SetMinVolume);
+
+	ClassDB::bind_method(D_METHOD("get_max_volume"), &ParameterizedOutputLooping::GetMaxVolume);
+	ClassDB::bind_method(D_METHOD("set_max_volume", "max_volume"), &ParameterizedOutputLooping::SetMaxVolume);
+
+	ClassDB::bind_method(D_METHOD("get_parameter_value_min_volume"), &ParameterizedOutputLooping::GetParameterValueMinVolume);
+	ClassDB::bind_method(D_METHOD("set_parameter_value_min_volume", "parameter_value_min_volume"), &ParameterizedOutputLooping::SetParameterValueMinVolume);
+
+	ClassDB::bind_method(D_METHOD("get_parameter_value_max_volume"), &ParameterizedOutputLooping::GetParameterValueMaxVolume);
+	ClassDB::bind_method(D_METHOD("set_parameter_value_max_volume", "parameter_value_max_volume"), &ParameterizedOutputLooping::SetParameterValueMaxVolume);
+
+	ClassDB::bind_method(D_METHOD("get_min_pitch"), &ParameterizedOutputLooping::GetMinPitch);
+	ClassDB::bind_method(D_METHOD("set_min_pitch", "min_pitch"), &ParameterizedOutputLooping::SetMinPitch);
+
+	ClassDB::bind_method(D_METHOD("get_max_pitch"), &ParameterizedOutputLooping::GetMaxPitch);
+	ClassDB::bind_method(D_METHOD("set_max_pitch", "max_pitch"), &ParameterizedOutputLooping::SetMaxPitch);
+
+	ClassDB::bind_method(D_METHOD("get_parameter_value_min_pitch"), &ParameterizedOutputLooping::GetParameterValueMinPitch);
+	ClassDB::bind_method(D_METHOD("set_parameter_value_min_pitch", "parameter_value_min_pitch"), &ParameterizedOutputLooping::SetParameterValueMinPitch);
+
+	ClassDB::bind_method(D_METHOD("get_parameter_value_max_pitch"), &ParameterizedOutputLooping::GetParameterValueMaxPitch);
+	ClassDB::bind_method(D_METHOD("set_parameter_value_max_pitch", "parameter_value_max_pitch"), &ParameterizedOutputLooping::SetParameterValueMaxPitch);
+
+	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "input_stream"), "set_input_stream", "get_input_stream");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "modifying_parameter_name"), "set_modifying_parameter_name", "get_modifying_parameter_name");
+
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_volume"), "set_min_volume", "get_min_volume");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_volume"), "set_max_volume", "get_max_volume");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "parameter_value_min_volume"), "set_parameter_value_min_volume", "get_parameter_value_min_volume");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "parameter_value_max_volume"), "set_parameter_value_max_volume", "get_parameter_value_max_volume");
+
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_pitch"), "set_min_pitch", "get_min_pitch");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_pitch"), "set_max_pitch", "get_max_pitch");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "parameter_value_min_pitch"), "set_parameter_value_min_pitch", "get_parameter_value_min_pitch");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "parameter_value_max_pitch"), "set_parameter_value_max_pitch", "get_parameter_value_max_pitch");
+}
+
+class ParameterizedOutputLoopingRuntimeInstance : public ParameterizedOutputRuntimeInstanceBase {
+public:
+	ParameterizedAudioStreamInput* input;
+	int last_played_index = 0;
+
+	void triggered() override {
+
+	}
+
+	bool mix_output_into_buffer(AudioFrame *p_buffer, float p_rate_scale, int32_t p_frames) override {
+
+		return true;
+	}
+};
+
+ParameterizedOutputRuntimeInstanceBase *ParameterizedOutputLooping::create_runtime_instance(const AudioStreamPlaybackParameterized &from_playback) {
+	auto* instance = new ParameterizedOutputLoopingRuntimeInstance();
+
+	return instance;
+}
+
+void ParameterizedOutputLooping::release_runtime_instance(ParameterizedOutputRuntimeInstanceBase *instance) {
+	delete dynamic_cast<ParameterizedOutputLoopingRuntimeInstance *>(instance);
+}
+
+// -------------------- ParameterizedOutputGranularLinearSweep --------------------
 void ParameterizedOutputGranularLinearSweep::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_input_stream"), &ParameterizedOutputGranularLinearSweep::GetInputStream);
 	ClassDB::bind_method(D_METHOD("set_input_stream", "input_stream"), &ParameterizedOutputGranularLinearSweep::SetInputStream);
