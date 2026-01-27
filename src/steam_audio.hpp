@@ -48,6 +48,8 @@ struct SteamAudioSourceConfig {
 	float max_attn_dist;
 	int ambisonics_order;
 	float max_refl_dist;
+	float hybrid_reverb_transition_time;
+	float hybrid_reverb_overlap_percent;
 	bool is_dist_attn_on;
 	bool is_ambisonics_on;
 	bool is_occlusion_on;
@@ -92,9 +94,20 @@ struct LocalSteamAudioState {
 		10.0f,
 		1,
 		10000.0f,
+		1.0f,
+		0.25f,
 		false,
 		true,
 		true,
+		false,
+		false,
+		false,
+		0.0f,
+		0.0f,
+		false,
+		0,
+		false,
+		false,
 		false
 	};
 	IPLHRTFInterpolation hrtfInterpolation;

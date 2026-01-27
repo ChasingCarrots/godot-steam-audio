@@ -13,6 +13,7 @@ int SteamAudioConfig::num_diffuse_samples = 32;
 float SteamAudioConfig::max_refl_duration = 2.0f;
 int SteamAudioConfig::max_num_refl_srcs = 8;
 int SteamAudioConfig::num_refl_threads = 2;
+IPLReflectionEffectType SteamAudioConfig::reflection_effect_type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
 IPLSceneType SteamAudioConfig::scene_type = IPL_SCENETYPE_EMBREE; // TODO: support more types
 
 void SteamAudioConfig::_bind_methods() {
@@ -56,6 +57,10 @@ void SteamAudioConfig::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_num_refl_threads"), &SteamAudioConfig::get_num_refl_threads);
 	ClassDB::bind_method(D_METHOD("set_num_refl_threads", "p_num_refl_threads"), &SteamAudioConfig::set_num_refl_threads);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_threads", PROPERTY_HINT_RANGE, "1,64,1"), "set_num_refl_threads", "get_num_refl_threads");
+
+	ClassDB::bind_method(D_METHOD("get_reflection_effect_type"), &SteamAudioConfig::get_reflection_effect_type);
+	ClassDB::bind_method(D_METHOD("set_reflection_effect_type", "p_reflection_effect_type"), &SteamAudioConfig::set_reflection_effect_type);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_effect_type", PROPERTY_HINT_ENUM, "Convolution,Parametric,Hybrid"), "set_reflection_effect_type", "get_reflection_effect_type");
 }
 
 SteamAudioConfig::SteamAudioConfig() {}
@@ -119,3 +124,11 @@ void SteamAudioConfig::set_max_num_refl_rays(int p_max_num_refl_rays) { max_num_
 
 int SteamAudioConfig::get_max_num_occ_samples() { return max_num_occ_samples; }
 void SteamAudioConfig::set_max_num_occ_samples(int p_max_num_occ_samples) { max_num_occ_samples = p_max_num_occ_samples; }
+
+int SteamAudioConfig::get_reflection_effect_type() { return reflection_effect_type; }
+void SteamAudioConfig::set_reflection_effect_type(int p_reflection_effect_type) {
+	if (p_reflection_effect_type < IPL_REFLECTIONEFFECTTYPE_CONVOLUTION || p_reflection_effect_type > IPL_REFLECTIONEFFECTTYPE_HYBRID) {
+		p_reflection_effect_type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+	}
+	reflection_effect_type = static_cast<IPLReflectionEffectType>(p_reflection_effect_type);
+}

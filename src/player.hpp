@@ -51,6 +51,10 @@ public:
 	void set_ambisonics_order(int p_ambisonics_order);
 	float get_max_reflection_dist();
 	void set_max_reflection_dist(float p_max_reflection_dist);
+	float get_hybrid_reverb_transition_time();
+	void set_hybrid_reverb_transition_time(float p_hybrid_reverb_transition_time);
+	float get_hybrid_reverb_overlap_percent();
+	void set_hybrid_reverb_overlap_percent(float p_hybrid_reverb_overlap_percent);
 	float get_directivity_dipole_weight();
 	void set_directivity_dipole_weight(float p_directivity_dipole_weight);
 	float get_directivity_dipole_power();

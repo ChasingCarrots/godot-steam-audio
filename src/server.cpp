@@ -98,6 +98,11 @@ void SteamAudioServer::tick() {
 		IPLSimulationInputs inputs{};
 		inputs.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
 		inputs.source = src_coords;
+		for (int band = 0; band < IPL_NUM_BANDS; ++band) {
+			inputs.reverbScale[band] = 1.0f;
+		}
+		inputs.hybridReverbTransitionTime = ls->cfg.hybrid_reverb_transition_time;
+		inputs.hybridReverbOverlapPercent = ls->cfg.hybrid_reverb_overlap_percent;
 
 		iplSourceSetInputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
 	}

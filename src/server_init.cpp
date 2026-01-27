@@ -55,8 +55,7 @@ IPLSimulator create_simulator(IPLContext ctx, IPLAudioSettings audio_cfg, IPLSce
 	sim_cfg.sceneType = scene_cfg.type;
 	sim_cfg.frameSize = audio_cfg.frameSize;
 	sim_cfg.samplingRate = audio_cfg.samplingRate;
-	// TODO: make configurable
-	sim_cfg.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+	sim_cfg.reflectionType = SteamAudioConfig::reflection_effect_type;
 	sim_cfg.maxNumOcclusionSamples = SteamAudioConfig::max_num_occ_samples;
 	sim_cfg.maxNumRays = SteamAudioConfig::max_num_refl_rays;
 	sim_cfg.numDiffuseSamples = SteamAudioConfig::num_diffuse_samples;

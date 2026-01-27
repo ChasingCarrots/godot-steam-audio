@@ -194,10 +194,12 @@ int32_t SteamAudioStreamPlayback::_mix(AudioFrame *buffer, float rate_scale, int
 	if(ls->src.simulationSource && ls->cfg.is_reflection_on && ls->fx.refl != nullptr && ls->fx.ambisonics != nullptr) {
 		IPLSimulationOutputs outputs;
 		iplSourceGetOutputs(ls->src.simulationSource, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
-		if (outputs.reflections.ir != nullptr) {
+		outputs.reflections.type = SteamAudioConfig::reflection_effect_type;
+		bool has_reflection_data = outputs.reflections.ir != nullptr ||
+				outputs.reflections.type == IPL_REFLECTIONEFFECTTYPE_PARAMETRIC;
+		if (has_reflection_data) {
 			PROFILE_FUNCTION_NAMED(apply_reflection)
 			iplAudioBufferDownmix(gs->ctx, &ls->bufs.in, &ls->bufs.mono);
-			outputs.reflections.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
 			outputs.reflections.numChannels = ambisonic_channels_from(ls->cfg.ambisonics_order);
 			outputs.reflections.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
 			outputs.reflections.tanDevice = nullptr;

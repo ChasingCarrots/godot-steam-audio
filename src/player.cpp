@@ -2,6 +2,7 @@
 #include "config.hpp"
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/core/object.hpp"
+#include "godot_cpp/core/math.hpp"
 #include "godot_cpp/variant/utility_functions.hpp"
 #include "server.hpp"
 #include "server_init.hpp"
@@ -21,6 +22,10 @@ void SteamAudioPlayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_max_attenuation_distance", "p_max_attenuation_distance"), &SteamAudioPlayer::set_max_attenuation_dist);
 	ClassDB::bind_method(D_METHOD("set_max_reflection_distance", "p_max_reflection_distance"), &SteamAudioPlayer::set_max_reflection_dist);
 	ClassDB::bind_method(D_METHOD("get_max_reflection_distance"), &SteamAudioPlayer::get_max_reflection_dist);
+	ClassDB::bind_method(D_METHOD("get_hybrid_reverb_transition_time"), &SteamAudioPlayer::get_hybrid_reverb_transition_time);
+	ClassDB::bind_method(D_METHOD("set_hybrid_reverb_transition_time", "p_hybrid_reverb_transition_time"), &SteamAudioPlayer::set_hybrid_reverb_transition_time);
+	ClassDB::bind_method(D_METHOD("get_hybrid_reverb_overlap_percent"), &SteamAudioPlayer::get_hybrid_reverb_overlap_percent);
+	ClassDB::bind_method(D_METHOD("set_hybrid_reverb_overlap_percent", "p_hybrid_reverb_overlap_percent"), &SteamAudioPlayer::set_hybrid_reverb_overlap_percent);
 	ClassDB::bind_method(D_METHOD("is_occlusion_on"), &SteamAudioPlayer::is_occlusion_on);
 	ClassDB::bind_method(D_METHOD("set_occlusion_on", "p_occlusion_on"), &SteamAudioPlayer::set_occlusion_on);
 	ClassDB::bind_method(D_METHOD("is_reflection_on"), &SteamAudioPlayer::is_reflection_on);
@@ -86,6 +91,8 @@ void SteamAudioPlayer::_bind_methods() {
 	ADD_GROUP("Reflection", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "reflection"), "set_reflection_on", "is_reflection_on");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "max_reflection_distance", PROPERTY_HINT_RANGE, "0.0,20000.0,0.1"), "set_max_reflection_distance", "get_max_reflection_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "hybrid_reverb_transition_time", PROPERTY_HINT_RANGE, "0.01,10.0,0.01"), "set_hybrid_reverb_transition_time", "get_hybrid_reverb_transition_time");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "hybrid_reverb_overlap_percent", PROPERTY_HINT_RANGE, "0.01,1.0,0.01"), "set_hybrid_reverb_overlap_percent", "get_hybrid_reverb_overlap_percent");
 }
 
 SteamAudioPlayer::SteamAudioPlayer() {
@@ -187,7 +194,7 @@ void SteamAudioPlayer::init_local_state() {
 
 	if (local_state.cfg.is_reflection_on) {
 		IPLReflectionEffectSettings refl_effect_cfg{};
-		refl_effect_cfg.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+		refl_effect_cfg.type = SteamAudioConfig::reflection_effect_type;
 		refl_effect_cfg.irSize = int(SteamAudioConfig::max_refl_duration * float(gs->audio_cfg.samplingRate));
 		refl_effect_cfg.numChannels = ambisonic_channels_from(local_state.cfg.ambisonics_order);
 		err = iplReflectionEffectCreate(gs->ctx, &gs->audio_cfg, &refl_effect_cfg, &local_state.fx.refl);
@@ -373,6 +380,14 @@ int SteamAudioPlayer::get_ambisonics_order() { return local_state.cfg.ambisonics
 void SteamAudioPlayer::set_ambisonics_order(int p_ambisonics_order) { local_state.cfg.ambisonics_order = p_ambisonics_order; }
 float SteamAudioPlayer::get_max_reflection_dist() { return local_state.cfg.max_refl_dist; }
 void SteamAudioPlayer::set_max_reflection_dist(float p_max_reflection_dist) { local_state.cfg.max_refl_dist = p_max_reflection_dist; }
+float SteamAudioPlayer::get_hybrid_reverb_transition_time() { return local_state.cfg.hybrid_reverb_transition_time; }
+void SteamAudioPlayer::set_hybrid_reverb_transition_time(float p_hybrid_reverb_transition_time) {
+	local_state.cfg.hybrid_reverb_transition_time = Math::max(0.01f, p_hybrid_reverb_transition_time);
+}
+float SteamAudioPlayer::get_hybrid_reverb_overlap_percent() { return local_state.cfg.hybrid_reverb_overlap_percent; }
+void SteamAudioPlayer::set_hybrid_reverb_overlap_percent(float p_hybrid_reverb_overlap_percent) {
+	local_state.cfg.hybrid_reverb_overlap_percent = Math::clamp(p_hybrid_reverb_overlap_percent, 0.01f, 1.0f);
+}
 float SteamAudioPlayer::get_directivity_dipole_weight() { return local_state.cfg.directivity_dipole_weight; }
 void SteamAudioPlayer::set_directivity_dipole_weight(float p_directivity_dipole_weight) { local_state.cfg.directivity_dipole_weight = p_directivity_dipole_weight; }
 float SteamAudioPlayer::get_directivity_dipole_power() { return local_state.cfg.directivity_dipole_power; }
