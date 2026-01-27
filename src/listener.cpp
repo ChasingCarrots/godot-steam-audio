@@ -43,6 +43,9 @@ void SteamAudioListener::_notification(int p_what) {
 		case NOTIFICATION_ENTER_TREE:
 			ready_internal();
 			break;
+		case NOTIFICATION_EXIT_TREE:
+			SteamAudioServer::get_singleton()->remove_listener(this);
+			break;
 	}
 }
 

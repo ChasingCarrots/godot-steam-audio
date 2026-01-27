@@ -54,6 +54,7 @@ public:
 	GlobalSteamAudioState *get_global_state(bool should_init = true);
 
 	void add_listener(SteamAudioListener *listener);
+	void remove_listener(SteamAudioListener *listener);
 	void add_local_state(LocalSteamAudioState *ls);
 	void remove_local_state(LocalSteamAudioState *ls);
 	void add_static_mesh(IPLStaticMesh mesh);

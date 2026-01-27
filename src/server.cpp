@@ -228,6 +228,15 @@ void SteamAudioServer::add_listener(SteamAudioListener *lis) {
 	refl_thread_wait_for_commit.store(true);
 }
 
+void SteamAudioServer::remove_listener(SteamAudioListener *lis) {
+	if (lis != self->listener) {
+		return;
+	}
+	self->listener = nullptr;
+	simulator_dirty = true;
+	refl_thread_wait_for_commit.store(true);
+}
+
 void SteamAudioServer::add_local_state(LocalSteamAudioState *ls) {
 	self->local_states.push_back(ls);
 	simulator_dirty = true;
