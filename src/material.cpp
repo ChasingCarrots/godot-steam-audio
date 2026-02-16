@@ -2,6 +2,8 @@
 #include "godot_cpp/core/class_db.hpp"
 #include "godot_cpp/core/object.hpp"
 
+using namespace godot;
+
 SteamAudioMaterial::SteamAudioMaterial() {}
 SteamAudioMaterial::~SteamAudioMaterial() {}
 

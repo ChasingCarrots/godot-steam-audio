@@ -1,16 +1,16 @@
 #include "register_types.hpp"
 
-#include "config.hpp"
-#include "geometry.hpp"
-#include "geometry_dynamic.hpp"
 #include "godot_cpp/core/memory.hpp"
+#include "geometry.hpp"
 #include "listener.hpp"
 #include "material.hpp"
-#include "player.hpp"
 #include "server.hpp"
-#include "stream.hpp"
+#include "source.hpp"
 #include "parameterized_audio_stream.h"
 
+#include "godot_cpp/classes/engine.hpp"
+#include "godot_cpp/classes/scene_tree.hpp"
+#include "godot_cpp/variant/utility_functions.hpp"
 #include <gdextension_interface.h>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/defs.hpp>
@@ -25,15 +25,17 @@ void init_ext(ModuleInitializationLevel p_level) {
 		return;
 	}
 
+	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
+		GDREGISTER_CLASS(SteamAudioServer);
+		srv = memnew(SteamAudioServer);
+		Engine::get_singleton()->register_singleton("SteamAudioServer", srv);
+	}
+
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
-		ClassDB::register_class<SteamAudioStreamPlayback>();
-		ClassDB::register_class<SteamAudioStream>();
 		ClassDB::register_class<SteamAudioListener>();
-		ClassDB::register_class<SteamAudioGeometry>();
-		ClassDB::register_class<SteamAudioDynamicGeometry>();
+		ClassDB::register_class<SteamAudioSource>();
 		ClassDB::register_class<SteamAudioMaterial>();
-		ClassDB::register_class<SteamAudioConfig>();
-		ClassDB::register_class<SteamAudioPlayer>();
+		ClassDB::register_class<SteamAudioGeometry>();
 		ClassDB::register_abstract_class<ParameterCondition>();
 		ClassDB::register_class<ParameterConditionComparison>();
 		ClassDB::register_class<ParameterConditionRange>();
@@ -44,15 +46,11 @@ void init_ext(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<AudioStreamParameterized>();
 		ClassDB::register_class<AudioStreamPlaybackParameterized>();
 	}
-
-	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
-		GDREGISTER_CLASS(SteamAudioServer);
-		srv = memnew(SteamAudioServer);
-	}
 }
 
 void uninit_ext(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
+		Engine::get_singleton()->unregister_singleton("SteamAudioServer");
 		memdelete(srv);
 	}
 }

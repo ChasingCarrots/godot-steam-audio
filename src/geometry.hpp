@@ -2,43 +2,37 @@
 #define STEAM_AUDIO_GEOMETRY_H
 
 #include "godot_cpp/classes/node3d.hpp"
-#include "godot_cpp/classes/wrapped.hpp"
+#include "godot_cpp/templates/hash_map.hpp"
 #include "material.hpp"
-#include "phonon.h"
 
-using namespace godot;
-
-class SteamAudioGeometry : public Node3D {
-	GDCLASS(SteamAudioGeometry, Node3D);
+class SteamAudioGeometry : public godot::Node3D {
+	GDCLASS(SteamAudioGeometry, godot::Node3D);
 
 private:
-	std::vector<IPLStaticMesh> meshes;
-	Ref<SteamAudioMaterial> mat;
+	godot::Dictionary materials; // Group Name (String) -> SteamAudioMaterial (Resource)
+	bool is_dynamic = false;
+	godot::NodePath root_path;
 
-	void create_geometry();
-	void destroy_geometry();
-	void register_geometry();
-	void unregister_geometry();
-
-	void ready_internal();
+	void find_and_register_geometry(godot::Node *p_node);
+	void find_and_unregister_geometry(godot::Node *p_node);
 
 protected:
 	static void _bind_methods();
 
 public:
-	bool disabled = false;
-
 	SteamAudioGeometry();
 	~SteamAudioGeometry();
+
 	void _notification(int p_what);
 
-	void recalculate();
-	Ref<SteamAudioMaterial> get_material();
-	void set_material(Ref<SteamAudioMaterial> p_material);
-	bool is_disabled() const { return disabled; }
-	void set_disabled(bool p_disabled);
+	void set_materials(const godot::Dictionary &p_materials);
+	godot::Dictionary get_materials() const;
 
-	PackedStringArray _get_configuration_warnings() const override;
+	void set_is_dynamic(bool p_dynamic);
+	bool get_is_dynamic() const;
+
+	void set_root_path(const godot::NodePath &p_path);
+	godot::NodePath get_root_path() const;
 };
 
 #endif // STEAM_AUDIO_GEOMETRY_H

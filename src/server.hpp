@@ -2,46 +2,124 @@
 #define STEAM_AUDIO_SERVER_H
 
 #include "godot_cpp/classes/object.hpp"
+#include "godot_cpp/classes/node3d.hpp"
 #include "godot_cpp/classes/thread.hpp"
-#include "listener.hpp"
+#include "godot_cpp/templates/local_vector.hpp"
+#include "godot_cpp/classes/audio_frame.hpp"
+#include "godot_cpp/variant/packed_vector2_array.hpp"
+#include "material.hpp"
 #include "steam_audio.hpp"
+#include <phonon.h>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <shared_mutex>
+#include <vector>
 
-using namespace godot;
+class SteamAudioListener;
+class SteamAudioSource;
 
-class SteamAudioServer : public Object {
-	GDCLASS(SteamAudioServer, Object)
+struct ListenerData {
+	SteamAudioListener *listener = nullptr;
+	IPLSimulator simulator = nullptr;
+
+	// Pre-allocated buffers to avoid reallocations in the mixing thread
+	godot::LocalVector<godot::AudioFrame> mix_buffer;
+	godot::PackedVector2Array push_buffer;
+
+	// Cached transform data, updated on main thread
+	IPLCoordinateSpace3 cached_coords{};
+	godot::Transform3D last_trf;
+	bool dirty = false;
+};
+
+struct SourceListenerData {
+	SteamAudioListener *listener = nullptr;
+	float dist_to_listener = 0.0f;
+	float doppler_pitch = 1.0f;
+	bool out_of_range = false;
+	IPLSource source = nullptr;
+	IPLBinauralEffect binaural_effect = nullptr;
+	IPLDirectEffect direct_effect = nullptr;
+	IPLReflectionEffect reflection_effect = nullptr;
+	IPLAmbisonicsDecodeEffect ambisonics_decode_effect = nullptr;
+	IPLAudioBuffer input_buffer{};
+	IPLAudioBuffer output_buffer{};
+	IPLAudioBuffer ambisonics_buffer{};
+};
+
+struct SourceData {
+	SteamAudioSource *source_node = nullptr;
+
+	godot::LocalVector<SourceListenerData> listener_data;
+
+	// Cached transform data, updated on main thread
+	IPLCoordinateSpace3 cached_coords{};
+	godot::Transform3D last_trf;
+};
+
+struct DynamicGeometryData {
+	godot::Node3D *node = nullptr;
+	IPLScene sub_scene = nullptr;
+	IPLInstancedMesh instanced_mesh = nullptr;
+	std::vector<IPLStaticMesh> meshes;
+	godot::Transform3D last_trf;
+};
+
+struct StaticGeometryData {
+	godot::Node *node = nullptr;
+	std::vector<IPLStaticMesh> meshes;
+};
+
+// Helper to clean up a SourceListenerData's IPL resources
+void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx);
+
+class SteamAudioServer : public godot::Object {
+	GDCLASS(SteamAudioServer, godot::Object)
 
 private:
 	static SteamAudioServer *self;
-	GlobalSteamAudioState global_state{};
-	std::vector<LocalSteamAudioState *> local_states;
 
-	int num_sources_in_sim = 0;
-	bool scene_dirty = false;
-	bool simulator_dirty = false;
+	bool is_initialized = false;
+	IPLContext phonon_context = nullptr;
+	IPLScene phonon_scene = nullptr;
+	// HRTF is global for now, but could be per listener if needed.
+	// SteamAudio uses one HRTF for the context usually.
+	IPLHRTF phonon_hrtf = nullptr;
 
-	std::atomic<bool> is_global_state_init;
-	std::atomic<bool> is_refl_thread_processing;
 	std::atomic<bool> is_running;
+
+	// Simulation Thread
+	godot::Ref<godot::Thread> simulation_thread;
+	void simulation_thread_func();
+
+	// Mixing Thread
+	godot::Ref<godot::Thread> mixing_thread;
+	void mixing_thread_func();
+
+	godot::LocalVector<ListenerData> listeners;
+	godot::LocalVector<SourceData> sources;
+	godot::LocalVector<DynamicGeometryData> dynamic_geometry;
+	godot::LocalVector<StaticGeometryData> static_geometry;
+
+	// Protects listeners, sources, dynamic_geometry, static_geometry
+	std::shared_mutex collections_mutex;
+
 	std::atomic<bool> refl_thread_wait_for_commit;
+	std::atomic<bool> is_refl_thread_processing;
 	std::atomic<bool> new_inputs_set;
-	std::mutex init_mux;
 	std::mutex refl_mux;
-	std::condition_variable cv;
+	std::condition_variable refl_cv;
 
-	// meshes to add to the global state scene after it's initialized.
-	std::vector<IPLStaticMesh> static_meshes_to_add;
-	std::vector<IPLStaticMesh> dynamic_meshes_to_add;
+	bool scene_dirty = false;
 
-	// TODO: allow for multiple
-	SteamAudioListener *listener = nullptr;
+	// Cached audio settings, set once during init()
+	IPLAudioSettings cached_audio_settings{};
 
-	void start_refl_sim();
-	void run_refl_sim();
-	Ref<Thread> refl_thread;
+	// Registration of Project Settings
+	void register_settings();
+
+	IPLAudioSettings get_audio_settings();
 
 protected:
 	static void _bind_methods();
@@ -51,20 +129,27 @@ public:
 	~SteamAudioServer();
 
 	static SteamAudioServer *get_singleton();
-	GlobalSteamAudioState *get_global_state(bool should_init = true);
 
+	void init();
+	void finish();
+
+	void tick(float delta);
+
+	// Listener management
 	void add_listener(SteamAudioListener *listener);
 	void remove_listener(SteamAudioListener *listener);
-	void add_local_state(LocalSteamAudioState *ls);
-	void remove_local_state(LocalSteamAudioState *ls);
-	void add_static_mesh(IPLStaticMesh mesh);
-	void remove_static_mesh(IPLStaticMesh mesh);
-	void add_dynamic_mesh(IPLInstancedMesh mesh);
-	void remove_dynamic_mesh(IPLInstancedMesh mesh);
-	void add_source_to_sim(IPLSource source);
-	void remove_source_from_sim(IPLSource source);
 
-	void tick();
+	// Source management (for SteamAudioSource nodes)
+	void add_source(SteamAudioSource *source_node);
+	void remove_source(SteamAudioSource *source_node);
+
+	void add_static_geometry(godot::Node *p_node, godot::Ref<SteamAudioMaterial> p_material);
+	void remove_static_geometry(godot::Node *p_node);
+	void add_dynamic_geometry(godot::Node *p_node, godot::Ref<SteamAudioMaterial> p_material);
+	void remove_dynamic_geometry(godot::Node * node);
+
+	// Audio pulling and effect application
+	void process_audio();
 };
 
 #endif // STEAM_AUDIO_SERVER_H

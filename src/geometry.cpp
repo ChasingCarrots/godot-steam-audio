@@ -1,114 +1,88 @@
 #include "geometry.hpp"
-#include "geometry_common.hpp"
-#include "godot_cpp/classes/collision_shape3d.hpp"
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/mesh_instance3d.hpp"
-#include "godot_cpp/variant/array.hpp"
-#include "godot_cpp/variant/utility_functions.hpp"
-#include "phonon.h"
+#include "godot_cpp/classes/collision_shape3d.hpp"
 #include "server.hpp"
 
+using namespace godot;
+
 void SteamAudioGeometry::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("get_material"), &SteamAudioGeometry::get_material);
-	ClassDB::bind_method(D_METHOD("set_material", "p_material"), &SteamAudioGeometry::set_material);
-	ClassDB::bind_method(D_METHOD("is_disabled"), &SteamAudioGeometry::is_disabled);
-	ClassDB::bind_method(D_METHOD("set_disabled", "p_disabled"), &SteamAudioGeometry::set_disabled);
-	ClassDB::bind_method(D_METHOD("recalculate"), &SteamAudioGeometry::recalculate);
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "disabled"), "set_disabled", "is_disabled");
-	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "material", PROPERTY_HINT_RESOURCE_TYPE, "SteamAudioMaterial"), "set_material", "get_material");
+	ClassDB::bind_method(D_METHOD("get_materials"), &SteamAudioGeometry::get_materials);
+	ClassDB::bind_method(D_METHOD("set_materials", "materials"), &SteamAudioGeometry::set_materials);
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "materials", PROPERTY_HINT_DICTIONARY_TYPE, "String;SteamAudioMaterial"), "set_materials", "get_materials");
+
+	ClassDB::bind_method(D_METHOD("get_is_dynamic"), &SteamAudioGeometry::get_is_dynamic);
+	ClassDB::bind_method(D_METHOD("set_is_dynamic", "dynamic"), &SteamAudioGeometry::set_is_dynamic);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "is_dynamic"), "set_is_dynamic", "get_is_dynamic");
+
+	ClassDB::bind_method(D_METHOD("get_root_path"), &SteamAudioGeometry::get_root_path);
+	ClassDB::bind_method(D_METHOD("set_root_path", "path"), &SteamAudioGeometry::set_root_path);
+	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "root_path"), "set_root_path", "get_root_path");
 }
 
 SteamAudioGeometry::SteamAudioGeometry() {}
-
-SteamAudioGeometry::~SteamAudioGeometry() {
-	if (Engine::get_singleton()->is_editor_hint()) {
-		return;
-	}
-
-	unregister_geometry();
-	destroy_geometry();
-}
-
-void SteamAudioGeometry::ready_internal() {
-	if (Engine::get_singleton()->is_editor_hint()) {
-		return;
-	}
-
-	create_geometry();
-	register_geometry();
-}
+SteamAudioGeometry::~SteamAudioGeometry() {}
 
 void SteamAudioGeometry::_notification(int p_what) {
+	if (Engine::get_singleton()->is_editor_hint()) return;
+
 	switch (p_what) {
-		case NOTIFICATION_ENTER_TREE:
-			ready_internal();
+		case NOTIFICATION_READY: {
+			Node *root = get_node_or_null(root_path);
+			if (!root) root = this;
+			find_and_register_geometry(root);
+		} break;
+		case NOTIFICATION_EXIT_TREE: {
+			Node *root = get_node_or_null(root_path);
+			if (!root) root = this;
+			find_and_unregister_geometry(root);
+		} break;
+	}
+}
+
+void SteamAudioGeometry::find_and_register_geometry(Node *p_node) {
+	if (!p_node) return;
+
+	Array groups = p_node->get_groups();
+	for (int i = 0; i < groups.size(); ++i) {
+		String group = groups[i];
+		if (materials.has(group)) {
+			Ref<SteamAudioMaterial> mat = materials[group];
+			if (is_dynamic) {
+				SteamAudioServer::get_singleton()->add_dynamic_geometry(p_node, mat);
+			} else {
+				SteamAudioServer::get_singleton()->add_static_geometry(p_node, mat);
+			}
+			// One node can only be one geometry object for now to keep it simple.
 			break;
+		}
+	}
+
+	for (int i = 0; i < p_node->get_child_count(); ++i) {
+		find_and_register_geometry(p_node->get_child(i));
 	}
 }
 
-void SteamAudioGeometry::set_disabled(bool p_disabled) {
-	if (disabled == p_disabled) {
-		return;
+void SteamAudioGeometry::find_and_unregister_geometry(Node *p_node) {
+	if (!p_node) return;
+
+	if (is_dynamic) {
+		SteamAudioServer::get_singleton()->remove_dynamic_geometry(p_node);
+	}
+	else {
+		SteamAudioServer::get_singleton()->remove_static_geometry(p_node);
 	}
 
-	if (p_disabled) {
-		unregister_geometry();
-	} else {
-		register_geometry();
-	}
-
-	disabled = p_disabled;
-}
-
-void SteamAudioGeometry::recalculate() {
-	unregister_geometry();
-	destroy_geometry();
-	create_geometry();
-	register_geometry();
-}
-
-void SteamAudioGeometry::create_geometry() {
-	// FIXME: we probably don't even have a global state yet
-	if (Object::cast_to<MeshInstance3D>(get_parent())) {
-		meshes = create_meshes_from_mesh_inst_3d(
-				Object::cast_to<MeshInstance3D>(get_parent()),
-				SteamAudioServer::get_singleton()->get_global_state()->scene, mat);
-	} else if (Object::cast_to<CollisionShape3D>(get_parent())) {
-		meshes = create_meshes_from_coll_inst_3d(
-				Object::cast_to<CollisionShape3D>(get_parent()),
-				SteamAudioServer::get_singleton()->get_global_state()->scene, mat);
-	} else {
-		UtilityFunctions::push_error("The parent of SteamAudioGeometry must be a MeshInstance3D or a CollisionShape3D.");
-		return;
+	for (int i = 0; i < p_node->get_child_count(); ++i) {
+		find_and_unregister_geometry(p_node->get_child(i));
 	}
 }
 
-void SteamAudioGeometry::destroy_geometry() {
-	for (auto mesh : meshes) {
-		iplStaticMeshRelease(&mesh);
-	}
-	meshes.clear();
-}
+void SteamAudioGeometry::set_materials(const Dictionary &p_materials) { materials = p_materials; }
+Dictionary SteamAudioGeometry::get_materials() const { return materials; }
 
-void SteamAudioGeometry::register_geometry() {
-	for (auto mesh : meshes) {
-		SteamAudioServer::get_singleton()->add_static_mesh(mesh);
-	}
-}
+void SteamAudioGeometry::set_is_dynamic(bool p_dynamic) { is_dynamic = p_dynamic; }
+bool SteamAudioGeometry::get_is_dynamic() const { return is_dynamic; }
 
-void SteamAudioGeometry::unregister_geometry() {
-	for (auto ipl_mesh : meshes) {
-		SteamAudioServer::get_singleton()->remove_static_mesh(ipl_mesh);
-	}
-}
-
-PackedStringArray SteamAudioGeometry::_get_configuration_warnings() const {
-	PackedStringArray res;
-	if (!Object::cast_to<MeshInstance3D>(get_parent()) && !Object::cast_to<CollisionShape3D>(get_parent())) {
-		res.push_back("The parent of SteamAudioGeometry must be a MeshInstance3D or a CollisionShape3D.");
-	}
-	return res;
-}
-
-Ref<SteamAudioMaterial> SteamAudioGeometry::get_material() { return mat; }
-void SteamAudioGeometry::set_material(Ref<SteamAudioMaterial> p_material) { mat = p_material; }
+void SteamAudioGeometry::set_root_path(const NodePath &p_path) { root_path = p_path; }
+NodePath SteamAudioGeometry::get_root_path() const { return root_path; }

@@ -4,18 +4,23 @@
 #include "godot_cpp/classes/wrapped.hpp"
 #include "godot_cpp/variant/packed_string_array.hpp"
 #include <godot_cpp/classes/node3d.hpp>
+#include <godot_cpp/classes/audio_stream_generator.hpp>
+#include <godot_cpp/classes/audio_stream_generator_playback.hpp>
+#include <phonon.h>
 
-using namespace godot;
-
-class SteamAudioListener : public Node3D {
-	GDCLASS(SteamAudioListener, Node3D);
+class SteamAudioListener : public godot::Node3D {
+	GDCLASS(SteamAudioListener, godot::Node3D);
 
 private:
+	bool reflection_simulation_enabled = true;
 	int num_refl_rays = 4096;
 	int num_refl_bounces = 16;
 	float refl_duration = 2.0f;
 	int refl_ambisonics_order = 1;
 	float irradiance_min_dist = 1.0f;
+	uint32_t mask = 1;
+	float range = 0.0f;
+	float buffer_length = 0.1f;
 
 	void ready_internal();
 
@@ -39,7 +44,30 @@ public:
 	float get_irradiance_min_dist();
 	void set_irradiance_min_dist(float p_irradiance_min_dist);
 
-	PackedStringArray _get_configuration_warnings() const override;
+	uint32_t get_mask() const { return mask; }
+	void set_mask(uint32_t p_mask) { mask = p_mask; }
+
+	float get_range() const { return range; }
+	void set_range(float p_range) { range = p_range; }
+
+	float get_buffer_length() const { return buffer_length; }
+	void set_buffer_length(float p_buffer_length) { buffer_length = p_buffer_length; }
+
+	bool get_reflection_simulation_enabled() { return reflection_simulation_enabled; }
+	void set_reflection_simulation_enabled(bool p_enabled) { reflection_simulation_enabled = p_enabled; }
+
+	godot::Ref<godot::AudioStreamGenerator> get_generator() { return generator; }
+	void set_generator_playback(godot::Ref<godot::AudioStreamGeneratorPlayback> p_playback) { generator_playback = p_playback; }
+	godot::Ref<godot::AudioStreamGeneratorPlayback> get_generator_playback() { return generator_playback; }
+
+	// Steam Audio objects for listener
+	IPLAmbisonicsPanningEffect panning_effect = nullptr;
+	IPLAmbisonicsBinauralEffect binaural_effect = nullptr;
+
+	godot::PackedStringArray _get_configuration_warnings() const override;
+private:
+	godot::Ref<godot::AudioStreamGenerator> generator;
+	godot::Ref<godot::AudioStreamGeneratorPlayback> generator_playback;
 };
 
 #endif // STEAM_AUDIO_LISTENER_HPP

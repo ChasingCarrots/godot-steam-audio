@@ -8,6 +8,7 @@
 #include "godot_cpp/classes/capsule_shape3d.hpp"
 #include "godot_cpp/classes/collision_shape3d.hpp"
 #include "godot_cpp/classes/concave_polygon_shape3d.hpp"
+#include "godot_cpp/classes/convex_polygon_shape3d.hpp"
 #include "godot_cpp/classes/cylinder_mesh.hpp"
 #include "godot_cpp/classes/cylinder_shape3d.hpp"
 #include "godot_cpp/classes/mesh.hpp"
@@ -18,19 +19,18 @@
 #include "phonon.h"
 #include "steam_audio.hpp"
 #include <vector>
-using namespace godot;
 
-inline IPLStaticMesh godot_mesh_to_ipl_mesh(Ref<Mesh> mesh, IPLScene scene, IPLMaterial material, Transform3D trf, int surface_idx) {
-	Array dat = mesh->surface_get_arrays(surface_idx);
-	Array verts = dat[Mesh::ARRAY_VERTEX];
-	Array tris = dat[Mesh::ARRAY_INDEX];
+inline IPLStaticMesh godot_mesh_to_ipl_mesh(godot::Ref<godot::Mesh> mesh, IPLScene scene, IPLMaterial material, godot::Transform3D trf, int surface_idx) {
+	godot::Array dat = mesh->surface_get_arrays(surface_idx);
+	godot::Array verts = dat[godot::Mesh::ARRAY_VERTEX];
+	godot::Array tris = dat[godot::Mesh::ARRAY_INDEX];
 
 	std::vector<IPLVector3> ipl_verts(verts.size());
 	std::vector<IPLTriangle> ipl_tris(tris.size() / 3);
 	std::vector<IPLint32> ipl_mat_indices(tris.size() / 3);
 
 	for (int j = 0; j < verts.size(); j++) {
-		Vector3 vert = verts[j];
+		godot::Vector3 vert = verts[j];
 		vert = trf.basis.xform(vert);
 		vert += trf.origin;
 		ipl_verts[j] = ipl_vec3_from(vert);
@@ -54,19 +54,19 @@ inline IPLStaticMesh godot_mesh_to_ipl_mesh(Ref<Mesh> mesh, IPLScene scene, IPLM
 	static_mesh_cfg.materialIndices = ipl_mat_indices.data();
 	static_mesh_cfg.materials = mats;
 
-	IPLStaticMesh ipl_mesh;
-	iplStaticMeshCreate(scene, &static_mesh_cfg, &ipl_mesh);
+	IPLStaticMesh ipl_mesh = nullptr;
+	handleErr(iplStaticMeshCreate(scene, &static_mesh_cfg, &ipl_mesh), "Failed to create static mesh");
 
 	return ipl_mesh;
 }
 
-inline std::vector<IPLStaticMesh> create_meshes_from_mesh_inst_3d(MeshInstance3D *mesh_inst, IPLScene scene, Ref<SteamAudioMaterial> mat, bool ignore_trf = false) {
+inline std::vector<IPLStaticMesh> create_meshes_from_mesh_inst_3d(godot::MeshInstance3D *mesh_inst, IPLScene scene, godot::Ref<SteamAudioMaterial> mat, bool ignore_trf = false) {
 	std::vector<IPLStaticMesh> p_meshes;
-	Ref<Mesh> mesh = mesh_inst->get_mesh();
+	godot::Ref<godot::Mesh> mesh = mesh_inst->get_mesh();
 
-	Transform3D trf;
+	godot::Transform3D trf;
 	if (ignore_trf) {
-		trf = Transform3D(Vector3(1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1), Vector3(0, 0, 0));
+		trf = godot::Transform3D(godot::Vector3(1, 0, 0), godot::Vector3(0, 1, 0), godot::Vector3(0, 0, 1), godot::Vector3(0, 0, 0));
 	} else {
 		trf = mesh_inst->get_global_transform();
 	}
@@ -80,22 +80,22 @@ inline std::vector<IPLStaticMesh> create_meshes_from_mesh_inst_3d(MeshInstance3D
 
 	for (int i = 0; i < mesh->get_surface_count(); i++) {
 		auto ipl_mesh = godot_mesh_to_ipl_mesh(mesh, scene, material, trf, i);
-		p_meshes.push_back(ipl_mesh);
+		if (ipl_mesh) p_meshes.push_back(ipl_mesh);
 	}
 
 	return p_meshes;
 }
 
-inline std::vector<IPLStaticMesh> create_meshes_from_coll_inst_3d(CollisionShape3D *coll_inst, IPLScene scene, Ref<SteamAudioMaterial> mat, bool ignore_trf = false) {
+inline std::vector<IPLStaticMesh> create_meshes_from_coll_inst_3d(godot::CollisionShape3D *coll_inst, IPLScene scene, godot::Ref<SteamAudioMaterial> mat, bool ignore_trf = false) {
 	std::vector<IPLStaticMesh> p_meshes;
-	Transform3D trf;
+	godot::Transform3D trf;
 	if (ignore_trf) {
-		trf = Transform3D(Vector3(1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1), Vector3(0, 0, 0));
+		trf = godot::Transform3D(godot::Vector3(1, 0, 0), godot::Vector3(0, 1, 0), godot::Vector3(0, 0, 1), godot::Vector3(0, 0, 0));
 	} else {
 		trf = coll_inst->get_global_transform();
 	}
 
-	Ref<Mesh> mesh;
+	godot::Ref<godot::Mesh> mesh;
 
 	IPLMaterial material;
 	if (mat == nullptr) {
@@ -104,15 +104,15 @@ inline std::vector<IPLStaticMesh> create_meshes_from_coll_inst_3d(CollisionShape
 		material = mat->get_material();
 	}
 
-	if (Object::cast_to<BoxShape3D>(coll_inst->get_shape().ptr())) {
-		Ref<BoxShape3D> shape = coll_inst->get_shape();
-		Ref<BoxMesh> box_mesh;
+	if (godot::Object::cast_to<godot::BoxShape3D>(coll_inst->get_shape().ptr())) {
+		godot::Ref<godot::BoxShape3D> shape = coll_inst->get_shape();
+		godot::Ref<godot::BoxMesh> box_mesh;
 		box_mesh.instantiate();
 		box_mesh->set_size(shape->get_size());
 		mesh = box_mesh;
-	} else if (Object::cast_to<CylinderShape3D>(coll_inst->get_shape().ptr())) {
-		Ref<CylinderShape3D> shape = coll_inst->get_shape();
-		Ref<CylinderMesh> cyl_mesh;
+	} else if (godot::Object::cast_to<godot::CylinderShape3D>(coll_inst->get_shape().ptr())) {
+		godot::Ref<godot::CylinderShape3D> shape = coll_inst->get_shape();
+		godot::Ref<godot::CylinderMesh> cyl_mesh;
 		cyl_mesh.instantiate();
 		cyl_mesh->set_radial_segments(4);
 		cyl_mesh->set_rings(4);
@@ -120,51 +120,53 @@ inline std::vector<IPLStaticMesh> create_meshes_from_coll_inst_3d(CollisionShape
 		cyl_mesh->set_top_radius(shape->get_radius());
 		cyl_mesh->set_height(shape->get_height());
 		mesh = cyl_mesh;
-	} else if (Object::cast_to<CapsuleShape3D>(coll_inst->get_shape().ptr())) {
-		Ref<CapsuleShape3D> shape = coll_inst->get_shape();
-		Ref<CapsuleMesh> cap_mesh;
+	} else if (godot::Object::cast_to<godot::CapsuleShape3D>(coll_inst->get_shape().ptr())) {
+		godot::Ref<godot::CapsuleShape3D> shape = coll_inst->get_shape();
+		godot::Ref<godot::CapsuleMesh> cap_mesh;
 		cap_mesh.instantiate();
 		cap_mesh->set_radial_segments(4);
 		cap_mesh->set_rings(4);
 		cap_mesh->set_radius(shape->get_radius());
 		cap_mesh->set_height(shape->get_height());
 		mesh = cap_mesh;
-	} else if (Object::cast_to<SphereShape3D>(coll_inst->get_shape().ptr())) {
-		Ref<SphereShape3D> shape = coll_inst->get_shape();
-		Ref<SphereMesh> sph_mesh;
+	} else if (godot::Object::cast_to<godot::SphereShape3D>(coll_inst->get_shape().ptr())) {
+		godot::Ref<godot::SphereShape3D> shape = coll_inst->get_shape();
+		godot::Ref<godot::SphereMesh> sph_mesh;
 		sph_mesh.instantiate();
 		sph_mesh->set_radial_segments(4);
 		sph_mesh->set_rings(4);
 		sph_mesh->set_radius(shape->get_radius());
 		sph_mesh->set_height(shape->get_radius() * 2);
 		mesh = sph_mesh;
-	} else if (Object::cast_to<ConcavePolygonShape3D>(coll_inst->get_shape().ptr())) {
-		Ref<ConcavePolygonShape3D> concave = coll_inst->get_shape();
-		Ref<ArrayMesh> arr_mesh;
+	} else if (godot::Object::cast_to<godot::ConcavePolygonShape3D>(coll_inst->get_shape().ptr())) {
+		godot::Ref<godot::ConcavePolygonShape3D> concave = coll_inst->get_shape();
+		godot::Ref<godot::ArrayMesh> arr_mesh;
 		arr_mesh.instantiate();
 		auto faces = concave->get_faces();
 
-		PackedInt32Array tris;
+		godot::PackedInt32Array tris;
 		tris.resize(faces.size());
 		for (int i = 0; i < faces.size(); i++) {
 			tris[i] = i;
 		}
 
-		Array surface_array;
-		surface_array.resize(Mesh::ArrayType::ARRAY_MAX);
-		surface_array[Mesh::ArrayType::ARRAY_VERTEX] = faces;
-		surface_array[Mesh::ArrayType::ARRAY_INDEX] = tris;
+		godot::Array surface_array;
+		surface_array.resize(godot::Mesh::ArrayType::ARRAY_MAX);
+		surface_array[godot::Mesh::ArrayType::ARRAY_VERTEX] = faces;
+		surface_array[godot::Mesh::ArrayType::ARRAY_INDEX] = tris;
 
-		arr_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, surface_array);
+		arr_mesh->add_surface_from_arrays(godot::Mesh::PRIMITIVE_TRIANGLES, surface_array);
 		mesh = arr_mesh;
+	} else if (godot::Object::cast_to<godot::ConvexPolygonShape3D>(coll_inst->get_shape().ptr())) {
+		mesh = coll_inst->get_shape()->get_debug_mesh();
 	} else {
-		SteamAudio::log(SteamAudio::log_error, "SteamAudioGeometry supports sphere, box, cylinder, capsule and concave polygon shapes. Something else was provided, so this geometry will not do anything.");
+		SteamAudio::log(SteamAudio::log_error, "SteamAudioGeometry supports sphere, box, cylinder, capsule, concave polygon and convex polygon shapes. Something else was provided, so this geometry will not do anything.");
 		return p_meshes;
 	}
 
 	for (int i = 0; i < mesh->get_surface_count(); i++) {
 		auto ipl_mesh = godot_mesh_to_ipl_mesh(mesh, scene, material, trf, i);
-		p_meshes.push_back(ipl_mesh);
+		if (ipl_mesh) p_meshes.push_back(ipl_mesh);
 	}
 	mesh.unref();
 	return p_meshes;

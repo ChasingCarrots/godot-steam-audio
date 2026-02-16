@@ -5,10 +5,8 @@
 #include <phonon.h>
 #include <godot_cpp/classes/resource.hpp>
 
-using namespace godot;
-
-class SteamAudioMaterial : public Resource {
-	GDCLASS(SteamAudioMaterial, Resource);
+class SteamAudioMaterial : public godot::Resource {
+	GDCLASS(SteamAudioMaterial, godot::Resource);
 
 	IPLMaterial mat{};
 

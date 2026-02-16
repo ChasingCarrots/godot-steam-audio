@@ -1,51 +1,80 @@
 #include "listener.hpp"
-#include "config.hpp"
 #include "godot_cpp/classes/engine.hpp"
+#include "godot_cpp/classes/project_settings.hpp"
+#include "godot_cpp/classes/audio_stream_player3d.hpp"
+#include "godot_cpp/classes/audio_stream_player.hpp"
 #include "server.hpp"
 
+using namespace godot;
+
 void SteamAudioListener::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_generator"), &SteamAudioListener::get_generator);
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "generator", PROPERTY_HINT_RESOURCE_TYPE, "AudioStreamGenerator"), "", "get_generator");
+
+	ClassDB::bind_method(D_METHOD("get_reflection_simulation_enabled"), &SteamAudioListener::get_reflection_simulation_enabled);
+	ClassDB::bind_method(D_METHOD("set_reflection_simulation_enabled", "p_enabled"), &SteamAudioListener::set_reflection_simulation_enabled);
 	ClassDB::bind_method(D_METHOD("get_refl_duration"), &SteamAudioListener::get_refl_duration);
 	ClassDB::bind_method(D_METHOD("set_refl_duration", "p_refl_duration"), &SteamAudioListener::set_refl_duration);
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_duration", PROPERTY_HINT_RANGE, "0.1,10.0,0.1"), "set_refl_duration", "get_refl_duration");
 	ClassDB::bind_method(D_METHOD("get_irradiance_min_dist"), &SteamAudioListener::get_irradiance_min_dist);
 	ClassDB::bind_method(D_METHOD("set_irradiance_min_dist", "p_irradiance_min_dist"), &SteamAudioListener::set_irradiance_min_dist);
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "irradiance_min_distance", PROPERTY_HINT_RANGE, "0.1,5.0,0.1"), "set_irradiance_min_dist", "get_irradiance_min_dist");
 	ClassDB::bind_method(D_METHOD("get_num_refl_rays"), &SteamAudioListener::get_num_refl_rays);
 	ClassDB::bind_method(D_METHOD("set_num_refl_rays", "p_num_refl_rays"), &SteamAudioListener::set_num_refl_rays);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_rays", PROPERTY_HINT_RANGE, "1,8192,1"), "set_num_refl_rays", "get_num_refl_rays");
 	ClassDB::bind_method(D_METHOD("get_num_refl_bounces"), &SteamAudioListener::get_num_refl_bounces);
 	ClassDB::bind_method(D_METHOD("set_num_refl_bounces", "p_num_refl_bounces"), &SteamAudioListener::set_num_refl_bounces);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_bounces", PROPERTY_HINT_RANGE, "1,64,1"), "set_num_refl_bounces", "get_num_refl_bounces");
 	ClassDB::bind_method(D_METHOD("get_refl_ambisonics_order"), &SteamAudioListener::get_refl_ambisonics_order);
 	ClassDB::bind_method(D_METHOD("set_refl_ambisonics_order", "p_refl_ambisonics_order"), &SteamAudioListener::set_refl_ambisonics_order);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_ambisonics_order", PROPERTY_HINT_RANGE, "0,5,1"), "set_refl_ambisonics_order", "get_refl_ambisonics_order");
+	ClassDB::bind_method(D_METHOD("get_mask"), &SteamAudioListener::get_mask);
+	ClassDB::bind_method(D_METHOD("set_mask", "mask"), &SteamAudioListener::set_mask);
+	ClassDB::bind_method(D_METHOD("get_range"), &SteamAudioListener::get_range);
+	ClassDB::bind_method(D_METHOD("set_range", "range"), &SteamAudioListener::set_range);
+	ClassDB::bind_method(D_METHOD("get_buffer_length"), &SteamAudioListener::get_buffer_length);
+	ClassDB::bind_method(D_METHOD("set_buffer_length", "buffer_length"), &SteamAudioListener::set_buffer_length);
+
+	ADD_GROUP("Reflection Simulation", "reflection_simulation_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "reflection_simulation_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_reflection_simulation_enabled", "get_reflection_simulation_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_simulation_duration", PROPERTY_HINT_RANGE, "0.1,10.0,0.1"), "set_refl_duration", "get_refl_duration");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_simulation_irradiance_min_distance", PROPERTY_HINT_RANGE, "0.1,5.0,0.1"), "set_irradiance_min_dist", "get_irradiance_min_dist");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_simulation_rays", PROPERTY_HINT_RANGE, "1,8192,1"), "set_num_refl_rays", "get_num_refl_rays");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_simulation_bounces", PROPERTY_HINT_RANGE, "1,64,1"), "set_num_refl_bounces", "get_num_refl_bounces");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_simulation_ambisonics_order", PROPERTY_HINT_RANGE, "0,5,1"), "set_refl_ambisonics_order", "get_refl_ambisonics_order");
+
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "mask", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_mask", "get_mask");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "range", PROPERTY_HINT_RANGE, "0.0,10000.0,0.1,or_greater"), "set_range", "get_range");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "buffer_length", PROPERTY_HINT_RANGE, "0.01,1.0,0.01"), "set_buffer_length", "get_buffer_length");
 }
 
 void SteamAudioListener::ready_internal() {
-	if (Engine::get_singleton()->is_editor_hint()) {
-		return;
-	}
-
-	if (refl_ambisonics_order > SteamAudioConfig::max_ambisonics_order) {
-		refl_ambisonics_order = SteamAudioConfig::max_ambisonics_order;
-	}
-	if (refl_duration > SteamAudioConfig::max_refl_duration) {
-		refl_duration = SteamAudioConfig::max_refl_duration;
-	}
-	if (num_refl_rays > SteamAudioConfig::max_num_refl_rays) {
-		num_refl_rays = SteamAudioConfig::max_num_refl_rays;
-	}
-	SteamAudioServer::get_singleton()->add_listener(this);
+	generator.instantiate();
+	generator->set_mix_rate(ProjectSettings::get_singleton()->get_setting("audio/driver/mix_rate"));
+	generator->set_buffer_length(buffer_length);
 }
 
 void SteamAudioListener::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_ENTER_TREE:
+			if (Engine::get_singleton()->is_editor_hint()) return;
 			ready_internal();
 			break;
 		case NOTIFICATION_EXIT_TREE:
+			if (Engine::get_singleton()->is_editor_hint()) return;
 			SteamAudioServer::get_singleton()->remove_listener(this);
 			break;
+		case NOTIFICATION_READY: {
+			if (Engine::get_singleton()->is_editor_hint()) return;
+			Node *p = get_parent();
+			if (p && p->is_class("AudioStreamPlayer3D")) {
+				Object::cast_to<AudioStreamPlayer3D>(p)->set_stream(generator);
+				Object::cast_to<AudioStreamPlayer3D>(p)->play();
+				generator_playback = Object::cast_to<AudioStreamPlayer3D>(p)->get_stream_playback();
+			} else if (p && p->is_class("AudioStreamPlayer")) {
+				Object::cast_to<AudioStreamPlayer>(p)->set_stream(generator);
+				Object::cast_to<AudioStreamPlayer>(p)->play();
+				generator_playback = Object::cast_to<AudioStreamPlayer>(p)->get_stream_playback();
+			}
+			// Register with server only after generator_playback is set up,
+			// so the mixing thread won't encounter a null playback.
+			SteamAudioServer::get_singleton()->add_listener(this);
+		} break;
 	}
 }
 
@@ -65,19 +94,5 @@ void SteamAudioListener::set_irradiance_min_dist(float p_irradiance_min_dist) { 
 
 PackedStringArray SteamAudioListener::_get_configuration_warnings() const {
 	PackedStringArray res;
-
-	if (refl_ambisonics_order > SteamAudioConfig::max_ambisonics_order) {
-		res.push_back("Ambisonics order exceeds maximum set in SteamAudioConfig. \
-				When the game starts, the order on this player will be set to the maximum.");
-	}
-	if (refl_duration > SteamAudioConfig::max_refl_duration) {
-		res.push_back("Reflection duration exceeds maximum set in SteamAudioConfig. \
-				When the game starts, the value on this listener will be set to the maximum.");
-	}
-	if (num_refl_rays > SteamAudioConfig::max_num_refl_rays) {
-		res.push_back("Reflection rays exceed maximum set in SteamAudioConfig. \
-				When the game starts, the value on this listener will be set to the maximum.");
-	}
-
 	return res;
 }
