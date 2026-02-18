@@ -501,12 +501,57 @@ void SteamAudioServer::process_audio() {
 
 	std::shared_lock lock(collections_mutex);
 
+	// Pre-mix source playbacks so that mix_audio is called only once per source,
+	// rather than once per listener (mix_audio consumes the buffer).
+	// If mixed_frames is still populated from a previous call (no listener
+	// consumed it yet), skip fetching to avoid losing audio data.
+	for (auto &sd : sources) {
+		if (!sd.source_node)
+			continue;
+
+		if (sd.mixed_frames_consumed) {
+			sd.mixed_frames.clear();
+			sd.mixed_frames_consumed = false;
+		}
+
+		// Still have unconsumed frames from a previous call, don't fetch more
+		if (sd.mixed_frames.size() > 0)
+			continue;
+
+		std::lock_guard pb_lock(sd.source_node->get_playbacks_mutex());
+		auto &playbacks = sd.source_node->get_playbacks();
+
+		// Clean up finished playbacks
+		for (int i = 0; i < (int)playbacks.size(); ++i) {
+			if (!playbacks[i].playback->is_playing()) {
+				playbacks.remove_at(i);
+				i--;
+			}
+		}
+
+		if (playbacks.size() == 0)
+			continue;
+
+		sd.mixed_frames.resize(frame_size);
+		for (int s = 0; s < frame_size; ++s)
+			sd.mixed_frames[s] = Vector2(0.0f, 0.0f);
+
+		for (auto &pb : playbacks) {
+			const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, frame_size);
+			int pulled = MIN((int)frames.size(), frame_size);
+
+			for (int s = 0; s < pulled; ++s) {
+				sd.mixed_frames[s] += frames[s] * pb.volume_linear;
+			}
+		}
+	}
+
 	for (auto &ld : listeners) {
 		if (!ld.listener)
 			continue;
 
 		// Lock playbacks and check if there are any active ones
-		std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
+		std::lock_guard pb_lock(*ld.playbacks_mutex);
 
 		// Remove playbacks that are no longer playing
 		for (int i = (int)ld.playbacks.size() -1; i >= 0; --i) {
@@ -550,35 +595,20 @@ void SteamAudioServer::process_audio() {
 				}
 			}
 
-			if (!sld || !sld->binaural_effect || sld->out_of_range)
+ 		if (!sld || !sld->binaural_effect || sld->out_of_range)
 				continue;
 
-			// Pull PCM from source playbacks
+			// Use pre-mixed source audio frames
 			for (int s = 0; s < frame_size; ++s)
 				sld->input_buffer.data[0][s] = 0.0f;
 
 			{
-				std::lock_guard<std::mutex> pb_lock(sd.source_node->get_playbacks_mutex());
-				auto &playbacks = sd.source_node->get_playbacks();
-
-				// Clean up finished playbacks
-				for (int i = 0; i < (int)playbacks.size(); ++i) {
-					if (!playbacks[i].playback->is_playing()) {
-						playbacks.remove_at(i);
-						i--;
-					}
+				int pulled = MIN((int)sd.mixed_frames.size(), frame_size);
+				for (int s = 0; s < pulled; ++s) {
+					Vector2 v = sd.mixed_frames[s];
+					sld->input_buffer.data[0][s] = (v.x + v.y) * 0.5f;
 				}
-
-				for (auto &pb : playbacks) {
-					float effective_pitch = pb.pitch_scale * sld->doppler_pitch;
-					const PackedVector2Array frames = pb.playback->mix_audio(effective_pitch, frame_size);
-					int pulled = MIN((int)frames.size(), frame_size);
-
-					for (int s = 0; s < pulled; ++s) {
-						Vector2 v = frames[s];
-						sld->input_buffer.data[0][s] += (v.x + v.y) * 0.5f * pb.volume_linear;
-					}
-				}
+				sd.mixed_frames_consumed = true;
 			}
 
 			// Apply Direct Effects
@@ -709,6 +739,7 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener, Ref<AudioStrea
 		}
 	}
 
+	// but a unique lock for adding listeners to the list of listeners
 	std::unique_lock lock(collections_mutex);
 	ListenerData ld;
 	ld.listener = listener;

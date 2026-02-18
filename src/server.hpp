@@ -59,6 +59,11 @@ struct SourceData {
 
 	godot::LocalVector<SourceListenerData> listener_data;
 
+	// Pre-mixed audio frames from source playbacks. Populated once and kept
+	// until at least one listener consumes them.
+	godot::PackedVector2Array mixed_frames;
+	bool mixed_frames_consumed = false;
+
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
 	godot::Transform3D last_trf;
