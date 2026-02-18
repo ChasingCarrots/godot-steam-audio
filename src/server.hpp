@@ -1,17 +1,19 @@
 #ifndef STEAM_AUDIO_SERVER_H
 #define STEAM_AUDIO_SERVER_H
 
-#include "godot_cpp/classes/object.hpp"
+#include "godot_cpp/classes/audio_frame.hpp"
+#include "godot_cpp/classes/audio_stream_generator_playback.hpp"
 #include "godot_cpp/classes/node3d.hpp"
+#include "godot_cpp/classes/object.hpp"
 #include "godot_cpp/classes/thread.hpp"
 #include "godot_cpp/templates/local_vector.hpp"
-#include "godot_cpp/classes/audio_frame.hpp"
 #include "godot_cpp/variant/packed_vector2_array.hpp"
 #include "material.hpp"
 #include "steam_audio.hpp"
 #include <phonon.h>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <vector>
@@ -26,6 +28,10 @@ struct ListenerData {
 	// Pre-allocated buffers to avoid reallocations in the mixing thread
 	godot::LocalVector<godot::AudioFrame> mix_buffer;
 	godot::PackedVector2Array push_buffer;
+
+	// Multiple playbacks per listener, protected by playbacks_mutex
+	godot::LocalVector<godot::Ref<godot::AudioStreamGeneratorPlayback>> playbacks;
+	std::unique_ptr<std::mutex> playbacks_mutex = std::make_unique<std::mutex>();
 
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
@@ -97,7 +103,7 @@ private:
 	godot::Ref<godot::Thread> mixing_thread;
 	void mixing_thread_func();
 
-	godot::LocalVector<ListenerData> listeners;
+	std::vector<ListenerData> listeners;
 	godot::LocalVector<SourceData> sources;
 	godot::LocalVector<DynamicGeometryData> dynamic_geometry;
 	godot::LocalVector<StaticGeometryData> static_geometry;
@@ -136,7 +142,7 @@ public:
 	void tick(float delta);
 
 	// Listener management
-	void add_listener(SteamAudioListener *listener);
+	void add_listener(SteamAudioListener *listener, godot::Ref<godot::AudioStreamGeneratorPlayback> playback);
 	void remove_listener(SteamAudioListener *listener);
 
 	// Source management (for SteamAudioSource nodes)
@@ -146,7 +152,7 @@ public:
 	void add_static_geometry(godot::Node *p_node, godot::Ref<SteamAudioMaterial> p_material);
 	void remove_static_geometry(godot::Node *p_node);
 	void add_dynamic_geometry(godot::Node *p_node, godot::Ref<SteamAudioMaterial> p_material);
-	void remove_dynamic_geometry(godot::Node * node);
+	void remove_dynamic_geometry(godot::Node *node);
 
 	// Audio pulling and effect application
 	void process_audio();

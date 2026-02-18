@@ -1,8 +1,8 @@
 #include "listener.hpp"
+#include "godot_cpp/classes/audio_stream_player.hpp"
+#include "godot_cpp/classes/audio_stream_player3d.hpp"
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/project_settings.hpp"
-#include "godot_cpp/classes/audio_stream_player3d.hpp"
-#include "godot_cpp/classes/audio_stream_player.hpp"
 #include "server.hpp"
 
 using namespace godot;
@@ -10,6 +10,8 @@ using namespace godot;
 void SteamAudioListener::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_generator"), &SteamAudioListener::get_generator);
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "generator", PROPERTY_HINT_RESOURCE_TYPE, "AudioStreamGenerator"), "", "get_generator");
+
+	ClassDB::bind_method(D_METHOD("play_on_audiostreamplayer", "audiostreamplayer"), &SteamAudioListener::play_on_audiostreamplayer);
 
 	ClassDB::bind_method(D_METHOD("get_reflection_simulation_enabled"), &SteamAudioListener::get_reflection_simulation_enabled);
 	ClassDB::bind_method(D_METHOD("set_reflection_simulation_enabled", "p_enabled"), &SteamAudioListener::set_reflection_simulation_enabled);
@@ -23,6 +25,8 @@ void SteamAudioListener::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_num_refl_bounces", "p_num_refl_bounces"), &SteamAudioListener::set_num_refl_bounces);
 	ClassDB::bind_method(D_METHOD("get_refl_ambisonics_order"), &SteamAudioListener::get_refl_ambisonics_order);
 	ClassDB::bind_method(D_METHOD("set_refl_ambisonics_order", "p_refl_ambisonics_order"), &SteamAudioListener::set_refl_ambisonics_order);
+	ClassDB::bind_method(D_METHOD("get_refl_type"), &SteamAudioListener::get_refl_type);
+	ClassDB::bind_method(D_METHOD("set_refl_type", "p_refl_type"), &SteamAudioListener::set_refl_type);
 	ClassDB::bind_method(D_METHOD("get_mask"), &SteamAudioListener::get_mask);
 	ClassDB::bind_method(D_METHOD("set_mask", "mask"), &SteamAudioListener::set_mask);
 	ClassDB::bind_method(D_METHOD("get_range"), &SteamAudioListener::get_range);
@@ -37,6 +41,7 @@ void SteamAudioListener::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_simulation_rays", PROPERTY_HINT_RANGE, "1,8192,1"), "set_num_refl_rays", "get_num_refl_rays");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_simulation_bounces", PROPERTY_HINT_RANGE, "1,64,1"), "set_num_refl_bounces", "get_num_refl_bounces");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_simulation_ambisonics_order", PROPERTY_HINT_RANGE, "0,5,1"), "set_refl_ambisonics_order", "get_refl_ambisonics_order");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_simulation_type", PROPERTY_HINT_ENUM, "Convolution,Parametric,Hybrid"), "set_refl_type", "get_refl_type");
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "mask", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_mask", "get_mask");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "range", PROPERTY_HINT_RANGE, "0.0,10000.0,0.1,or_greater"), "set_range", "get_range");
@@ -52,30 +57,53 @@ void SteamAudioListener::ready_internal() {
 void SteamAudioListener::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_ENTER_TREE:
-			if (Engine::get_singleton()->is_editor_hint()) return;
+			if (Engine::get_singleton()->is_editor_hint())
+				return;
 			ready_internal();
 			break;
 		case NOTIFICATION_EXIT_TREE:
-			if (Engine::get_singleton()->is_editor_hint()) return;
+			if (Engine::get_singleton()->is_editor_hint())
+				return;
 			SteamAudioServer::get_singleton()->remove_listener(this);
 			break;
 		case NOTIFICATION_READY: {
-			if (Engine::get_singleton()->is_editor_hint()) return;
-			Node *p = get_parent();
-			if (p && p->is_class("AudioStreamPlayer3D")) {
-				Object::cast_to<AudioStreamPlayer3D>(p)->set_stream(generator);
-				Object::cast_to<AudioStreamPlayer3D>(p)->play();
-				generator_playback = Object::cast_to<AudioStreamPlayer3D>(p)->get_stream_playback();
-			} else if (p && p->is_class("AudioStreamPlayer")) {
-				Object::cast_to<AudioStreamPlayer>(p)->set_stream(generator);
-				Object::cast_to<AudioStreamPlayer>(p)->play();
-				generator_playback = Object::cast_to<AudioStreamPlayer>(p)->get_stream_playback();
+			if (Engine::get_singleton()->is_editor_hint())
+				return;
+			if (get_child_count() > 0) {
+				Node *child = get_child(0);
+				if (child && (child->is_class("AudioStreamPlayer") || child->is_class("AudioStreamPlayer3D") || child->is_class("AudioStreamPlayer2D") || child->is_class("SteamAudioSource"))) {
+					play_on_audiostreamplayer(child);
+				}
 			}
-			// Register with server only after generator_playback is set up,
-			// so the mixing thread won't encounter a null playback.
-			SteamAudioServer::get_singleton()->add_listener(this);
 		} break;
 	}
+}
+
+Ref<AudioStreamGeneratorPlayback> SteamAudioListener::play_on_audiostreamplayer(godot::Variant audiostreamplayer) {
+	Ref<AudioStreamGeneratorPlayback> playback;
+	if (!generator.is_valid()) {
+		ERR_PRINT("SteamAudioListener: generator is invalid, the SteamAudioListener has to be added to the tree before calling play_on_audiostreamplayer.");
+		return playback;
+	}
+	if (audiostreamplayer.get_type() != Variant::OBJECT || (!audiostreamplayer.has_method("set_stream") && !audiostreamplayer.has_method("play_stream"))) {
+		ERR_PRINT("SteamAudioListener: audiostreamplayer is not an AudioStreamPlayer/2D/3D or SteamAudioSource.");
+		return playback;
+	}
+	if (audiostreamplayer.has_method("set_stream")) {
+		audiostreamplayer.call("set_stream", generator);
+		audiostreamplayer.call("play");
+		playback = audiostreamplayer.call("get_stream_playback");
+	}
+	else if (audiostreamplayer.has_method("play_stream")) {
+		playback = audiostreamplayer.call("play_stream", generator);
+	}
+	if (playback.is_valid()) {
+		SteamAudioServer::get_singleton()->add_listener(this, playback);
+	}
+	else {
+		ERR_PRINT("SteamAudioListener: play_on_audiostreamplayer failed.");
+	}
+	return playback;
 }
 
 SteamAudioListener::SteamAudioListener() {}
@@ -91,6 +119,8 @@ float SteamAudioListener::get_refl_duration() { return refl_duration; }
 void SteamAudioListener::set_refl_duration(float p_refl_duration) { refl_duration = p_refl_duration; }
 float SteamAudioListener::get_irradiance_min_dist() { return irradiance_min_dist; }
 void SteamAudioListener::set_irradiance_min_dist(float p_irradiance_min_dist) { irradiance_min_dist = p_irradiance_min_dist; }
+int SteamAudioListener::get_refl_type() { return refl_type; }
+void SteamAudioListener::set_refl_type(int p_refl_type) { refl_type = p_refl_type; }
 
 PackedStringArray SteamAudioListener::_get_configuration_warnings() const {
 	PackedStringArray res;

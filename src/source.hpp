@@ -1,13 +1,13 @@
 #ifndef STEAM_AUDIO_SOURCE_HPP
 #define STEAM_AUDIO_SOURCE_HPP
 
-#include <godot_cpp/core/class_db.hpp>
-#include <godot_cpp/classes/node3d.hpp>
-#include <godot_cpp/classes/audio_stream.hpp>
-#include <godot_cpp/classes/audio_stream_playback.hpp>
-#include <godot_cpp/templates/local_vector.hpp>
 #include <phonon.h>
 #include <cmath>
+#include <godot_cpp/classes/audio_stream.hpp>
+#include <godot_cpp/classes/audio_stream_playback.hpp>
+#include <godot_cpp/classes/node3d.hpp>
+#include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/templates/local_vector.hpp>
 #include <mutex>
 
 struct PlaybackEntry {
@@ -26,8 +26,11 @@ private:
 	bool dynamic_registration = false;
 	bool is_registered = false;
 
+	bool direct_enabled = true;
+
 	bool binaural_enabled = true;
 	int binaural_interpolation = IPL_HRTFINTERPOLATION_NEAREST;
+	float binaural_spatial_blend = 1.0f;
 
 	bool distance_attenuation_enabled = true;
 	float distance_attenuation_min = 1.0f;
@@ -52,7 +55,6 @@ private:
 	float transmission_high = 0.05f;
 
 	bool reflection_enabled = false;
-	int reflection_type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
 	float reflection_duration = 2.0f;
 	float reflection_hybrid_delay = 0.5f;
 
@@ -71,6 +73,9 @@ public:
 	void set_stream_volume(godot::Ref<godot::AudioStreamPlayback> p_playback, float p_volume_db);
 	void set_stream_pitch(godot::Ref<godot::AudioStreamPlayback> p_playback, float p_pitch_scale);
 
+	bool get_direct_enabled() const { return direct_enabled; }
+	void set_direct_enabled(bool p_enabled) { direct_enabled = p_enabled; }
+
 	bool get_binaural_enabled() const { return binaural_enabled; }
 	void set_binaural_enabled(bool p_enabled) { binaural_enabled = p_enabled; }
 	int get_binaural_interpolation() const { return binaural_interpolation; }
@@ -78,8 +83,6 @@ public:
 
 	bool get_reflection_enabled() const { return reflection_enabled; }
 	void set_reflection_enabled(bool p_enabled) { reflection_enabled = p_enabled; }
-	int get_reflection_type() const { return reflection_type; }
-	void set_reflection_type(int p_type) { reflection_type = p_type; }
 	float get_reflection_duration() const { return reflection_duration; }
 	void set_reflection_duration(float p_duration) { reflection_duration = p_duration; }
 	float get_reflection_hybrid_delay() const { return reflection_hybrid_delay; }
@@ -131,6 +134,9 @@ public:
 
 	float get_doppler_factor() const { return doppler_factor; }
 	void set_doppler_factor(float p_factor) { doppler_factor = p_factor; }
+
+	float get_binaural_spatial_blend() const { return binaural_spatial_blend; }
+	void set_binaural_spatial_blend(float p_blend) { binaural_spatial_blend = p_blend; }
 
 	std::mutex &get_playbacks_mutex() { return playbacks_mutex; }
 	godot::LocalVector<PlaybackEntry> &get_playbacks() { return playbacks; }

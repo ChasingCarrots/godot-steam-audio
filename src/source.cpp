@@ -9,6 +9,9 @@ void SteamAudioSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_stream_volume", "stream_playback", "volume_db"), &SteamAudioSource::set_stream_volume);
 	ClassDB::bind_method(D_METHOD("set_stream_pitch", "stream_playback", "pitch_scale"), &SteamAudioSource::set_stream_pitch);
 
+	ClassDB::bind_method(D_METHOD("get_direct_enabled"), &SteamAudioSource::get_direct_enabled);
+	ClassDB::bind_method(D_METHOD("set_direct_enabled", "enabled"), &SteamAudioSource::set_direct_enabled);
+
 	ClassDB::bind_method(D_METHOD("get_binaural_enabled"), &SteamAudioSource::get_binaural_enabled);
 	ClassDB::bind_method(D_METHOD("set_binaural_enabled", "enabled"), &SteamAudioSource::set_binaural_enabled);
 	ClassDB::bind_method(D_METHOD("get_binaural_interpolation"), &SteamAudioSource::get_binaural_interpolation);
@@ -16,8 +19,6 @@ void SteamAudioSource::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_reflection_enabled"), &SteamAudioSource::get_reflection_enabled);
 	ClassDB::bind_method(D_METHOD("set_reflection_enabled", "enabled"), &SteamAudioSource::set_reflection_enabled);
-	ClassDB::bind_method(D_METHOD("get_reflection_type"), &SteamAudioSource::get_reflection_type);
-	ClassDB::bind_method(D_METHOD("set_reflection_type", "type"), &SteamAudioSource::set_reflection_type);
 	ClassDB::bind_method(D_METHOD("get_reflection_duration"), &SteamAudioSource::get_reflection_duration);
 	ClassDB::bind_method(D_METHOD("set_reflection_duration", "duration"), &SteamAudioSource::set_reflection_duration);
 	ClassDB::bind_method(D_METHOD("get_reflection_hybrid_delay"), &SteamAudioSource::get_reflection_hybrid_delay);
@@ -70,9 +71,15 @@ void SteamAudioSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_doppler_factor"), &SteamAudioSource::get_doppler_factor);
 	ClassDB::bind_method(D_METHOD("set_doppler_factor", "factor"), &SteamAudioSource::set_doppler_factor);
 
+	ClassDB::bind_method(D_METHOD("get_binaural_spatial_blend"), &SteamAudioSource::get_binaural_spatial_blend);
+	ClassDB::bind_method(D_METHOD("set_binaural_spatial_blend", "blend"), &SteamAudioSource::set_binaural_spatial_blend);
+
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "direct_enabled"), "set_direct_enabled", "get_direct_enabled");
+
 	ADD_GROUP("Binaural", "binaural_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "binaural_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_binaural_enabled", "get_binaural_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "binaural_interpolation", PROPERTY_HINT_ENUM, "Nearest,Bilinear"), "set_binaural_interpolation", "get_binaural_interpolation");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "binaural_spatial_blend", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_binaural_spatial_blend", "get_binaural_spatial_blend");
 
 	ADD_GROUP("Distance Attenuation", "distance_attenuation_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "distance_attenuation_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_distance_attenuation_enabled", "get_distance_attenuation_enabled");
@@ -105,12 +112,10 @@ void SteamAudioSource::_bind_methods() {
 
 	ADD_GROUP("Reflection", "reflection_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "reflection_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_reflection_enabled", "get_reflection_enabled");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "reflection_type", PROPERTY_HINT_ENUM, "Convolution,Parametric,Hybrid"), "set_reflection_type", "get_reflection_type");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_duration"), "set_reflection_duration", "get_reflection_duration");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_hybrid_delay", PROPERTY_HINT_RANGE, "0.0,10.0,0.01"), "set_reflection_hybrid_delay", "get_reflection_hybrid_delay");
 
 	ADD_SIGNAL(MethodInfo("removed_from_simulation"));
-
 }
 
 SteamAudioSource::SteamAudioSource() {}
@@ -118,11 +123,13 @@ SteamAudioSource::SteamAudioSource() {}
 SteamAudioSource::~SteamAudioSource() {}
 
 void SteamAudioSource::_notification(int p_what) {
-	if (Engine::get_singleton()->is_editor_hint()) return;
+	if (Engine::get_singleton()->is_editor_hint())
+		return;
 
 	switch (p_what) {
 		case NOTIFICATION_ENTER_TREE:
-			if (Engine::get_singleton()->is_editor_hint()) return;
+			if (Engine::get_singleton()->is_editor_hint())
+				return;
 			if (!dynamic_registration) {
 				SteamAudioServer::get_singleton()->add_source(this);
 				is_registered = true;
@@ -130,14 +137,16 @@ void SteamAudioSource::_notification(int p_what) {
 			set_process(dynamic_registration);
 			break;
 		case NOTIFICATION_EXIT_TREE:
-			if (Engine::get_singleton()->is_editor_hint()) return;
+			if (Engine::get_singleton()->is_editor_hint())
+				return;
 			if (is_registered) {
 				SteamAudioServer::get_singleton()->remove_source(this);
 				is_registered = false;
 			}
 			break;
 		case NOTIFICATION_PROCESS: {
-			if (!dynamic_registration || !is_registered) break;
+			if (!dynamic_registration || !is_registered)
+				break;
 			bool has_active = false;
 			{
 				std::lock_guard<std::mutex> lock(playbacks_mutex);
@@ -159,7 +168,8 @@ void SteamAudioSource::_notification(int p_what) {
 }
 
 void SteamAudioSource::set_stream_volume(Ref<AudioStreamPlayback> p_playback, float p_volume_db) {
-	if (p_playback.is_null()) return;
+	if (p_playback.is_null())
+		return;
 
 	std::lock_guard<std::mutex> lock(playbacks_mutex);
 	for (auto &entry : playbacks) {
@@ -171,7 +181,8 @@ void SteamAudioSource::set_stream_volume(Ref<AudioStreamPlayback> p_playback, fl
 }
 
 void SteamAudioSource::set_stream_pitch(Ref<AudioStreamPlayback> p_playback, float p_pitch_scale) {
-	if (p_playback.is_null()) return;
+	if (p_playback.is_null())
+		return;
 
 	std::lock_guard<std::mutex> lock(playbacks_mutex);
 	for (auto &entry : playbacks) {
@@ -183,7 +194,8 @@ void SteamAudioSource::set_stream_pitch(Ref<AudioStreamPlayback> p_playback, flo
 }
 
 Ref<AudioStreamPlayback> SteamAudioSource::play_stream(Ref<AudioStream> p_stream, float p_volume_db, float p_pitch_scale) {
-	if (p_stream.is_null()) return Ref<AudioStreamPlayback>();
+	if (p_stream.is_null())
+		return Ref<AudioStreamPlayback>();
 
 	Ref<AudioStreamPlayback> playback = p_stream->instantiate_playback();
 	if (playback.is_valid()) {
@@ -201,4 +213,3 @@ Ref<AudioStreamPlayback> SteamAudioSource::play_stream(Ref<AudioStream> p_stream
 	}
 	return playback;
 }
-
