@@ -1,5 +1,6 @@
 #include "server.hpp"
 #include "geometry_common.hpp"
+#include "godot_cpp/classes/audio_effect.hpp"
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/os.hpp"
 #include "godot_cpp/classes/project_settings.hpp"
@@ -161,6 +162,7 @@ void SteamAudioServer::init() {
 
 	// Cache audio settings once
 	cached_audio_settings = get_audio_settings();
+	temp_buffer.resize(cached_audio_settings.frameSize);
 
 	IPLHRTFSettings hrtf_cfg{};
 	hrtf_cfg.type = IPL_HRTFTYPE_DEFAULT;
@@ -534,15 +536,25 @@ void SteamAudioServer::process_audio() {
 
 		sd.mixed_frames.resize(frame_size);
 		for (int s = 0; s < frame_size; ++s)
-			sd.mixed_frames[s] = Vector2(0.0f, 0.0f);
+			sd.mixed_frames[s] = {};
 
 		for (auto &pb : playbacks) {
 			const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, frame_size);
 			int pulled = MIN((int)frames.size(), frame_size);
 
 			for (int s = 0; s < pulled; ++s) {
-				sd.mixed_frames[s] += frames[s] * pb.volume_linear;
+				sd.mixed_frames[s].left += frames[s].x * pb.volume_linear;
+				sd.mixed_frames[s].right += frames[s].y * pb.volume_linear;
 			}
+		}
+
+		// Apply effect stack in-place on mixed frames
+		for (auto &inst : sd.effect_instances) {
+			inst->_process(
+					sd.mixed_frames.ptr(),
+					temp_buffer.ptr(),
+					frame_size);
+			SWAP(sd.mixed_frames, temp_buffer);
 		}
 	}
 
@@ -605,8 +617,8 @@ void SteamAudioServer::process_audio() {
 			{
 				int pulled = MIN((int)sd.mixed_frames.size(), frame_size);
 				for (int s = 0; s < pulled; ++s) {
-					Vector2 v = sd.mixed_frames[s];
-					sld->input_buffer.data[0][s] = (v.x + v.y) * 0.5f;
+					AudioFrame af = sd.mixed_frames[s];
+					sld->input_buffer.data[0][s] = (af.left + af.right) * 0.5f;
 				}
 				sd.mixed_frames_consumed = true;
 			}
@@ -824,6 +836,20 @@ void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 
 	SourceData sd;
 	sd.source_node = source_node;
+
+	// Instantiate AudioEffectInstances from the source's effect stack
+	TypedArray<AudioEffect> effects = source_node->get_effect_stack();
+	for (int i = 0; i < effects.size(); ++i) {
+		Ref<AudioEffect> effect = effects[i];
+		if (effect.is_valid()) {
+			// THIS WON'T WORK! because AudioEffect is not exposed completely like that to gdextension.
+			// inst will always be invalid/null...
+			Ref<AudioEffectInstance> inst = effect->_instantiate();
+			if (inst.is_valid()) {
+				sd.effect_instances.push_back(inst);
+			}
+		}
+	}
 
 	// Initialize effects and buffers for all existing listeners
 	for (const auto &ld : listeners) {

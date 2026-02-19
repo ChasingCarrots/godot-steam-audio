@@ -74,6 +74,9 @@ void SteamAudioSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_binaural_spatial_blend"), &SteamAudioSource::get_binaural_spatial_blend);
 	ClassDB::bind_method(D_METHOD("set_binaural_spatial_blend", "blend"), &SteamAudioSource::set_binaural_spatial_blend);
 
+	ClassDB::bind_method(D_METHOD("get_effect_stack"), &SteamAudioSource::get_effect_stack);
+	ClassDB::bind_method(D_METHOD("set_effect_stack", "stack"), &SteamAudioSource::set_effect_stack);
+
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "direct_enabled"), "set_direct_enabled", "get_direct_enabled");
 
 	ADD_GROUP("Binaural", "binaural_");
@@ -114,6 +117,8 @@ void SteamAudioSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "reflection_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_reflection_enabled", "get_reflection_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_duration"), "set_reflection_duration", "get_reflection_duration");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_hybrid_delay", PROPERTY_HINT_RANGE, "0.0,10.0,0.01"), "set_reflection_hybrid_delay", "get_reflection_hybrid_delay");
+
+	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "effect_stack", PROPERTY_HINT_TYPE_STRING, String::num(Variant::OBJECT) + "/" + String::num(PROPERTY_HINT_RESOURCE_TYPE) + ":AudioEffect"), "set_effect_stack", "get_effect_stack");
 
 	ADD_SIGNAL(MethodInfo("removed_from_simulation"));
 }

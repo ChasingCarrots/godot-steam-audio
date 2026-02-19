@@ -1,6 +1,7 @@
 #ifndef STEAM_AUDIO_SERVER_H
 #define STEAM_AUDIO_SERVER_H
 
+#include "godot_cpp/classes/audio_effect_instance.hpp"
 #include "godot_cpp/classes/audio_frame.hpp"
 #include "godot_cpp/classes/audio_stream_generator_playback.hpp"
 #include "godot_cpp/classes/node3d.hpp"
@@ -61,8 +62,11 @@ struct SourceData {
 
 	// Pre-mixed audio frames from source playbacks. Populated once and kept
 	// until at least one listener consumes them.
-	godot::PackedVector2Array mixed_frames;
+	godot::LocalVector<godot::AudioFrame> mixed_frames;
 	bool mixed_frames_consumed = false;
+
+	// AudioEffectInstances created from the source's effect stack
+	godot::LocalVector<godot::Ref<godot::AudioEffectInstance>> effect_instances;
 
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
@@ -112,6 +116,7 @@ private:
 	godot::LocalVector<SourceData> sources;
 	godot::LocalVector<DynamicGeometryData> dynamic_geometry;
 	godot::LocalVector<StaticGeometryData> static_geometry;
+	godot::LocalVector<godot::AudioFrame> temp_buffer;
 
 	// Protects listeners, sources, dynamic_geometry, static_geometry
 	std::shared_mutex collections_mutex;

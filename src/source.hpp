@@ -3,11 +3,13 @@
 
 #include <phonon.h>
 #include <cmath>
+#include <godot_cpp/classes/audio_effect.hpp>
 #include <godot_cpp/classes/audio_stream.hpp>
 #include <godot_cpp/classes/audio_stream_playback.hpp>
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/templates/local_vector.hpp>
+#include <godot_cpp/variant/typed_array.hpp>
 #include <mutex>
 
 struct PlaybackEntry {
@@ -59,6 +61,8 @@ private:
 	float reflection_hybrid_delay = 0.5f;
 
 	float doppler_factor = 1.0f;
+
+	godot::TypedArray<godot::AudioEffect> effect_stack;
 
 protected:
 	static void _bind_methods();
@@ -140,6 +144,9 @@ public:
 
 	std::mutex &get_playbacks_mutex() { return playbacks_mutex; }
 	godot::LocalVector<PlaybackEntry> &get_playbacks() { return playbacks; }
+
+	godot::TypedArray<godot::AudioEffect> get_effect_stack() const { return effect_stack; }
+	void set_effect_stack(const godot::TypedArray<godot::AudioEffect> &p_stack) { effect_stack = p_stack; }
 };
 
 #endif // STEAM_AUDIO_SOURCE_HPP
