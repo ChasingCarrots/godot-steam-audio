@@ -24,16 +24,23 @@ class AudioStream;
 class SteamAudioListener;
 class SteamAudioSource;
 
+struct ListenerPlaybackEntry {
+	godot::Ref<godot::AudioStreamGeneratorPlayback> playback;
+	int remaining_from_push_buffer = 0;
+};
+
 struct ListenerData {
 	SteamAudioListener *listener = nullptr;
 	IPLSimulator simulator = nullptr;
 
-	// Pre-allocated buffers to avoid reallocations in the mixing thread
-	godot::LocalVector<godot::AudioFrame> mix_buffer;
+	// This buffer will be filled by the pre-mixed and steam audio handled
+	// audio data from all relevant sources. When all relevant sources have
+	// filled it, it will be pushed to the listener's playbacks, ready for a new round.
 	godot::PackedVector2Array push_buffer;
+	bool push_buffer_ready = false;
 
 	// Multiple playbacks per listener, protected by playbacks_mutex
-	godot::LocalVector<godot::Ref<godot::AudioStreamGeneratorPlayback>> playbacks;
+	godot::LocalVector<ListenerPlaybackEntry> playbacks;
 	std::unique_ptr<std::mutex> playbacks_mutex = std::make_unique<std::mutex>();
 
 	// Cached transform data, updated on main thread
@@ -47,6 +54,8 @@ struct SourceListenerData {
 	float dist_to_listener = 0.0f;
 	float doppler_pitch = 1.0f;
 	bool out_of_range = false;
+	bool consumed_source_mix = true;
+	bool pushed_to_listener_buffer = false;
 	IPLSource source = nullptr;
 	IPLBinauralEffect binaural_effect = nullptr;
 	IPLDirectEffect direct_effect = nullptr;
@@ -74,7 +83,6 @@ struct SourceData {
 	// Pre-mixed audio frames from source playbacks.
 	godot::PackedVector2Array mixed_frames;
 	int mixed_frames_ready = 0;
-	bool mixed_frames_consumed = false;
 
 	// AudioEffectInstances created from the source's effect stack
 	godot::LocalVector<godot::Ref<godot::AudioEffectInstance>> effect_instances;
