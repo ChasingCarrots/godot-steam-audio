@@ -534,36 +534,92 @@ void SteamAudioServer::process_audio() {
 
 	std::shared_lock lock(collections_mutex);
 
-	// Pre-mix source playbacks so that mix_audio is called only once per source,
-	// rather than once per listener (mix_audio consumes the buffer).
-	// If mixed_frames is still populated from a previous call (no listener
-	// consumed it yet), skip fetching to avoid losing audio data.
+	// =========================================================================
+	// PHASE 3: Drain push_buffers into listener playbacks.
+	// For each listener whose push_buffer is ready (pending_drains > 0),
+	// push data to playbacks. When all playbacks have consumed the buffer,
+	// clear it and prepare for a new round of contributions.
+	// =========================================================================
+	for (auto &ld : listeners) {
+		if (!ld.listener)
+			continue;
+		if (ld.pending_drains <= 0)
+			continue;
+
+		PROFILE_FUNCTION_NAMED("Listener draining");
+		std::lock_guard pb_lock(*ld.playbacks_mutex);
+
+		// Remove playbacks that are no longer playing (adjust pending_drains)
+		// and push remaining data from the push_buffer to active playbacks.
+		for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
+			if (!ld.playbacks[i].playback->is_playing()) {
+				if (ld.playbacks[i].remaining_from_push_buffer > 0) {
+					ld.pending_drains--;
+				}
+				ld.playbacks.remove_at(i);
+				continue;
+			}
+			auto &pb = ld.playbacks[i];
+			if (pb.remaining_from_push_buffer <= 0)
+				continue;
+			if (pb.playback->can_push_buffer(pb.remaining_from_push_buffer)) {
+				pb.playback->push_buffer(ld.push_buffer.slice(frame_size - pb.remaining_from_push_buffer));
+				pb.remaining_from_push_buffer = 0;
+			} else {
+				int num_to_push = MIN(pb.remaining_from_push_buffer, pb.playback->get_frames_available());
+				if (num_to_push > 0) {
+					int start = frame_size - pb.remaining_from_push_buffer;
+					pb.playback->push_buffer(ld.push_buffer.slice(start, start + num_to_push));
+					pb.remaining_from_push_buffer -= num_to_push;
+				}
+			}
+			if (pb.remaining_from_push_buffer <= 0)
+				ld.pending_drains--;
+		}
+
+		// All playbacks have consumed the push_buffer — clear it and
+		// recount pending_contributors for the next round.
+		if (ld.pending_drains <= 0) {
+			ld.pending_drains = 0;
+			ld.push_buffer.fill(Vector2(0, 0));
+			ld.generation++;
+
+			// Count how many relevant sources need to contribute
+			ld.pending_contributors = 0;
+			for (auto &sd : sources) {
+				if (!sd.source_node)
+					continue;
+				if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+					continue;
+				for (auto &sld : sd.listener_data) {
+					if (sld.listener == ld.listener && !sld.out_of_range) {
+						ld.pending_contributors++;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	// =========================================================================
+	// PHASE 1: Mix source playbacks into mixed_frames.
+	// For each source whose pending_consumers == 0 (all listeners have consumed
+	// the previous mix), reset and pull new audio from playbacks.
+	// =========================================================================
 	int total_num_playbacks = 0;
 	for (auto &sd : sources) {
 		if (!sd.source_node)
 			continue;
 		PROFILE_FUNCTION_NAMED("Source Pre-mixing");
 
-		bool all_listeners_consumed_current_mix = true;
-		for (const auto& sld : sd.listener_data) {
-			if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
-				continue;
-			if (sld.pushed_to_listener_buffer || sld.out_of_range)
-				continue;
-			if (!sld.consumed_source_mix) {
-				all_listeners_consumed_current_mix = false;
-				break;
-			}
-		}
-
-		if (all_listeners_consumed_current_mix) {
-			sd.mixed_frames.fill(Vector2(0,0));
-			sd.mixed_frames_ready = 0;
-		}
-		else {
-			// we can't create a new mix, since there are still listeners
-			// wanting to consume our old mix.
+		// Can we start a new mix? Only if all listeners consumed the previous one.
+		if (sd.pending_consumers > 0)
 			continue;
+
+		// Reset if we had a completed mix that was fully consumed
+		if (sd.mixed_frames_ready >= frame_size) {
+			sd.mixed_frames.fill(Vector2(0, 0));
+			sd.mixed_frames_ready = 0;
 		}
 
 		// Does the mixed_frames buffer have space?
@@ -572,7 +628,7 @@ void SteamAudioServer::process_audio() {
 
 		{
 			// Clean up finished playbacks
-			for (int i = (int)sd.playbacks.size() -1; i >= 0; --i) {
+			for (int i = (int)sd.playbacks.size() - 1; i >= 0; --i) {
 				if (!sd.playbacks[i].playback->is_playing()) {
 					sd.playbacks.remove_at(i);
 				}
@@ -637,237 +693,261 @@ void SteamAudioServer::process_audio() {
 			}
 		}
 		if (sd.mixed_frames_ready == frame_size) {
-			// all sources are mixed! mark the listeners as not having consumed the mix
-			for (auto& sld : sd.listener_data) {
+			// Mix is complete! Count how many listeners need to consume it.
+			sd.pending_consumers = 0;
+			for (auto &sld : sd.listener_data) {
 				if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
 					continue;
-				sld.consumed_source_mix = false;
+				if (sld.out_of_range)
+					continue;
+				sd.pending_consumers++;
 			}
 		}
 	}
 	PROFILING_PLOT_NUMBER("NumActiveSteamAudioPlaybacks", (int64_t)total_num_playbacks);
 
+	// =========================================================================
+	// PHASE 2: Sources contribute their mixed audio to listener push_buffers.
+	// For each listener that is waiting for contributions (pending_contributors > 0),
+	// check each source: if its mix is ready and it hasn't contributed to this
+	// listener's current generation, apply SteamAudio effects and add to push_buffer.
+	// =========================================================================
 	for (auto &ld : listeners) {
 		if (!ld.listener)
 			continue;
 
-		PROFILE_FUNCTION_NAMED("Listener mixing");
-		// Lock playbacks and check if there are any active ones
-		std::lock_guard pb_lock(*ld.playbacks_mutex);
-
-		// Remove playbacks that are no longer playing and
-		// push remains from the push_buffer (we only want to fill
-		// the push_buffer if no playback needs this data anymore!)
-		bool all_playbacks_done_with_pushbuffer = true;
-		for (int i = (int)ld.playbacks.size() -1; i >= 0; --i) {
-			if (!ld.playbacks[i].playback->is_playing()) {
-				ld.playbacks.remove_at(i);
-			}
-			else if (ld.push_buffer_ready && ld.playbacks[i].remaining_from_push_buffer > 0) {
-				auto& pb = ld.playbacks[i];
-				if (pb.playback->can_push_buffer(pb.remaining_from_push_buffer)) {
-					pb.playback->push_buffer(ld.push_buffer.slice(frame_size - pb.remaining_from_push_buffer));
-					pb.remaining_from_push_buffer = 0;
-				}
-				else {
-					int num_to_push = MIN(pb.remaining_from_push_buffer, pb.playback->get_frames_available());
-					if (num_to_push > 0) {
-						int start = frame_size - pb.remaining_from_push_buffer;
-						pb.playback->push_buffer(ld.push_buffer.slice(start, start + num_to_push));
-						pb.remaining_from_push_buffer -= num_to_push;
-					}
-					all_playbacks_done_with_pushbuffer = false;
-				}
-			}
-		}
-
-		if (ld.push_buffer_ready && all_playbacks_done_with_pushbuffer) {
-			ld.push_buffer.fill(Vector2(0,0));
-			ld.push_buffer_ready = false;
-			// reset the pushed_to_listener_buffer flag
-			for (auto &sd : sources) {
-				for (auto &entry : sd.listener_data) {
-					if (entry.listener == ld.listener) {
-						entry.pushed_to_listener_buffer = false;
-					}
-				}
-			}
-		}
-
-		if (!ld.push_buffer_ready) {
-			// fill the push_buffer from relevant and ready sources
-			// the push_buffer_ready flag will be cleared by sources
-			// that are not ready.
-			ld.push_buffer_ready = true;
+		// If the listener is completely idle (no pending contributions and no
+		// pending drains), recount contributors. This handles the case where
+		// sources were added after the listener, or all sources were temporarily
+		// out of range and have come back.
+		if (ld.pending_contributors <= 0 && ld.pending_drains <= 0) {
+			ld.pending_contributors = 0;
 			for (auto &sd : sources) {
 				if (!sd.source_node)
 					continue;
-
 				if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
 					continue;
-
-				if (sd.mixed_frames_ready < frame_size) {
-					// this source is relevant, but it is not ready!
-					ld.push_buffer_ready = false;
-					continue;
-				}
-
-				SourceListenerData *sld = nullptr;
-				for (auto &entry : sd.listener_data) {
-					if (entry.listener == ld.listener) {
-						sld = &entry;
+				for (auto &sld : sd.listener_data) {
+					if (sld.listener == ld.listener && !sld.out_of_range) {
+						ld.pending_contributors++;
 						break;
 					}
-				}
-
-				if (!sld || sld->pushed_to_listener_buffer || sld->out_of_range)
-					continue;
-
-				// Use pre-mixed source audio frames
-				for (int s = 0; s < frame_size; ++s) {
-					Vector2 f = sd.mixed_frames[s];
-					sld->input_buffer.data[0][s] = (f.x + f.y) * 0.5f;
-				}
-				// we consumed the sourcedata mixed_frames, we mark that, so that new data can be created
-				sld->consumed_source_mix = true;
-
-				// Apply Direct Effects
-				if (sd.source_node->get_direct_enabled() && sld->source && sld->direct_effect) {
-					PROFILE_FUNCTION_NAMED("direct effect processing")
-					IPLSimulationOutputs outputs{};
-					iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
-
-					IPLDirectEffectParams direct_params = outputs.direct;
-					direct_params.flags = static_cast<IPLDirectEffectFlags>(0);
-
-					if (sd.source_node->get_occlusion_enabled()) {
-						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
-					}
-
-					if (sd.source_node->get_transmission_enabled()) {
-						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
-						direct_params.transmissionType = static_cast<IPLTransmissionType>(sd.source_node->get_transmission_type());
-						direct_params.transmission[0] = sd.source_node->get_transmission_low();
-						direct_params.transmission[1] = sd.source_node->get_transmission_med();
-						direct_params.transmission[2] = sd.source_node->get_transmission_high();
-					}
-
-					if (sd.source_node->get_air_absorption_enabled()) {
-						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
-						direct_params.airAbsorption[0] = sd.source_node->get_air_absorption_low();
-						direct_params.airAbsorption[1] = sd.source_node->get_air_absorption_med();
-						direct_params.airAbsorption[2] = sd.source_node->get_air_absorption_high();
-					}
-
-					if (sd.source_node->get_distance_attenuation_enabled()) {
-						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
-
-						float dist = sld->dist_to_listener;
-						float min_dist = sd.source_node->get_distance_attenuation_min();
-						float max_dist = sd.source_node->get_distance_attenuation_max();
-
-						float attenuation = 1.0f - CLAMP(Math::inverse_lerp(min_dist, max_dist, dist), 0.0f, 1.0f);
-						direct_params.distanceAttenuation = attenuation * attenuation;
-					} else {
-						direct_params.distanceAttenuation = 1.0f;
-					}
-
-					iplDirectEffectApply(sld->direct_effect, &direct_params, &sld->input_buffer, &sld->input_buffer);
-
-					// Apply Binaural Spatialization for direct audio
-					if (sd.source_node->get_binaural_enabled()) {
-						IPLBinauralEffectParams params{};
-
-						params.direction = iplCalculateRelativeDirection(phonon_context,
-								sd.cached_coords.origin,
-								ld.cached_coords.origin,
-								ld.cached_coords.ahead,
-								ld.cached_coords.up);
-						params.interpolation = static_cast<IPLHRTFInterpolation>(sd.source_node->get_binaural_interpolation());
-						params.spatialBlend = sd.source_node->get_binaural_spatial_blend();
-						params.hrtf = phonon_hrtf;
-
-						if (phonon_hrtf) {
-							iplBinauralEffectApply(sld->binaural_effect, &params, &sld->input_buffer, &sld->output_buffer);
-						} else {
-							for (int s = 0; s < frame_size; ++s) {
-								sld->output_buffer.data[0][s] = sld->input_buffer.data[0][s];
-								sld->output_buffer.data[1][s] = sld->input_buffer.data[0][s];
-							}
-						}
-
-						for (int s = 0; s < frame_size; ++s) {
-							ld.push_buffer[s].x += sld->output_buffer.data[0][s];
-							ld.push_buffer[s].y += sld->output_buffer.data[1][s];
-						}
-					} else {
-						for (int s = 0; s < frame_size; ++s) {
-							ld.push_buffer[s].x += sld->input_buffer.data[0][s];
-							ld.push_buffer[s].y += sld->input_buffer.data[0][s];
-						}
-					}
-				}
-
-				// Apply Reflections
-				if (sd.source_node->get_reflection_enabled() && sld->source && sld->reflection_effect && sld->ambisonics_decode_effect) {
-					PROFILE_FUNCTION_NAMED("Reflection Effect Processing");
-					IPLSimulationOutputs outputs{};
-					iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
-
-					IPLReflectionEffectParams refl_params = outputs.reflections;
-					refl_params.type = static_cast<IPLReflectionEffectType>(ld.listener->get_refl_type());
-					refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
-
-					if (outputs.reflections.irSize > 0) {
-						iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, nullptr);
-
-						IPLAmbisonicsDecodeEffectParams decode_params{};
-						decode_params.order = ld.listener->get_refl_ambisonics_order();
-						decode_params.hrtf = phonon_hrtf;
-						decode_params.orientation = ld.cached_coords;
-						decode_params.binaural = IPL_TRUE;
-
-						iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
-
-						for (int s = 0; s < frame_size; ++s) {
-							ld.push_buffer[s].x += sld->output_buffer.data[0][s];
-							ld.push_buffer[s].y += sld->output_buffer.data[1][s];
-						}
-					}
-				}
-
-				sld->pushed_to_listener_buffer = true;
-			}
-
-			// the push_buffer wasn't ready, but now is. so we go through all playbacks again
-			// and prepare them to receive the push_buffer (and try to push what we can)
-			if (ld.push_buffer_ready) {
-				bool all_playbacks_done_with_pushbuffer = true;
-				for (int i = (int)ld.playbacks.size() -1; i >= 0; --i) {
-					auto& pb = ld.playbacks[i];
-					pb.remaining_from_push_buffer = frame_size;
-					if (pb.playback->can_push_buffer(frame_size)) {
-						pb.playback->push_buffer(ld.push_buffer);
-						pb.remaining_from_push_buffer = 0;
-					}
-					else {
-						int num_to_push = MIN(frame_size, pb.playback->get_frames_available());
-						if (num_to_push > 0) {
-							pb.playback->push_buffer(ld.push_buffer.slice(0, num_to_push));
-							pb.remaining_from_push_buffer -= num_to_push;
-						}
-						all_playbacks_done_with_pushbuffer = false;
-					}
-				}
-
-				// unlikely, but it can happen that we directly pushed the whole buffer to all playbacks
-				if (all_playbacks_done_with_pushbuffer) {
-					ld.push_buffer.fill(Vector2(0,0));
-					ld.push_buffer_ready = false;
 				}
 			}
 		}
 
+		if (ld.pending_contributors <= 0)
+			continue;
+
+		PROFILE_FUNCTION_NAMED("Listener mixing");
+
+		for (auto &sd : sources) {
+			if (!sd.source_node)
+				continue;
+
+			if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+				continue;
+
+			if (sd.mixed_frames_ready < frame_size) {
+				// This source is relevant but not ready — can't complete push_buffer yet.
+				continue;
+			}
+
+			SourceListenerData *sld = nullptr;
+			for (auto &entry : sd.listener_data) {
+				if (entry.listener == ld.listener) {
+					sld = &entry;
+					break;
+				}
+			}
+
+			if (!sld)
+				continue;
+
+			// Already contributed to this generation?
+			if (sld->last_contributed_generation == ld.generation)
+				continue;
+
+			// If out of range, still mark as contributed and decrement counters
+			// so the pipeline doesn't stall, but skip actual audio processing.
+			if (sld->out_of_range) {
+				sld->last_contributed_generation = ld.generation;
+				if (ld.pending_contributors > 0)
+					ld.pending_contributors--;
+				if (sd.pending_consumers > 0)
+					sd.pending_consumers--;
+				continue;
+			}
+
+			// Use pre-mixed source audio frames
+			for (int s = 0; s < frame_size; ++s) {
+				Vector2 f = sd.mixed_frames[s];
+				sld->input_buffer.data[0][s] = (f.x + f.y) * 0.5f;
+			}
+			// Mark this source-listener pair as having contributed
+			sld->last_contributed_generation = ld.generation;
+			if (ld.pending_contributors > 0)
+				ld.pending_contributors--;
+			if (sd.pending_consumers > 0)
+				sd.pending_consumers--;
+
+			// Apply Direct Effects
+			if (sd.source_node->get_direct_enabled() && sld->source && sld->direct_effect) {
+				PROFILE_FUNCTION_NAMED("direct effect processing")
+				IPLSimulationOutputs outputs{};
+				iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+
+				IPLDirectEffectParams direct_params = outputs.direct;
+				direct_params.flags = static_cast<IPLDirectEffectFlags>(0);
+
+				if (sd.source_node->get_occlusion_enabled()) {
+					direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
+				}
+
+				if (sd.source_node->get_transmission_enabled()) {
+					direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+					direct_params.transmissionType = static_cast<IPLTransmissionType>(sd.source_node->get_transmission_type());
+					direct_params.transmission[0] = sd.source_node->get_transmission_low();
+					direct_params.transmission[1] = sd.source_node->get_transmission_med();
+					direct_params.transmission[2] = sd.source_node->get_transmission_high();
+				}
+
+				if (sd.source_node->get_air_absorption_enabled()) {
+					direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
+					direct_params.airAbsorption[0] = sd.source_node->get_air_absorption_low();
+					direct_params.airAbsorption[1] = sd.source_node->get_air_absorption_med();
+					direct_params.airAbsorption[2] = sd.source_node->get_air_absorption_high();
+				}
+
+				if (sd.source_node->get_distance_attenuation_enabled()) {
+					direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
+
+					float dist = sld->dist_to_listener;
+					float min_dist = sd.source_node->get_distance_attenuation_min();
+					float max_dist = sd.source_node->get_distance_attenuation_max();
+
+					float attenuation = 1.0f - CLAMP(Math::inverse_lerp(min_dist, max_dist, dist), 0.0f, 1.0f);
+					direct_params.distanceAttenuation = attenuation * attenuation;
+				} else {
+					direct_params.distanceAttenuation = 1.0f;
+				}
+
+				iplDirectEffectApply(sld->direct_effect, &direct_params, &sld->input_buffer, &sld->input_buffer);
+
+				// Apply Binaural Spatialization for direct audio
+				if (sd.source_node->get_binaural_enabled()) {
+					IPLBinauralEffectParams params{};
+
+					params.direction = iplCalculateRelativeDirection(phonon_context,
+							sd.cached_coords.origin,
+							ld.cached_coords.origin,
+							ld.cached_coords.ahead,
+							ld.cached_coords.up);
+					params.interpolation = static_cast<IPLHRTFInterpolation>(sd.source_node->get_binaural_interpolation());
+					params.spatialBlend = sd.source_node->get_binaural_spatial_blend();
+					params.hrtf = phonon_hrtf;
+
+					if (phonon_hrtf) {
+						iplBinauralEffectApply(sld->binaural_effect, &params, &sld->input_buffer, &sld->output_buffer);
+					} else {
+						for (int s = 0; s < frame_size; ++s) {
+							sld->output_buffer.data[0][s] = sld->input_buffer.data[0][s];
+							sld->output_buffer.data[1][s] = sld->input_buffer.data[0][s];
+						}
+					}
+
+					for (int s = 0; s < frame_size; ++s) {
+						ld.push_buffer[s].x += sld->output_buffer.data[0][s];
+						ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+					}
+				} else {
+					for (int s = 0; s < frame_size; ++s) {
+						ld.push_buffer[s].x += sld->input_buffer.data[0][s];
+						ld.push_buffer[s].y += sld->input_buffer.data[0][s];
+					}
+				}
+			}
+
+			// Apply Reflections
+			if (sd.source_node->get_reflection_enabled() && sld->source && sld->reflection_effect && sld->ambisonics_decode_effect) {
+				PROFILE_FUNCTION_NAMED("Reflection Effect Processing");
+				IPLSimulationOutputs outputs{};
+				iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+
+				IPLReflectionEffectParams refl_params = outputs.reflections;
+				refl_params.type = static_cast<IPLReflectionEffectType>(ld.listener->get_refl_type());
+				refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
+
+				if (outputs.reflections.irSize > 0) {
+					iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, nullptr);
+
+					IPLAmbisonicsDecodeEffectParams decode_params{};
+					decode_params.order = ld.listener->get_refl_ambisonics_order();
+					decode_params.hrtf = phonon_hrtf;
+					decode_params.orientation = ld.cached_coords;
+					decode_params.binaural = IPL_TRUE;
+
+					iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
+
+					for (int s = 0; s < frame_size; ++s) {
+						ld.push_buffer[s].x += sld->output_buffer.data[0][s];
+						ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+					}
+				}
+			}
+		}
+
+		// All contributors done — push_buffer is ready, start draining to playbacks
+		if (ld.pending_contributors <= 0) {
+			ld.pending_contributors = 0;
+			std::lock_guard pb_lock(*ld.playbacks_mutex);
+
+			// Clean up finished playbacks
+			for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
+				if (!ld.playbacks[i].playback->is_playing()) {
+					ld.playbacks.remove_at(i);
+				}
+			}
+
+			ld.pending_drains = 0;
+			for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
+				auto &pb = ld.playbacks[i];
+				pb.remaining_from_push_buffer = frame_size;
+				ld.pending_drains++;
+				if (pb.playback->can_push_buffer(frame_size)) {
+					pb.playback->push_buffer(ld.push_buffer);
+					pb.remaining_from_push_buffer = 0;
+					ld.pending_drains--;
+				} else {
+					int num_to_push = MIN(frame_size, pb.playback->get_frames_available());
+					if (num_to_push > 0) {
+						pb.playback->push_buffer(ld.push_buffer.slice(0, num_to_push));
+						pb.remaining_from_push_buffer -= num_to_push;
+					}
+				}
+			}
+
+			// All playbacks consumed immediately — clear and prepare next round
+			if (ld.pending_drains <= 0) {
+				ld.pending_drains = 0;
+				ld.push_buffer.fill(Vector2(0, 0));
+				ld.generation++;
+
+				ld.pending_contributors = 0;
+				for (auto &sd : sources) {
+					if (!sd.source_node)
+						continue;
+					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+						continue;
+					for (auto &sld : sd.listener_data) {
+						if (sld.listener == ld.listener && !sld.out_of_range) {
+							ld.pending_contributors++;
+							break;
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -910,6 +990,21 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 		iplSimulatorCommit(ld.simulator);
 	}
 
+	// Initialize pending_contributors so Phase 2 can start immediately
+	ld.pending_contributors = 0;
+	for (auto &sd : sources) {
+		if (!sd.source_node)
+			continue;
+		if ((sd.source_node->get_layers() & listener->get_mask()) == 0)
+			continue;
+		for (auto &sld : sd.listener_data) {
+			if (sld.listener == listener && !sld.out_of_range) {
+				ld.pending_contributors++;
+				break;
+			}
+		}
+	}
+
 	listeners.push_back(std::move(ld));
 }
 
@@ -931,11 +1026,48 @@ void SteamAudioServer::remove_listener(SteamAudioListener *listener) {
 	PROFILE_FUNCTION();
 	std::unique_lock lock(collections_mutex);
 
+	// Find the ListenerData for counter adjustments
+	ListenerData *removing_ld = nullptr;
+	for (auto &ld : listeners) {
+		if (ld.listener == listener) {
+			removing_ld = &ld;
+			break;
+		}
+	}
+
 	// Clean up per-listener state in all sources
 	for (auto &sd : sources) {
 		for (uint32_t i = 0; i < sd.listener_data.size(); ++i) {
 			if (sd.listener_data[i].listener == listener) {
 				SourceListenerData &sld = sd.listener_data[i];
+
+				// If this SLD had not yet contributed to the listener's current
+				// generation and was counted as a pending_contributor, adjust.
+				if (removing_ld && !sld.out_of_range &&
+						(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
+						sld.last_contributed_generation != removing_ld->generation &&
+						removing_ld->pending_contributors > 0) {
+					removing_ld->pending_contributors--;
+				}
+
+				// If this SLD was counted as a pending_consumer (it contributed
+				// to the listener but the source hasn't been reset yet), adjust.
+				if (removing_ld && !sld.out_of_range &&
+						(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
+						sld.last_contributed_generation == removing_ld->generation &&
+						sd.pending_consumers > 0) {
+					// This listener already consumed the source mix for this generation,
+					// so pending_consumers was already decremented during contribution.
+					// No adjustment needed here.
+				} else if (sd.mixed_frames_ready >= cached_audio_settings.frameSize &&
+						!sld.out_of_range &&
+						(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
+						sd.pending_consumers > 0) {
+					// The source mix is ready and this listener was counted but
+					// hasn't consumed yet — decrement.
+					sd.pending_consumers--;
+				}
+
 				// Remove source from simulator before releasing
 				for (auto &ld_entry : listeners) {
 					if (ld_entry.listener == listener && ld_entry.simulator && sld.source) {
@@ -1064,6 +1196,17 @@ void SteamAudioServer::remove_source(SteamAudioSource *source_node) {
 		if (sources[i].source_node == source_node) {
 			SourceData &sd = sources[i];
 			for (auto &sld : sd.listener_data) {
+				// Adjust listener pending_contributors if this source was counted
+				// but hasn't contributed yet to the current generation.
+				for (auto &ld : listeners) {
+					if (sld.listener == ld.listener && !sld.out_of_range &&
+							(sd.source_node->get_layers() & ld.listener->get_mask()) != 0 &&
+							sld.last_contributed_generation != ld.generation &&
+							ld.pending_contributors > 0) {
+						ld.pending_contributors--;
+					}
+				}
+
 				// Remove source from its simulator
 				for (auto &ld : listeners) {
 					if (ld.simulator && sld.source && sld.listener == ld.listener) {

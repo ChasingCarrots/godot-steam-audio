@@ -37,7 +37,20 @@ struct ListenerData {
 	// audio data from all relevant sources. When all relevant sources have
 	// filled it, it will be pushed to the listener's playbacks, ready for a new round.
 	godot::PackedVector2Array push_buffer;
-	bool push_buffer_ready = false;
+
+	// Counter-based flow control:
+	// pending_contributors: number of relevant sources that still need to contribute
+	// to the push_buffer. Set when push_buffer is cleared, decremented as sources contribute.
+	// When it reaches 0, the push_buffer is ready to be pushed to playbacks.
+	int pending_contributors = 0;
+	// pending_drains: number of playbacks that still need to fully consume the push_buffer.
+	// Set when push_buffer becomes ready, decremented as playbacks finish draining.
+	// When it reaches 0, the push_buffer can be cleared and reused.
+	int pending_drains = 0;
+	// Generation counter: incremented each time the push_buffer is cleared and
+	// pending_contributors is recomputed. Used with SourceListenerData::last_contributed_generation
+	// to track which sources have already contributed without needing reset loops.
+	uint32_t generation = 1;
 
 	// Multiple playbacks per listener, protected by playbacks_mutex
 	godot::LocalVector<ListenerPlaybackEntry> playbacks;
@@ -54,8 +67,9 @@ struct SourceListenerData {
 	float dist_to_listener = 0.0f;
 	float doppler_pitch = 1.0f;
 	bool out_of_range = false;
-	bool consumed_source_mix = true;
-	bool pushed_to_listener_buffer = false;
+	// Generation of the listener's push_buffer that this SLD last contributed to.
+	// Compared against ListenerData::generation to determine if contribution is needed.
+	uint32_t last_contributed_generation = 0;
 	IPLSource source = nullptr;
 	IPLBinauralEffect binaural_effect = nullptr;
 	IPLDirectEffect direct_effect = nullptr;
@@ -83,6 +97,10 @@ struct SourceData {
 	// Pre-mixed audio frames from source playbacks.
 	godot::PackedVector2Array mixed_frames;
 	int mixed_frames_ready = 0;
+	// Number of listeners that still need to consume the current mix.
+	// Set when mixed_frames_ready == frame_size, decremented as listeners consume.
+	// When it reaches 0, the source can reset and start a new mix.
+	int pending_consumers = 0;
 
 	// AudioEffectInstances created from the source's effect stack
 	godot::LocalVector<godot::Ref<godot::AudioEffectInstance>> effect_instances;
