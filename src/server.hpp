@@ -18,6 +18,9 @@
 #include <shared_mutex>
 #include <vector>
 
+namespace godot {
+class AudioStream;
+}
 class SteamAudioListener;
 class SteamAudioSource;
 
@@ -54,8 +57,17 @@ struct SourceListenerData {
 	IPLAudioBuffer ambisonics_buffer{};
 };
 
+struct SourcePlaybackEntry {
+	godot::Ref<godot::AudioStreamPlayback> playback;
+	int num_mixed_too_much_last_round = 0;
+	float volume_linear = 1.0f;
+	float pitch_scale = 1.0f;
+};
+
 struct SourceData {
 	SteamAudioSource *source_node = nullptr;
+
+	godot::LocalVector<SourcePlaybackEntry> playbacks;
 
 	godot::LocalVector<SourceListenerData> listener_data;
 
@@ -150,11 +162,16 @@ public:
 	void tick(float delta);
 
 	// Listener management
-	void add_listener(SteamAudioListener *listener, godot::Ref<godot::AudioStreamGeneratorPlayback> playback);
+	void add_listener(SteamAudioListener *listener);
+	void add_playback_to_listener(SteamAudioListener *listener, godot::Ref<godot::AudioStreamGeneratorPlayback> playback);
 	void remove_listener(SteamAudioListener *listener);
 
 	// Source management (for SteamAudioSource nodes)
 	void add_source(SteamAudioSource *source_node);
+	void add_playback_to_source(const SteamAudioSource *source_node, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_volume_db, float p_pitch_scale);
+	void set_source_playback_volume(const SteamAudioSource * source_node, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_volume_db);
+	void set_source_playback_pitch(const SteamAudioSource * source_node, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_pitch_scale);
+	int source_get_num_active_playbacks(const SteamAudioSource * source_node);
 	void remove_source(SteamAudioSource *source_node);
 
 	void add_static_geometry(godot::Node *p_node, godot::Ref<SteamAudioMaterial> p_material);

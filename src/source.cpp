@@ -152,17 +152,8 @@ void SteamAudioSource::_notification(int p_what) {
 		case NOTIFICATION_PROCESS: {
 			if (!dynamic_registration || !is_registered)
 				break;
-			bool has_active = false;
-			{
-				std::shared_lock lock(playbacks_mutex);
-				for (uint32_t i = 0; i < playbacks.size(); i++) {
-					if (playbacks[i].playback->is_playing()) {
-						has_active = true;
-						break;
-					}
-				}
-			}
-			if (!has_active) {
+			int num_active_playbacks = SteamAudioServer::get_singleton()->source_get_num_active_playbacks(this);
+			if (num_active_playbacks == 0) {
 				SteamAudioServer::get_singleton()->remove_source(this);
 				is_registered = false;
 				emit_signal("removed_from_simulation");
@@ -176,46 +167,27 @@ void SteamAudioSource::set_stream_volume(Ref<AudioStreamPlayback> p_playback, fl
 	if (p_playback.is_null())
 		return;
 
-	std::shared_lock lock(playbacks_mutex);
-	for (auto &entry : playbacks) {
-		if (entry.playback == p_playback) {
-			entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
-			return;
-		}
-	}
+	SteamAudioServer::get_singleton()->set_source_playback_volume(this, p_playback, p_volume_db);
 }
 
 void SteamAudioSource::set_stream_pitch(Ref<AudioStreamPlayback> p_playback, float p_pitch_scale) {
 	if (p_playback.is_null())
 		return;
 
-	std::shared_lock lock(playbacks_mutex);
-	for (auto &entry : playbacks) {
-		if (entry.playback == p_playback) {
-			entry.pitch_scale = p_pitch_scale;
-			return;
-		}
-	}
+	SteamAudioServer::get_singleton()->set_source_playback_pitch(this, p_playback, p_pitch_scale);
 }
 
 Ref<AudioStreamPlayback> SteamAudioSource::play_stream(Ref<AudioStream> p_stream, float p_volume_db, float p_pitch_scale) {
 	if (p_stream.is_null())
 		return Ref<AudioStreamPlayback>();
 
-	UtilityFunctions::print("play_stream pitch: ", p_pitch_scale);
 	Ref<AudioStreamPlayback> playback = p_stream->instantiate_playback();
 	if (playback.is_valid()) {
 		if (dynamic_registration && !is_registered) {
 			SteamAudioServer::get_singleton()->add_source(this);
 			is_registered = true;
 		}
-		PlaybackEntry entry;
-		entry.playback = playback;
-		entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
-		entry.pitch_scale = p_pitch_scale;
-		playback->start();
-		std::lock_guard lock(playbacks_mutex);
-		playbacks.push_back(entry);
+		SteamAudioServer::get_singleton()->add_playback_to_source(this, playback, p_volume_db, p_pitch_scale);
 	}
 	return playback;
 }

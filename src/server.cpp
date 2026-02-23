@@ -556,28 +556,23 @@ void SteamAudioServer::process_audio() {
 		if (sd.mixed_frames_ready >= frame_size)
 			continue;
 
-		auto &source_playbacks = sd.source_node->get_playbacks();
 		{
 			// Clean up finished playbacks
-			std::lock_guard pb_lock(sd.source_node->get_playbacks_mutex());
-			for (int i = 0; i < (int)source_playbacks.size(); ++i) {
-				if (!source_playbacks[i].playback->is_playing()) {
-					UtilityFunctions::print("removing playback");
-					source_playbacks.remove_at(i);
-					i--;
+			for (int i = (int)sd.playbacks.size() -1; i >= 0; --i) {
+				if (!sd.playbacks[i].playback->is_playing()) {
+					sd.playbacks.remove_at(i);
 				}
 			}
 		}
-		if (source_playbacks.is_empty())
+		if (sd.playbacks.is_empty())
 			continue;
 		int num_already_ready_before = sd.mixed_frames_ready;
 		if (num_already_ready_before > 0)
 			UtilityFunctions::print("we had leftover frames mixed from last round ", num_already_ready_before);
 		{
-			std::shared_lock pb_lock(sd.source_node->get_playbacks_mutex());
 			int pull_num_frames = frame_size - sd.mixed_frames_ready;
 			int min_frames_ready = frame_size;
-			for (auto &pb : source_playbacks) {
+			for (auto &pb : sd.playbacks) {
 				total_num_playbacks += 1;
 				if (pb.num_mixed_too_much_last_round >= pull_num_frames)
 					continue;
@@ -600,10 +595,14 @@ void SteamAudioServer::process_audio() {
 				pb.num_mixed_too_much_last_round = mixed_index;
 			}
 			sd.mixed_frames_ready = min_frames_ready;
-			for (auto &pb : source_playbacks) {
+			for (auto &pb : sd.playbacks) {
 				pb.num_mixed_too_much_last_round -= min_frames_ready;
 				if (pb.num_mixed_too_much_last_round > 0) {
 					UtilityFunctions::print("num mixed too much: ", pb.num_mixed_too_much_last_round);
+				}
+				else if (pb.num_mixed_too_much_last_round < 0) {
+					UtilityFunctions::print("num_mixed_too_much was < 0! value: ", pb.num_mixed_too_much_last_round);
+					pb.num_mixed_too_much_last_round = 0;
 				}
 			}
 		}
@@ -810,26 +809,14 @@ void SteamAudioServer::process_audio() {
 	}
 }
 
-void SteamAudioServer::add_listener(SteamAudioListener *listener, Ref<AudioStreamGeneratorPlayback> playback) {
+void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 	PROFILE_FUNCTION();
-	{
-		// we only need a shared lock for the adding of playbacks to the listener
-		std::shared_lock lock(collections_mutex);
-		for (auto &ld : listeners) {
-			if (ld.listener == listener) {
-				std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
-				ld.playbacks.push_back(playback);
-				return;
-			}
-		}
-	}
 
 	// but a unique lock for adding listeners to the list of listeners
 	std::unique_lock lock(collections_mutex);
 	ListenerData ld;
 	ld.listener = listener;
 	ld.dirty = true;
-	ld.playbacks.push_back(playback);
 
 	ld.mix_buffer.resize(cached_audio_settings.frameSize);
 	ld.push_buffer.resize(cached_audio_settings.frameSize);
@@ -863,6 +850,18 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener, Ref<AudioStrea
 	}
 
 	listeners.push_back(std::move(ld));
+}
+
+void SteamAudioServer::add_playback_to_listener(SteamAudioListener *listener, godot::Ref<godot::AudioStreamGeneratorPlayback> playback) {
+	// we only need a shared lock for the adding of playbacks to the listener
+	std::shared_lock lock(collections_mutex);
+	for (auto &ld : listeners) {
+		if (ld.listener == listener) {
+			std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
+			ld.playbacks.push_back(playback);
+			return;
+		}
+	}
 }
 
 void SteamAudioServer::remove_listener(SteamAudioListener *listener) {
@@ -933,6 +932,65 @@ void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 	}
 
 	sources.push_back(sd);
+}
+
+void SteamAudioServer::add_playback_to_source(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> playback, float p_volume_db, float p_pitch_scale) {
+	if (playback.is_null())
+		return;
+
+	std::unique_lock lock(collections_mutex);
+	for (auto &sd : sources) {
+		if (sd.source_node == source_node) {
+			SourcePlaybackEntry entry;
+			entry.playback = playback;
+			entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
+			entry.pitch_scale = p_pitch_scale;
+			playback->start();
+			sd.playbacks.push_back(entry);
+			return;
+		}
+	}
+}
+
+void SteamAudioServer::set_source_playback_volume(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> p_playback, float p_volume_db) {
+	std::shared_lock lock(collections_mutex);
+	for (auto &sd : sources) {
+		if (sd.source_node == source_node) {
+			for (auto &entry : sd.playbacks) {
+				if (entry.playback == p_playback) {
+					entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
+					return;
+				}
+			}
+			// playback not found!
+			return;
+		}
+	}
+}
+
+void SteamAudioServer::set_source_playback_pitch(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> p_playback, float p_pitch_scale) {
+	std::shared_lock lock(collections_mutex);
+	for (auto &sd : sources) {
+		if (sd.source_node == source_node) {
+			for (auto &entry : sd.playbacks) {
+				if (entry.playback == p_playback) {
+					entry.pitch_scale = p_pitch_scale;
+					return;
+				}
+			}
+			// playback not found!
+			return;
+		}
+	}
+}
+
+int SteamAudioServer::source_get_num_active_playbacks(const SteamAudioSource *source_node) {
+	std::shared_lock lock(collections_mutex);
+	for (auto &sd : sources) {
+		if (sd.source_node == source_node)
+			return sd.playbacks.size();
+	}
+	return 0;
 }
 
 void SteamAudioServer::remove_source(SteamAudioSource *source_node) {

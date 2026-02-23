@@ -56,6 +56,8 @@ void SteamAudioListener::ready_internal() {
 	auto sas = SteamAudioServer::get_singleton();
 	float frame_size_seconds = (float)sas->get_frame_size() / (float)sas->get_sampling_rate();
 	generator->set_buffer_length(MAX(buffer_length, frame_size_seconds * 1.25f));
+
+	sas->add_listener(this);
 }
 
 void SteamAudioListener::_notification(int p_what) {
@@ -102,7 +104,7 @@ Ref<AudioStreamGeneratorPlayback> SteamAudioListener::play_on_audiostreamplayer(
 		playback = audiostreamplayer.call("play_stream", generator);
 	}
 	if (playback.is_valid()) {
-		SteamAudioServer::get_singleton()->add_listener(this, playback);
+		SteamAudioServer::get_singleton()->add_playback_to_listener(this, playback);
 	}
 	else {
 		ERR_PRINT("SteamAudioListener: play_on_audiostreamplayer failed.");
