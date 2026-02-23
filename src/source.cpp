@@ -154,7 +154,7 @@ void SteamAudioSource::_notification(int p_what) {
 				break;
 			bool has_active = false;
 			{
-				std::lock_guard<std::mutex> lock(playbacks_mutex);
+				std::shared_lock lock(playbacks_mutex);
 				for (uint32_t i = 0; i < playbacks.size(); i++) {
 					if (playbacks[i].playback->is_playing()) {
 						has_active = true;
@@ -176,7 +176,7 @@ void SteamAudioSource::set_stream_volume(Ref<AudioStreamPlayback> p_playback, fl
 	if (p_playback.is_null())
 		return;
 
-	std::lock_guard<std::mutex> lock(playbacks_mutex);
+	std::shared_lock lock(playbacks_mutex);
 	for (auto &entry : playbacks) {
 		if (entry.playback == p_playback) {
 			entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
@@ -189,7 +189,7 @@ void SteamAudioSource::set_stream_pitch(Ref<AudioStreamPlayback> p_playback, flo
 	if (p_playback.is_null())
 		return;
 
-	std::lock_guard<std::mutex> lock(playbacks_mutex);
+	std::shared_lock lock(playbacks_mutex);
 	for (auto &entry : playbacks) {
 		if (entry.playback == p_playback) {
 			entry.pitch_scale = p_pitch_scale;
@@ -202,19 +202,20 @@ Ref<AudioStreamPlayback> SteamAudioSource::play_stream(Ref<AudioStream> p_stream
 	if (p_stream.is_null())
 		return Ref<AudioStreamPlayback>();
 
+	UtilityFunctions::print("play_stream pitch: ", p_pitch_scale);
 	Ref<AudioStreamPlayback> playback = p_stream->instantiate_playback();
 	if (playback.is_valid()) {
 		if (dynamic_registration && !is_registered) {
 			SteamAudioServer::get_singleton()->add_source(this);
 			is_registered = true;
 		}
-		std::lock_guard<std::mutex> lock(playbacks_mutex);
 		PlaybackEntry entry;
 		entry.playback = playback;
 		entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
 		entry.pitch_scale = p_pitch_scale;
-		playbacks.push_back(entry);
 		playback->start();
+		std::lock_guard lock(playbacks_mutex);
+		playbacks.push_back(entry);
 	}
 	return playback;
 }

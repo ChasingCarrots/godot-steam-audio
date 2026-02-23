@@ -10,7 +10,6 @@
 #include "godot_cpp/templates/local_vector.hpp"
 #include "godot_cpp/variant/packed_vector2_array.hpp"
 #include "material.hpp"
-#include "steam_audio.hpp"
 #include <phonon.h>
 #include <atomic>
 #include <condition_variable>
@@ -60,9 +59,9 @@ struct SourceData {
 
 	godot::LocalVector<SourceListenerData> listener_data;
 
-	// Pre-mixed audio frames from source playbacks. Populated once and kept
-	// until at least one listener consumes them.
-	godot::LocalVector<godot::AudioFrame> mixed_frames;
+	// Pre-mixed audio frames from source playbacks.
+	godot::PackedVector2Array mixed_frames;
+	int mixed_frames_ready = 0;
 	bool mixed_frames_consumed = false;
 
 	// AudioEffectInstances created from the source's effect stack
@@ -116,7 +115,6 @@ private:
 	godot::LocalVector<SourceData> sources;
 	godot::LocalVector<DynamicGeometryData> dynamic_geometry;
 	godot::LocalVector<StaticGeometryData> static_geometry;
-	godot::LocalVector<godot::AudioFrame> temp_buffer;
 
 	// Protects listeners, sources, dynamic_geometry, static_geometry
 	std::shared_mutex collections_mutex;
@@ -166,6 +164,9 @@ public:
 
 	// Audio pulling and effect application
 	void process_audio();
+
+	int get_frame_size() const { return cached_audio_settings.frameSize; }
+	int get_sampling_rate() const { return cached_audio_settings.samplingRate; }
 };
 
 #endif // STEAM_AUDIO_SERVER_H

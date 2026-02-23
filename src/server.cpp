@@ -155,14 +155,20 @@ void SteamAudioServer::init() {
 	}
 
 	IPLSceneSettings scene_cfg{};
+	scene_cfg.radeonRaysDevice = nullptr;
 	scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+	if (scene_cfg.type == IPL_SCENETYPE_EMBREE) {
+		IPLEmbreeDeviceSettings embree_cfg{};
+		IPLEmbreeDevice embree_dev;
+		iplEmbreeDeviceCreate(phonon_context, &embree_cfg, &embree_dev);
+		scene_cfg.embreeDevice = embree_dev;
+	}
 	if (!handleErr(iplSceneCreate(phonon_context, &scene_cfg, &phonon_scene), "SteamAudio: Failed to create scene")) {
 		phonon_scene = nullptr;
 	}
 
 	// Cache audio settings once
 	cached_audio_settings = get_audio_settings();
-	temp_buffer.resize(cached_audio_settings.frameSize);
 
 	IPLHRTFSettings hrtf_cfg{};
 	hrtf_cfg.type = IPL_HRTFTYPE_DEFAULT;
@@ -251,6 +257,7 @@ void SteamAudioServer::tick(float delta) {
 
 	std::shared_lock lock(collections_mutex);
 
+	PROFILING_PLOT_NUMBER("NumSteamDynamicGeometries", (int64_t)dynamic_geometry.size());
 	// Update Dynamic Geometry (only mark dirty if transform changed)
 	for (auto &dg : dynamic_geometry) {
 		if (!dg.node || !dg.instanced_mesh)
@@ -264,6 +271,9 @@ void SteamAudioServer::tick(float delta) {
 		}
 	}
 
+	PROFILING_PLOT_NUMBER("NumSteamListeners", (int64_t)listeners.size());
+	int total_number_of_active_sources = 0;
+	int total_reflection_sources = 0;
 	for (auto &ld : listeners) {
 		if (!ld.listener)
 			continue;
@@ -297,7 +307,7 @@ void SteamAudioServer::tick(float delta) {
 			if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
 				continue;
 
-			// Find or create the SourceListenerData for this listener
+			// Find the SourceListenerData for this listener/source pair
 			SourceListenerData *sld = nullptr;
 			for (auto &entry : sd.listener_data) {
 				if (entry.listener == ld.listener) {
@@ -375,6 +385,7 @@ void SteamAudioServer::tick(float delta) {
 				sd.last_trf = src_trf;
 				continue;
 			}
+			total_number_of_active_sources += 1;
 
 			IPLSimulationInputs inputs{};
 			inputs.flags = static_cast<IPLSimulationFlags>(0);
@@ -382,6 +393,7 @@ void SteamAudioServer::tick(float delta) {
 				inputs.flags = static_cast<IPLSimulationFlags>(inputs.flags | IPL_SIMULATIONFLAGS_DIRECT);
 			}
 			if (sd.source_node->get_reflection_enabled()) {
+				total_reflection_sources += 1;
 				inputs.flags = static_cast<IPLSimulationFlags>(inputs.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
 			}
 
@@ -454,6 +466,8 @@ void SteamAudioServer::tick(float delta) {
 		std::unique_lock<std::mutex> lock_refl(refl_mux);
 		refl_cv.notify_one();
 	}
+	PROFILING_PLOT_NUMBER("NumActiveSteamAudioSources", (int64_t)total_number_of_active_sources);
+	PROFILING_PLOT_NUMBER("NumActiveSteamAudioReflectionSources", (int64_t)total_reflection_sources);
 }
 
 void SteamAudioServer::simulation_thread_func() {
@@ -491,9 +505,26 @@ void SteamAudioServer::simulation_thread_func() {
 }
 
 void SteamAudioServer::mixing_thread_func() {
+	using clock = std::chrono::steady_clock;
+	auto wait_time = std::chrono::milliseconds(
+		5
+	);
+	auto spin_threshold = std::chrono::milliseconds(1);
 	while (is_running.load()) {
+		auto start = clock::now();
 		process_audio();
-		OS::get_singleton()->delay_msec(1);
+
+		// hybrid spin sleep (try to reduce CPU usage while still being responsive)
+		auto target = start + wait_time;
+		while (clock::now() < target) {
+			if (clock::now() + spin_threshold < target) {
+				std::this_thread::sleep_for(std::chrono::microseconds(100));
+			} else {
+				while (clock::now() < target) {
+					std::this_thread::yield();
+				}
+			}
+		}
 	}
 }
 
@@ -507,83 +538,118 @@ void SteamAudioServer::process_audio() {
 	// rather than once per listener (mix_audio consumes the buffer).
 	// If mixed_frames is still populated from a previous call (no listener
 	// consumed it yet), skip fetching to avoid losing audio data.
+	int total_num_playbacks = 0;
 	for (auto &sd : sources) {
 		if (!sd.source_node)
 			continue;
+		PROFILE_FUNCTION_NAMED("Source Pre-mixing");
 
 		if (sd.mixed_frames_consumed) {
-			sd.mixed_frames.clear();
+			for (int s = 0; s < frame_size; ++s) {
+					sd.mixed_frames[s] = {};
+			}
+			sd.mixed_frames_ready = 0;
 			sd.mixed_frames_consumed = false;
 		}
 
-		// Still have unconsumed frames from a previous call, don't fetch more
-		if (sd.mixed_frames.size() > 0)
+		// Does the mixed_frames buffer have space?
+		if (sd.mixed_frames_ready >= frame_size)
 			continue;
 
-		std::lock_guard pb_lock(sd.source_node->get_playbacks_mutex());
-		auto &playbacks = sd.source_node->get_playbacks();
+		auto &source_playbacks = sd.source_node->get_playbacks();
+		{
+			// Clean up finished playbacks
+			std::lock_guard pb_lock(sd.source_node->get_playbacks_mutex());
+			for (int i = 0; i < (int)source_playbacks.size(); ++i) {
+				if (!source_playbacks[i].playback->is_playing()) {
+					UtilityFunctions::print("removing playback");
+					source_playbacks.remove_at(i);
+					i--;
+				}
+			}
+		}
+		if (source_playbacks.is_empty())
+			continue;
+		int num_already_ready_before = sd.mixed_frames_ready;
+		if (num_already_ready_before > 0)
+			UtilityFunctions::print("we had leftover frames mixed from last round ", num_already_ready_before);
+		{
+			std::shared_lock pb_lock(sd.source_node->get_playbacks_mutex());
+			int pull_num_frames = frame_size - sd.mixed_frames_ready;
+			int min_frames_ready = frame_size;
+			for (auto &pb : source_playbacks) {
+				total_num_playbacks += 1;
+				if (pb.num_mixed_too_much_last_round >= pull_num_frames)
+					continue;
+				int to_pull = pull_num_frames - pb.num_mixed_too_much_last_round;
+				const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, to_pull);
+				int pulled = MIN((int)frames.size(), to_pull);
+				if (pulled != to_pull) {
+					UtilityFunctions::print("playback should have pulled ", to_pull, " but got ", pulled);
+				}
 
-		// Clean up finished playbacks
-		for (int i = 0; i < (int)playbacks.size(); ++i) {
-			if (!playbacks[i].playback->is_playing()) {
-				playbacks.remove_at(i);
-				i--;
+				int mixed_index = sd.mixed_frames_ready + pb.num_mixed_too_much_last_round;
+				for (int frames_index = 0; frames_index < pulled; ++frames_index) {
+					sd.mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear;
+					++mixed_index;
+				}
+				min_frames_ready = MIN(min_frames_ready, mixed_index);
+				// we save the number of our frames in the mixed_frames array
+				// temporarily in the pb.num_mixed_too_much_last_round (the real
+				// number will then be calculated in a second for loop!)
+				pb.num_mixed_too_much_last_round = mixed_index;
+			}
+			sd.mixed_frames_ready = min_frames_ready;
+			for (auto &pb : source_playbacks) {
+				pb.num_mixed_too_much_last_round -= min_frames_ready;
+				if (pb.num_mixed_too_much_last_round > 0) {
+					UtilityFunctions::print("num mixed too much: ", pb.num_mixed_too_much_last_round);
+				}
 			}
 		}
 
-		if (playbacks.size() == 0)
-			continue;
-
-		sd.mixed_frames.resize(frame_size);
-		for (int s = 0; s < frame_size; ++s)
-			sd.mixed_frames[s] = {};
-
-		for (auto &pb : playbacks) {
-			const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, frame_size);
-			int pulled = MIN((int)frames.size(), frame_size);
-
-			for (int s = 0; s < pulled; ++s) {
-				sd.mixed_frames[s].left += frames[s].x * pb.volume_linear;
-				sd.mixed_frames[s].right += frames[s].y * pb.volume_linear;
+		if (!sd.effect_instances.is_empty()) {
+			PROFILE_FUNCTION_NAMED("Effect Stack Processing");
+			// Apply effect stack in-place on mixed frames
+			int num_newly_ready = sd.mixed_frames_ready - num_already_ready_before;
+			if (num_newly_ready > 0) {
+				PackedVector2Array new_frames(sd.mixed_frames.slice(num_already_ready_before, sd.mixed_frames_ready));
+				for (auto &inst : sd.effect_instances) {
+					new_frames = inst->process_audio(
+							new_frames,
+							frame_size);
+				}
+				int new_index = 0;
+				for (int mixed_index = num_already_ready_before; mixed_index < sd.mixed_frames_ready; ++mixed_index) {
+					sd.mixed_frames[mixed_index] = new_frames[new_index];
+					new_index++;
+				}
 			}
-		}
-
-		// Apply effect stack in-place on mixed frames
-		for (auto &inst : sd.effect_instances) {
-			inst->_process(
-					sd.mixed_frames.ptr(),
-					temp_buffer.ptr(),
-					frame_size);
-			SWAP(sd.mixed_frames, temp_buffer);
 		}
 	}
+	PROFILING_PLOT_NUMBER("NumActiveSteamAudioPlaybacks", (int64_t)total_num_playbacks);
 
 	for (auto &ld : listeners) {
 		if (!ld.listener)
 			continue;
 
+		PROFILE_FUNCTION_NAMED("Listener mixing");
 		// Lock playbacks and check if there are any active ones
 		std::lock_guard pb_lock(*ld.playbacks_mutex);
 
-		// Remove playbacks that are no longer playing
+		// Remove playbacks that are no longer playing and check if we
+		// can even push to any of the listeners AudioStreamGenerators
+		bool can_push_to_any_playback = false;
 		for (int i = (int)ld.playbacks.size() -1; i >= 0; --i) {
 			if (!ld.playbacks[i]->is_playing()) {
 				ld.playbacks.remove_at(i);
 			}
-		}
-
-		if (ld.playbacks.is_empty())
-			continue;
-
-		// Check if all playbacks can accept frames
-		bool all_ready = true;
-		for (auto &playback : ld.playbacks) {
-			if (playback->get_frames_available() < frame_size) {
-				all_ready = false;
-				break;
+			else if (ld.playbacks[i]->can_push_buffer(frame_size)) {
+				can_push_to_any_playback = true;
 			}
 		}
-		if (!all_ready)
+
+		if (!can_push_to_any_playback)
 			continue;
 
 		// Clear listener mix buffer
@@ -594,6 +660,9 @@ void SteamAudioServer::process_audio() {
 
 		for (auto &sd : sources) {
 			if (!sd.source_node)
+				continue;
+
+			if (sd.mixed_frames_ready < frame_size)
 				continue;
 
 			if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
@@ -607,24 +676,19 @@ void SteamAudioServer::process_audio() {
 				}
 			}
 
- 		if (!sld || !sld->binaural_effect || sld->out_of_range)
+ 			if (!sld || !sld->binaural_effect || sld->out_of_range)
 				continue;
 
 			// Use pre-mixed source audio frames
-			for (int s = 0; s < frame_size; ++s)
-				sld->input_buffer.data[0][s] = 0.0f;
-
-			{
-				int pulled = MIN((int)sd.mixed_frames.size(), frame_size);
-				for (int s = 0; s < pulled; ++s) {
-					AudioFrame af = sd.mixed_frames[s];
-					sld->input_buffer.data[0][s] = (af.left + af.right) * 0.5f;
-				}
-				sd.mixed_frames_consumed = true;
+			for (int s = 0; s < frame_size; ++s) {
+				Vector2 f = sd.mixed_frames[s];
+				sld->input_buffer.data[0][s] = (f.x + f.y) * 0.5f;
 			}
+			sd.mixed_frames_consumed = true;
 
 			// Apply Direct Effects
 			if (sd.source_node->get_direct_enabled() && sld->source && sld->direct_effect) {
+				PROFILE_FUNCTION_NAMED("direct effect processing")
 				IPLSimulationOutputs outputs{};
 				iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 
@@ -701,6 +765,7 @@ void SteamAudioServer::process_audio() {
 
 			// Apply Reflections
 			if (sd.source_node->get_reflection_enabled() && sld->source && sld->reflection_effect && sld->ambisonics_decode_effect) {
+				PROFILE_FUNCTION_NAMED("Reflection Effect Processing");
 				IPLSimulationOutputs outputs{};
 				iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
 
@@ -732,7 +797,15 @@ void SteamAudioServer::process_audio() {
 			ld.push_buffer[i] = Vector2(ld.mix_buffer[i].left, ld.mix_buffer[i].right);
 		}
 		for (auto &playback : ld.playbacks) {
-			playback->push_buffer(ld.push_buffer);
+			if (playback->can_push_buffer(frame_size))
+				playback->push_buffer(ld.push_buffer);
+			else {
+				int num_to_push = MIN(frame_size, playback->get_frames_available());
+				UtilityFunctions::print("couldn't push all to listener buffer, can only push ", num_to_push);
+				if (num_to_push > 0) {
+					playback->push_buffer(ld.push_buffer.slice(0, num_to_push));
+				}
+			}
 		}
 	}
 }
@@ -836,15 +909,15 @@ void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 
 	SourceData sd;
 	sd.source_node = source_node;
+	sd.mixed_frames.resize(cached_audio_settings.frameSize);
+	sd.mixed_frames.fill(Vector2(0,0));
 
 	// Instantiate AudioEffectInstances from the source's effect stack
 	TypedArray<AudioEffect> effects = source_node->get_effect_stack();
 	for (int i = 0; i < effects.size(); ++i) {
 		Ref<AudioEffect> effect = effects[i];
 		if (effect.is_valid()) {
-			// THIS WON'T WORK! because AudioEffect is not exposed completely like that to gdextension.
-			// inst will always be invalid/null...
-			Ref<AudioEffectInstance> inst = effect->_instantiate();
+			Ref<AudioEffectInstance> inst = effect->instantiate();
 			if (inst.is_valid()) {
 				sd.effect_instances.push_back(inst);
 			}

@@ -10,10 +10,11 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/templates/local_vector.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
-#include <mutex>
+#include <shared_mutex>
 
 struct PlaybackEntry {
 	godot::Ref<godot::AudioStreamPlayback> playback;
+	int num_mixed_too_much_last_round = 0;
 	float volume_linear = 1.0f;
 	float pitch_scale = 1.0f;
 };
@@ -23,7 +24,7 @@ class SteamAudioSource : public godot::Node3D {
 
 private:
 	godot::LocalVector<PlaybackEntry> playbacks;
-	std::mutex playbacks_mutex;
+	std::shared_mutex playbacks_mutex;
 
 	bool dynamic_registration = false;
 	bool is_registered = false;
@@ -142,7 +143,7 @@ public:
 	float get_binaural_spatial_blend() const { return binaural_spatial_blend; }
 	void set_binaural_spatial_blend(float p_blend) { binaural_spatial_blend = p_blend; }
 
-	std::mutex &get_playbacks_mutex() { return playbacks_mutex; }
+	std::shared_mutex &get_playbacks_mutex() { return playbacks_mutex; }
 	godot::LocalVector<PlaybackEntry> &get_playbacks() { return playbacks; }
 
 	godot::TypedArray<godot::AudioEffect> get_effect_stack() const { return effect_stack; }

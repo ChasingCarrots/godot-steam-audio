@@ -51,7 +51,11 @@ void SteamAudioListener::_bind_methods() {
 void SteamAudioListener::ready_internal() {
 	generator.instantiate();
 	generator->set_mix_rate(ProjectSettings::get_singleton()->get_setting("audio/driver/mix_rate"));
-	generator->set_buffer_length(buffer_length);
+	// we need at least the frame size of the SteamAudioServer as our buffer length, but
+	// to be on the safe side, we'll reserve more.
+	auto sas = SteamAudioServer::get_singleton();
+	float frame_size_seconds = (float)sas->get_frame_size() / (float)sas->get_sampling_rate();
+	generator->set_buffer_length(MAX(buffer_length, frame_size_seconds * 1.25f));
 }
 
 void SteamAudioListener::_notification(int p_what) {

@@ -23,6 +23,7 @@
 #define PROFILING_START_CAPTURE(NAME) \
     system(vformat("start cmd /c capture.exe -o %s.tracy -f -s 5", NAME).ascii()); \
     print_line("Started tracy capture");
+#define PROFILING_PLOT_NUMBER(NAME, NUMBER) TracyPlot(NAME, NUMBER);
 #else
 #define PROFILE_FRAME(NAME)
 #define PROFILE_FUNCTION(...)
@@ -37,6 +38,7 @@
 #define PROFILING_ALLOC(...)
 #define PROFILING_FREE(...)
 #define PROFILING_START_CAPTURE(...)
+#define PROFILING_PLOT_NUMBER(NAME, NUMBER)
 #endif
 
 #endif //GODOT_SOURCE_PROFILING_H
