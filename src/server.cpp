@@ -124,6 +124,101 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("tick", "delta"), &SteamAudioServer::tick);
 	ClassDB::bind_method(D_METHOD("mixing_thread_func"), &SteamAudioServer::mixing_thread_func);
 	ClassDB::bind_static_method("SteamAudioServer", D_METHOD("get_singleton"), &SteamAudioServer::get_singleton);
+	ClassDB::bind_method(D_METHOD("get_source_count"), &SteamAudioServer::get_source_count);
+	ClassDB::bind_method(D_METHOD("get_listener_count"), &SteamAudioServer::get_listener_count);
+	ClassDB::bind_method(D_METHOD("get_source_name", "index"), &SteamAudioServer::get_source_name);
+	ClassDB::bind_method(D_METHOD("get_listener_name", "index"), &SteamAudioServer::get_listener_name);
+	ClassDB::bind_method(D_METHOD("get_source_debug_string", "index"), &SteamAudioServer::get_source_debug_string);
+	ClassDB::bind_method(D_METHOD("get_listener_debug_string", "index"), &SteamAudioServer::get_listener_debug_string);
+}
+
+int SteamAudioServer::get_source_count() {
+	std::shared_lock lock(collections_mutex);
+	return (int)sources.size();
+}
+
+int SteamAudioServer::get_listener_count() {
+	std::shared_lock lock(collections_mutex);
+	return (int)listeners.size();
+}
+
+String SteamAudioServer::get_source_name(int index) {
+	std::shared_lock lock(collections_mutex);
+	if (index < 0 || index >= (int)sources.size())
+		return "";
+	auto &sd = sources[index];
+	if (!sd.source_node)
+		return "<null>";
+	return sd.source_node->get_name();
+}
+
+String SteamAudioServer::get_listener_name(int index) {
+	std::shared_lock lock(collections_mutex);
+	if (index < 0 || index >= (int)listeners.size())
+		return "";
+	auto &ld = listeners[index];
+	if (!ld.listener)
+		return "<null>";
+	return ld.listener->get_name();
+}
+
+String SteamAudioServer::get_source_debug_string(int index) {
+	std::shared_lock lock(collections_mutex);
+	if (index < 0 || index >= (int)sources.size())
+		return "";
+	auto &sd = sources[index];
+	int frame_size = cached_audio_settings.frameSize;
+
+	String s;
+	s += "mixed_frames_ready: " + String::num_int64(sd.mixed_frames_ready) + "/" + String::num_int64(frame_size) + "\n";
+	s += "pending_consumers: " + String::num_int64(sd.pending_consumers) + "\n";
+	s += "playbacks: " + String::num_int64((int)sd.playbacks.size()) + "\n";
+	for (uint32_t i = 0; i < sd.playbacks.size(); ++i) {
+		auto &pb = sd.playbacks[i];
+		s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
+		s += " vol=" + String::num(pb.volume_linear, 3);
+		s += " pitch=" + String::num(pb.pitch_scale, 3);
+		s += " mixed_too_much=" + String::num_int64(pb.num_mixed_too_much_last_round) + "\n";
+	}
+	s += "effect_instances: " + String::num_int64((int)sd.effect_instances.size()) + "\n";
+	s += "listener_data: " + String::num_int64((int)sd.listener_data.size()) + "\n";
+	for (uint32_t i = 0; i < sd.listener_data.size(); ++i) {
+		auto &sld = sd.listener_data[i];
+		String lname = sld.listener ? String(sld.listener->get_name()) : "<null>";
+		s += "  sld[" + String::num_int64(i) + "] listener=" + lname;
+		s += " dist=" + String::num(sld.dist_to_listener, 2);
+		s += " doppler=" + String::num(sld.doppler_pitch, 3);
+		s += " oor=" + String(sld.out_of_range ? "yes" : "no");
+		s += " last_gen=" + String::num_int64(sld.last_contributed_generation) + "\n";
+	}
+	return s;
+}
+
+String SteamAudioServer::get_listener_debug_string(int index) {
+	std::shared_lock lock(collections_mutex);
+	if (index < 0 || index >= (int)listeners.size())
+		return "";
+	auto &ld = listeners[index];
+	int frame_size = cached_audio_settings.frameSize;
+
+	String s;
+	s += "pending_contributors: " + String::num_int64(ld.pending_contributors) + "\n";
+	s += "pending_drains: " + String::num_int64(ld.pending_drains) + "\n";
+	s += "generation: " + String::num_int64(ld.generation) + "\n";
+	s += "push_buffer size: " + String::num_int64((int)ld.push_buffer.size()) + "/" + String::num_int64(frame_size) + "\n";
+	{
+		std::lock_guard pb_lock(*ld.playbacks_mutex);
+		s += "playbacks: " + String::num_int64((int)ld.playbacks.size()) + "\n";
+		for (uint32_t i = 0; i < ld.playbacks.size(); ++i) {
+			auto &pb = ld.playbacks[i];
+			s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
+			s += " remaining=" + String::num_int64(pb.remaining_from_push_buffer);
+			s += " avail=" + String::num_int64(pb.playback->get_frames_available()) + "\n";
+		}
+	}
+	s += "has_simulator: " + String(ld.simulator ? "yes" : "no") + "\n";
+	s += "dirty: " + String(ld.dirty ? "yes" : "no") + "\n";
+	return s;
 }
 
 IPLAudioSettings SteamAudioServer::get_audio_settings() {
@@ -694,13 +789,32 @@ void SteamAudioServer::process_audio() {
 		}
 		if (sd.mixed_frames_ready == frame_size) {
 			// Mix is complete! Count how many listeners need to consume it.
+			// Only count listeners that have active playbacks — listeners without
+			// playbacks would cycle through generations instantly, consuming source
+			// mixes before listeners with playbacks can use them.
 			sd.pending_consumers = 0;
 			for (auto &sld : sd.listener_data) {
 				if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
 					continue;
 				if (sld.out_of_range)
 					continue;
-				sd.pending_consumers++;
+				// Check if this listener has active (playing) playbacks
+				for (auto &ld : listeners) {
+					if (ld.listener == sld.listener) {
+						std::lock_guard pb_lock(*ld.playbacks_mutex);
+						bool has_playing = false;
+						for (auto &pb : ld.playbacks) {
+							if (pb.playback->is_playing()) {
+								has_playing = true;
+								break;
+							}
+						}
+						if (has_playing) {
+							sd.pending_consumers++;
+						}
+						break;
+					}
+				}
 			}
 		}
 	}
@@ -720,7 +834,54 @@ void SteamAudioServer::process_audio() {
 		// pending drains), recount contributors. This handles the case where
 		// sources were added after the listener, or all sources were temporarily
 		// out of range and have come back.
+		// Check if this listener has active playbacks. Listeners without playbacks
+		// should not participate in the contribution pipeline — they would cycle
+		// through generations instantly, consuming source mixes before listeners
+		// with actual playbacks can drain them.
+		bool has_playbacks;
+		{
+			std::lock_guard pb_lock(*ld.playbacks_mutex);
+			// Remove non-playing playbacks so they don't make the listener
+			// appear active when it has no real consumers.
+			for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
+				if (!ld.playbacks[i].playback->is_playing()) {
+					ld.playbacks.remove_at(i);
+				}
+			}
+			has_playbacks = !ld.playbacks.is_empty();
+		}
+
+		if (!has_playbacks) {
+			// This listener has no playbacks, so it shouldn't participate.
+			// Decrement pending_consumers on any sources that were counted for
+			// this listener but haven't been consumed yet, to prevent stalls.
+			if (ld.pending_contributors > 0) {
+				for (auto &sd : sources) {
+					if (!sd.source_node)
+						continue;
+					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+						continue;
+					if (sd.mixed_frames_ready < frame_size)
+						continue;
+					for (auto &entry : sd.listener_data) {
+						if (entry.listener == ld.listener && !entry.out_of_range &&
+								entry.last_contributed_generation != ld.generation) {
+							if (sd.pending_consumers > 0)
+								sd.pending_consumers--;
+							entry.last_contributed_generation = ld.generation;
+							break;
+						}
+					}
+				}
+			}
+			ld.pending_contributors = 0;
+			ld.pending_drains = 0;
+			continue;
+		}
+
 		if (ld.pending_contributors <= 0 && ld.pending_drains <= 0) {
+			ld.push_buffer.fill(Vector2(0, 0));
+			ld.generation++;
 			ld.pending_contributors = 0;
 			for (auto &sd : sources) {
 				if (!sd.source_node)
@@ -1013,10 +1174,38 @@ void SteamAudioServer::add_playback_to_listener(SteamAudioListener *listener, go
 	std::shared_lock lock(collections_mutex);
 	for (auto &ld : listeners) {
 		if (ld.listener == listener) {
-			std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
-			ld.playbacks.push_back({
-				playback, 0
-			});
+			bool was_empty;
+			{
+				std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
+				was_empty = ld.playbacks.is_empty();
+				ld.playbacks.push_back({
+					playback, 0
+				});
+			}
+
+			// If this listener transitions from 0 to 1 playbacks, it will now
+			// participate in the pipeline. Sources whose mix is already complete
+			// may have been counted without this listener (Phase 1 only counts
+			// listeners with playbacks). We need to increment pending_consumers
+			// on those sources so Phase 2's decrement during contribution stays
+			// balanced.
+			if (was_empty) {
+				for (auto &sd : sources) {
+					if (!sd.source_node)
+						continue;
+					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+						continue;
+					if (sd.mixed_frames_ready < cached_audio_settings.frameSize)
+						continue;
+					for (auto &sld : sd.listener_data) {
+						if (sld.listener == ld.listener && !sld.out_of_range &&
+								sld.last_contributed_generation != ld.generation) {
+							sd.pending_consumers++;
+							break;
+						}
+					}
+				}
+			}
 			return;
 		}
 	}

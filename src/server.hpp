@@ -210,6 +210,14 @@ public:
 
 	int get_frame_size() const { return cached_audio_settings.frameSize; }
 	int get_sampling_rate() const { return cached_audio_settings.samplingRate; }
+
+	// Debug functions
+	int get_source_count();
+	int get_listener_count();
+	godot::String get_source_name(int index);
+	godot::String get_listener_name(int index);
+	godot::String get_source_debug_string(int index);
+	godot::String get_listener_debug_string(int index);
 };
 
 #endif // STEAM_AUDIO_SERVER_H
