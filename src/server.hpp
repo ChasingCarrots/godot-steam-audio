@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <variant>
 #include <vector>
 
 namespace godot {
@@ -126,6 +127,46 @@ struct StaticGeometryData {
 // Helper to clean up a SourceListenerData's IPL resources
 void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx);
 
+// Pending operation types for the commit queue
+struct PendingAddSource {
+	SteamAudioSource *source_node;
+	SourceData source_data;
+};
+
+struct PendingRemoveSource {
+	SteamAudioSource *source_node;
+};
+
+struct PendingAddListener {
+	SteamAudioListener *listener;
+	ListenerData listener_data;
+};
+
+struct PendingRemoveListener {
+	SteamAudioListener *listener;
+};
+
+struct PendingAddPlaybackToSource {
+	const SteamAudioSource *source_node;
+	godot::Ref<godot::AudioStreamPlayback> playback;
+	float volume_linear;
+	float pitch_scale;
+};
+
+struct PendingAddPlaybackToListener {
+	SteamAudioListener *listener;
+	godot::Ref<godot::AudioStreamGeneratorPlayback> playback;
+};
+
+using PendingOp = std::variant<
+	PendingAddSource,
+	PendingRemoveSource,
+	PendingAddListener,
+	PendingRemoveListener,
+	PendingAddPlaybackToSource,
+	PendingAddPlaybackToListener
+>;
+
 class SteamAudioServer : public godot::Object {
 	GDCLASS(SteamAudioServer, godot::Object)
 
@@ -154,8 +195,16 @@ private:
 	godot::LocalVector<DynamicGeometryData> dynamic_geometry;
 	godot::LocalVector<StaticGeometryData> static_geometry;
 
-	// Protects listeners, sources, dynamic_geometry, static_geometry
+	// Protects listeners and sources collections.
+	// Unique-locked briefly by the mixing thread to apply pending ops.
+	// Shared-locked by tick(), process_audio() (after applying ops),
+	// simulation_thread, and debug functions.
 	std::shared_mutex collections_mutex;
+
+	// Pending operations queue: callers enqueue, mixing thread drains.
+	std::mutex pending_ops_mutex;
+	std::vector<PendingOp> pending_ops;
+	void apply_pending_ops();
 
 	std::atomic<bool> refl_thread_wait_for_commit;
 	std::atomic<bool> is_refl_thread_processing;

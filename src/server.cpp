@@ -191,7 +191,8 @@ String SteamAudioServer::get_source_debug_string(int index) {
 		s += " dist=" + String::num(sld.dist_to_listener, 2);
 		s += " doppler=" + String::num(sld.doppler_pitch, 3);
 		s += " oor=" + String(sld.out_of_range ? "yes" : "no");
-		s += " last_gen=" + String::num_int64(sld.last_contributed_generation) + "\n";
+		s += " last_gen=" + String::num_int64(sld.last_contributed_generation);
+ 	s += "\n";
 	}
 	return s;
 }
@@ -298,6 +299,9 @@ void SteamAudioServer::finish() {
 	if (mixing_thread.is_valid() && mixing_thread->is_started()) {
 		mixing_thread->wait_to_finish();
 	}
+
+	// Drain any remaining pending ops now that threads are stopped
+	apply_pending_ops();
 
 	for (auto &ld : listeners) {
 		if (ld.simulator) {
@@ -588,16 +592,27 @@ void SteamAudioServer::simulation_thread_func() {
 			new_inputs_set.store(false);
 
 			PROFILE_FUNCTION_NAMED("refl_sim");
-			// this lock might be problematic. the iplSimulatorRunReflections
-			// call can take a long time and the unique_lock when adding/removing
-			// a listener has to wait for that... But might be ok to wait 300ms
-			// for an event that doesn't happen often.
-			std::shared_lock lock(collections_mutex);
-			for (auto &ld : listeners) {
-				if (!ld.simulator)
-					continue;
-				iplSimulatorRunReflections(ld.simulator);
+
+			// Snapshot simulators with retain so we don't hold collections_mutex
+			// during the potentially long iplSimulatorRunReflections calls.
+			simulators.clear();
+			{
+				std::shared_lock lock(collections_mutex);
+				for (auto &ld : listeners) {
+					if (!ld.simulator)
+						continue;
+					simulators.push_back(iplSimulatorRetain(ld.simulator));
+				}
 			}
+
+			for (auto &sim : simulators) {
+				iplSimulatorRunReflections(sim);
+			}
+
+			for (auto &sim : simulators) {
+				iplSimulatorRelease(&sim);
+			}
+			simulators.clear();
 
 			is_refl_thread_processing.store(false);
 		}
@@ -628,9 +643,222 @@ void SteamAudioServer::mixing_thread_func() {
 	}
 }
 
+void SteamAudioServer::apply_pending_ops() {
+	PROFILE_FUNCTION();
+
+	std::vector<PendingOp> ops;
+	{
+		std::lock_guard lock(pending_ops_mutex);
+		ops.swap(pending_ops);
+	}
+
+	if (ops.empty())
+		return;
+
+	// unique_lock to mutate the collections
+	std::unique_lock lock(collections_mutex);
+
+	for (auto &op : ops) {
+		std::visit([&](auto &pending) {
+			using T = std::decay_t<decltype(pending)>;
+
+			if constexpr (std::is_same_v<T, PendingAddSource>) {
+				// Check for duplicates
+				for (const auto &sd : sources) {
+					if (sd.source_node == pending.source_node)
+						return;
+				}
+
+				SourceData &sd = pending.source_data;
+
+				// Create cross-references with all existing listeners
+				for (const auto &ld : listeners) {
+					SourceListenerData sld;
+					if (create_source_listener_data(sld, sd.source_node, ld.listener, phonon_context, &cached_audio_settings, phonon_hrtf)) {
+						sd.listener_data.push_back(sld);
+					}
+				}
+
+				sources.push_back(std::move(sd));
+
+			} else if constexpr (std::is_same_v<T, PendingRemoveSource>) {
+				for (uint32_t i = 0; i < sources.size(); ++i) {
+					if (sources[i].source_node == pending.source_node) {
+						SourceData &sd = sources[i];
+						for (auto &sld : sd.listener_data) {
+							// Adjust listener pending_contributors if this source was counted
+							// but hasn't contributed yet to the current generation.
+ 						for (auto &ld : listeners) {
+ 							if (sld.listener == ld.listener && !sld.out_of_range &&
+ 									(sd.source_node->get_layers() & ld.listener->get_mask()) != 0 &&
+ 									sld.last_contributed_generation != ld.generation &&
+ 									ld.pending_contributors > 0) {
+ 								ld.pending_contributors--;
+ 							}
+ 						}
+
+ 						// Remove source from its simulator (reuse ld loop)
+ 						for (auto &ld : listeners) {
+								if (ld.simulator && sld.source && sld.listener == ld.listener) {
+									iplSourceRemove(sld.source, ld.simulator);
+									ld.dirty = true;
+								}
+							}
+							cleanup_source_listener_data(sld, phonon_context);
+						}
+						sources.remove_at(i);
+						break;
+					}
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingAddListener>) {
+				ListenerData &ld = pending.listener_data;
+
+				// Create per-listener state for all existing sources
+				for (auto &sd : sources) {
+					SourceListenerData sld;
+					if (create_source_listener_data(sld, sd.source_node, ld.listener, phonon_context, &cached_audio_settings, phonon_hrtf)) {
+						sd.listener_data.push_back(sld);
+					}
+				}
+
+				// Initialize pending_contributors so Phase 3 can start immediately
+				ld.pending_contributors = 0;
+				for (auto &sd : sources) {
+					if (!sd.source_node)
+						continue;
+					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+						continue;
+					for (auto &sld : sd.listener_data) {
+						if (sld.listener == ld.listener && !sld.out_of_range) {
+							ld.pending_contributors++;
+							break;
+						}
+					}
+				}
+
+				listeners.push_back(std::move(ld));
+
+			} else if constexpr (std::is_same_v<T, PendingRemoveListener>) {
+				SteamAudioListener *listener = pending.listener;
+
+				// Find the ListenerData for counter adjustments
+				ListenerData *removing_ld = nullptr;
+				for (auto &ld : listeners) {
+					if (ld.listener == listener) {
+						removing_ld = &ld;
+						break;
+					}
+				}
+
+				// Clean up per-listener state in all sources
+				for (auto &sd : sources) {
+					for (uint32_t i = 0; i < sd.listener_data.size(); ++i) {
+						if (sd.listener_data[i].listener == listener) {
+							SourceListenerData &sld = sd.listener_data[i];
+
+ 						if (removing_ld && !sld.out_of_range &&
+								(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
+								sld.last_contributed_generation != removing_ld->generation &&
+								removing_ld->pending_contributors > 0) {
+							removing_ld->pending_contributors--;
+						}
+						// Also release pending_consumers if this listener was counted
+						if (!sld.out_of_range &&
+								(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
+								sd.mixed_frames_ready >= cached_audio_settings.frameSize &&
+								sd.pending_consumers > 0) {
+							sd.pending_consumers--;
+						}
+
+						// Remove source from simulator before releasing
+							for (auto &ld_entry : listeners) {
+								if (ld_entry.listener == listener && ld_entry.simulator && sld.source) {
+									iplSourceRemove(sld.source, ld_entry.simulator);
+								}
+							}
+							cleanup_source_listener_data(sld, phonon_context);
+							sd.listener_data.remove_at(i);
+							break;
+						}
+					}
+				}
+
+				for (auto it = listeners.begin(); it != listeners.end(); ++it) {
+					if (it->listener == listener) {
+						if (it->simulator) {
+							iplSimulatorRelease(&it->simulator);
+						}
+						listeners.erase(it);
+						break;
+					}
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToSource>) {
+				for (auto &sd : sources) {
+					if (sd.source_node == pending.source_node) {
+						SourcePlaybackEntry entry;
+						entry.playback = pending.playback;
+						entry.volume_linear = pending.volume_linear;
+						entry.pitch_scale = pending.pitch_scale;
+						sd.playbacks.push_back(entry);
+						return;
+					}
+				}
+
+ 		} else if constexpr (std::is_same_v<T, PendingAddPlaybackToListener>) {
+				for (auto &ld : listeners) {
+					if (ld.listener == pending.listener) {
+						bool was_empty;
+						{
+							std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
+							was_empty = ld.playbacks.is_empty();
+							ld.playbacks.push_back({ pending.playback, 0 });
+						}
+						String debug_string = "Adding playback to listener: listener=" + ld.listener->get_name();
+						debug_string += " was_empty=" + String(was_empty ? "true" : "false");
+						debug_string += vformat("\n generation=%d pending_contributors=%d pending_drains=%d", ld.generation, ld.pending_contributors, ld.pending_drains);
+						if (was_empty) {
+							// Listener was inactive — start a fresh cycle.
+							// Bump generation so stale last_contributed_generation won't match.
+							ld.generation++;
+							ld.pending_contributors = 0;
+							ld.pending_drains = 0;
+
+							const int frame_size = cached_audio_settings.frameSize;
+							for (auto &sd : sources) {
+								if (!sd.source_node)
+									continue;
+								if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+									continue;
+								for (auto &sld : sd.listener_data) {
+									if (sld.listener == ld.listener && !sld.out_of_range) {
+										ld.pending_contributors++;
+										// If source has a ready mix, increment pending_consumers
+										// so it waits for this listener to consume before resetting.
+										if (sd.mixed_frames_ready >= frame_size) {
+											sd.pending_consumers++;
+										}
+										break;
+									}
+								}
+							}
+							}
+						UtilityFunctions::print(debug_string);
+						return;
+					}
+				}
+			}
+		}, op);
+	}
+}
+
 void SteamAudioServer::process_audio() {
 	PROFILE_FUNCTION();
 	const int frame_size = cached_audio_settings.frameSize;
+
+	// Apply any queued operations (briefly unique-locks collections_mutex)
+	apply_pending_ops();
 
 	std::shared_lock lock(collections_mutex);
 
@@ -861,7 +1089,7 @@ void SteamAudioServer::process_audio() {
 									sd.pending_consumers--;
 								entry.last_contributed_generation = ld.generation;
 								break;
-									}
+							}
 						}
 					}
 				}
@@ -1105,21 +1333,11 @@ void SteamAudioServer::process_audio() {
 void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 	PROFILE_FUNCTION();
 
-	// but a unique lock for adding listeners to the list of listeners
-	std::unique_lock lock(collections_mutex);
+	// Pre-build ListenerData outside any lock
 	ListenerData ld;
 	ld.listener = listener;
 	ld.dirty = true;
-
 	ld.push_buffer.resize(cached_audio_settings.frameSize);
-
-	// Create per-listener state for all existing sources
-	for (auto &sd : sources) {
-		SourceListenerData sld;
-		if (create_source_listener_data(sld, sd.source_node, listener, phonon_context, &cached_audio_settings, phonon_hrtf)) {
-			sd.listener_data.push_back(sld);
-		}
-	}
 
 	// Initialize Simulator for this listener
 	IPLSimulationSettings sim_cfg{};
@@ -1141,146 +1359,29 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 		iplSimulatorCommit(ld.simulator);
 	}
 
-	// Initialize pending_contributors so Phase 3 can start immediately
-	ld.pending_contributors = 0;
-	for (auto &sd : sources) {
-		if (!sd.source_node)
-			continue;
-		if ((sd.source_node->get_layers() & listener->get_mask()) == 0)
-			continue;
-		for (auto &sld : sd.listener_data) {
-			if (sld.listener == listener && !sld.out_of_range) {
-				ld.pending_contributors++;
-				break;
-			}
-		}
+	// Enqueue — cross-references with sources will be created when applied
+	{
+		std::lock_guard lock(pending_ops_mutex);
+		pending_ops.push_back(PendingAddListener{ listener, std::move(ld) });
 	}
-
-	listeners.push_back(std::move(ld));
 }
 
 void SteamAudioServer::add_playback_to_listener(SteamAudioListener *listener, godot::Ref<godot::AudioStreamGeneratorPlayback> playback) {
 	PROFILE_FUNCTION();
-	// we only need a shared lock for the adding of playbacks to the listener
-	std::shared_lock lock(collections_mutex);
-	for (auto &ld : listeners) {
-		if (ld.listener == listener) {
-			bool was_empty;
-			{
-				std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
-				was_empty = ld.playbacks.is_empty();
-				ld.playbacks.push_back({
-					playback, 0
-				});
-			}
-
-			// If this listener transitions from 0 to 1 playbacks, it will now
-			// participate in the pipeline. Sources whose mix is already complete
-			// may have been counted without this listener (Phase 1 only counts
-			// listeners with playbacks). We need to increment pending_consumers
-			// on those sources so Phase 2's decrement during contribution stays
-			// balanced.
-			if (was_empty) {
-				for (auto &sd : sources) {
-					if (!sd.source_node)
-						continue;
-					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
-						continue;
-					if (sd.mixed_frames_ready < cached_audio_settings.frameSize)
-						continue;
-					for (auto &sld : sd.listener_data) {
-						if (sld.listener == ld.listener && !sld.out_of_range &&
-								sld.last_contributed_generation != ld.generation) {
-							sd.pending_consumers++;
-							break;
-						}
-					}
-				}
-			}
-			return;
-		}
-	}
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingAddPlaybackToListener{ listener, playback });
 }
 
 void SteamAudioServer::remove_listener(SteamAudioListener *listener) {
 	PROFILE_FUNCTION();
-	std::unique_lock lock(collections_mutex);
-
-	// Find the ListenerData for counter adjustments
-	ListenerData *removing_ld = nullptr;
-	for (auto &ld : listeners) {
-		if (ld.listener == listener) {
-			removing_ld = &ld;
-			break;
-		}
-	}
-
-	// Clean up per-listener state in all sources
-	for (auto &sd : sources) {
-		for (uint32_t i = 0; i < sd.listener_data.size(); ++i) {
-			if (sd.listener_data[i].listener == listener) {
-				SourceListenerData &sld = sd.listener_data[i];
-
-				// If this SLD had not yet contributed to the listener's current
-				// generation and was counted as a pending_contributor, adjust.
-				if (removing_ld && !sld.out_of_range &&
-						(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
-						sld.last_contributed_generation != removing_ld->generation &&
-						removing_ld->pending_contributors > 0) {
-					removing_ld->pending_contributors--;
-				}
-
-				// If this SLD was counted as a pending_consumer (it contributed
-				// to the listener but the source hasn't been reset yet), adjust.
-				if (removing_ld && !sld.out_of_range &&
-						(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
-						sld.last_contributed_generation == removing_ld->generation &&
-						sd.pending_consumers > 0) {
-					// This listener already consumed the source mix for this generation,
-					// so pending_consumers was already decremented during contribution.
-					// No adjustment needed here.
-				} else if (sd.mixed_frames_ready >= cached_audio_settings.frameSize &&
-						!sld.out_of_range &&
-						(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
-						sd.pending_consumers > 0) {
-					// The source mix is ready and this listener was counted but
-					// hasn't consumed yet — decrement.
-					sd.pending_consumers--;
-				}
-
-				// Remove source from simulator before releasing
-				for (auto &ld_entry : listeners) {
-					if (ld_entry.listener == listener && ld_entry.simulator && sld.source) {
-						iplSourceRemove(sld.source, ld_entry.simulator);
-					}
-				}
-				cleanup_source_listener_data(sld, phonon_context);
-				sd.listener_data.remove_at(i);
-				break;
-			}
-		}
-	}
-
-	for (auto it = listeners.begin(); it != listeners.end(); ++it) {
-		if (it->listener == listener) {
-			if (it->simulator) {
-				iplSimulatorRelease(&it->simulator);
-			}
-			listeners.erase(it);
-			break;
-		}
-	}
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingRemoveListener{ listener });
 }
 
 void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 	PROFILE_FUNCTION();
-	std::unique_lock lock(collections_mutex);
 
-	for (const auto &sd : sources) {
-		if (sd.source_node == source_node)
-			return;
-	}
-
+	// Pre-build SourceData outside any lock
 	SourceData sd;
 	sd.source_node = source_node;
 	sd.mixed_frames.resize(cached_audio_settings.frameSize);
@@ -1288,7 +1389,6 @@ void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 
 	{
 		PROFILE_FUNCTION_NAMED("instantiate_AudioEffects");
-		// Instantiate AudioEffectInstances from the source's effect stack
 		TypedArray<AudioEffect> effects = source_node->get_effect_stack();
 		for (int i = 0; i < effects.size(); ++i) {
 			Ref<AudioEffect> effect = effects[i];
@@ -1301,33 +1401,22 @@ void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 		}
 	}
 
-	// Initialize effects and buffers for all existing listeners
-	for (const auto &ld : listeners) {
-		SourceListenerData sld;
-		if (create_source_listener_data(sld, source_node, ld.listener, phonon_context, &cached_audio_settings, phonon_hrtf)) {
-			sd.listener_data.push_back(sld);
-		}
+	// Enqueue — cross-references with listeners will be created when applied
+	{
+		std::lock_guard lock(pending_ops_mutex);
+		pending_ops.push_back(PendingAddSource{ source_node, std::move(sd) });
 	}
-
-	sources.push_back(sd);
 }
 
 void SteamAudioServer::add_playback_to_source(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> playback, float p_volume_db, float p_pitch_scale) {
 	if (playback.is_null())
 		return;
 
-	std::unique_lock lock(collections_mutex);
-	for (auto &sd : sources) {
-		if (sd.source_node == source_node) {
-			SourcePlaybackEntry entry;
-			entry.playback = playback;
-			entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
-			entry.pitch_scale = p_pitch_scale;
-			playback->start();
-			sd.playbacks.push_back(entry);
-			return;
-		}
-	}
+	float volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
+	playback->start();
+
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingAddPlaybackToSource{ source_node, playback, volume_linear, p_pitch_scale });
 }
 
 void SteamAudioServer::set_source_playback_volume(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> p_playback, float p_volume_db) {
@@ -1373,36 +1462,8 @@ int SteamAudioServer::source_get_num_active_playbacks(const SteamAudioSource *so
 
 void SteamAudioServer::remove_source(SteamAudioSource *source_node) {
 	PROFILE_FUNCTION();
-	std::unique_lock lock(collections_mutex);
-
-	for (uint32_t i = 0; i < sources.size(); ++i) {
-		if (sources[i].source_node == source_node) {
-			SourceData &sd = sources[i];
-			for (auto &sld : sd.listener_data) {
-				// Adjust listener pending_contributors if this source was counted
-				// but hasn't contributed yet to the current generation.
-				for (auto &ld : listeners) {
-					if (sld.listener == ld.listener && !sld.out_of_range &&
-							(sd.source_node->get_layers() & ld.listener->get_mask()) != 0 &&
-							sld.last_contributed_generation != ld.generation &&
-							ld.pending_contributors > 0) {
-						ld.pending_contributors--;
-					}
-				}
-
-				// Remove source from its simulator
-				for (auto &ld : listeners) {
-					if (ld.simulator && sld.source && sld.listener == ld.listener) {
-						iplSourceRemove(sld.source, ld.simulator);
-						ld.dirty = true;
-					}
-				}
-				cleanup_source_listener_data(sld, phonon_context);
-			}
-			sources.remove_at(i);
-			break;
-		}
-	}
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingRemoveSource{ source_node });
 }
 
 void SteamAudioServer::add_static_geometry(Node *p_node, Ref<SteamAudioMaterial> p_material) {
@@ -1427,7 +1488,6 @@ void SteamAudioServer::add_static_geometry(Node *p_node, Ref<SteamAudioMaterial>
 		StaticGeometryData sg;
 		sg.node = p_node;
 		sg.meshes = meshes;
-		std::unique_lock lock(collections_mutex);
 		static_geometry.push_back(sg);
 		scene_dirty = true;
 	}
@@ -1435,7 +1495,6 @@ void SteamAudioServer::add_static_geometry(Node *p_node, Ref<SteamAudioMaterial>
 
 void SteamAudioServer::remove_static_geometry(Node *p_node) {
 	PROFILE_FUNCTION();
-	std::unique_lock lock(collections_mutex);
 	for (uint32_t i = 0; i < static_geometry.size(); ++i) {
 		if (static_geometry[i].node == p_node) {
 			for (auto &m : static_geometry[i].meshes) {
@@ -1487,13 +1546,11 @@ void SteamAudioServer::add_dynamic_geometry(Node *p_node, Ref<SteamAudioMaterial
 
 	scene_dirty = true;
 
-	std::unique_lock lock(collections_mutex);
 	dynamic_geometry.push_back(dg);
 }
 
 void SteamAudioServer::remove_dynamic_geometry(Node *p_node) {
 	PROFILE_FUNCTION();
-	std::unique_lock lock(collections_mutex);
 	for (uint32_t i = 0; i < dynamic_geometry.size(); ++i) {
 		if (dynamic_geometry[i].node == p_node) {
 			for (auto &m : dynamic_geometry[i].meshes) {
