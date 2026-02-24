@@ -18,6 +18,7 @@ class SteamAudioSource : public godot::Node3D {
 private:
 	bool dynamic_registration = false;
 	bool is_registered = false;
+	uint64_t timeout_registration_at;
 
 	bool direct_enabled = true;
 

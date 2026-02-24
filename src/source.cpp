@@ -1,5 +1,8 @@
 #include "source.hpp"
+#include "godot_cpp/classes/os.hpp"
+#include "godot_cpp/classes/time.hpp"
 #include "server.hpp"
+
 #include <godot_cpp/classes/engine.hpp>
 
 using namespace godot;
@@ -153,7 +156,10 @@ void SteamAudioSource::_notification(int p_what) {
 			if (!dynamic_registration || !is_registered)
 				break;
 			int num_active_playbacks = SteamAudioServer::get_singleton()->source_get_num_active_playbacks(this);
-			if (num_active_playbacks == 0) {
+			if (num_active_playbacks != 0) {
+				timeout_registration_at = Time::get_singleton()->get_ticks_msec() + 1000;
+			}
+			else if (Time::get_singleton()->get_ticks_msec() > timeout_registration_at) {
 				SteamAudioServer::get_singleton()->remove_source(this);
 				is_registered = false;
 				emit_signal("removed_from_simulation");
@@ -188,6 +194,7 @@ Ref<AudioStreamPlayback> SteamAudioSource::play_stream(Ref<AudioStream> p_stream
 			is_registered = true;
 		}
 		SteamAudioServer::get_singleton()->add_playback_to_source(this, playback, p_volume_db, p_pitch_scale);
+		timeout_registration_at = Time::get_singleton()->get_ticks_msec() + 1000;
 	}
 	return playback;
 }

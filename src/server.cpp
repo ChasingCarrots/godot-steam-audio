@@ -806,7 +806,7 @@ void SteamAudioServer::apply_pending_ops() {
 					}
 				}
 
- 		} else if constexpr (std::is_same_v<T, PendingAddPlaybackToListener>) {
+ 			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToListener>) {
 				for (auto &ld : listeners) {
 					if (ld.listener == pending.listener) {
 						bool was_empty;
@@ -815,9 +815,6 @@ void SteamAudioServer::apply_pending_ops() {
 							was_empty = ld.playbacks.is_empty();
 							ld.playbacks.push_back({ pending.playback, 0 });
 						}
-						String debug_string = "Adding playback to listener: listener=" + ld.listener->get_name();
-						debug_string += " was_empty=" + String(was_empty ? "true" : "false");
-						debug_string += vformat("\n generation=%d pending_contributors=%d pending_drains=%d", ld.generation, ld.pending_contributors, ld.pending_drains);
 						if (was_empty) {
 							// Listener was inactive — start a fresh cycle.
 							// Bump generation so stale last_contributed_generation won't match.
@@ -843,8 +840,7 @@ void SteamAudioServer::apply_pending_ops() {
 									}
 								}
 							}
-							}
-						UtilityFunctions::print(debug_string);
+						}
 						return;
 					}
 				}
