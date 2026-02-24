@@ -34,12 +34,12 @@ struct ListenerData {
 	IPLSimulator simulator = nullptr;
 
 	// This buffer will be filled by the pre-mixed and steam audio handled
-	// audio data from all relevant sources. When all relevant sources have
-	// filled it, it will be pushed to the listener's playbacks, ready for a new round.
+	// audio data from all relevant sources (additive). When all relevant sources have
+	// added to it, it will be pushed to the listener's playbacks, ready for a new round.
 	godot::PackedVector2Array push_buffer;
 
 	// Counter-based flow control:
-	// pending_contributors: number of relevant sources that still need to contribute
+	// pending_contributors: number of relevant (to this listener) sources that still need to contribute
 	// to the push_buffer. Set when push_buffer is cleared, decremented as sources contribute.
 	// When it reaches 0, the push_buffer is ready to be pushed to playbacks.
 	int pending_contributors = 0;
