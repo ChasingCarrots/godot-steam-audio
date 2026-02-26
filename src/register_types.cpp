@@ -7,6 +7,7 @@
 #include "server.hpp"
 #include "source.hpp"
 #include "parameterized_audio_stream.h"
+#include "AudioStreamSteamAudioListener.h"
 
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/scene_tree.hpp"
@@ -45,6 +46,9 @@ void init_ext(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<ParameterizedAudioStreamInput>();
 		ClassDB::register_class<AudioStreamParameterized>();
 		ClassDB::register_class<AudioStreamPlaybackParameterized>();
+		ClassDB::register_class<AudioStreamSteamAudioListener>();
+		ClassDB::register_class<AudioStreamSteamAudioListenerPlayback>();
+
 	}
 }
 

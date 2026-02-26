@@ -7,8 +7,9 @@
 #include <godot_cpp/classes/audio_stream_generator.hpp>
 #include <godot_cpp/classes/audio_stream_generator_playback.hpp>
 #include <godot_cpp/classes/node3d.hpp>
-#include <mutex>
 #include <vector>
+
+#include "AudioStreamSteamAudioListener.h"
 
 class SteamAudioListener : public godot::Node3D {
 	GDCLASS(SteamAudioListener, godot::Node3D);
@@ -23,7 +24,6 @@ private:
 	float irradiance_min_dist = 1.0f;
 	uint32_t mask = 1;
 	float range = 0.0f;
-	float buffer_length = 0.1f;
 
 	void ready_internal();
 
@@ -55,15 +55,10 @@ public:
 	float get_range() const { return range; }
 	void set_range(float p_range) { range = p_range; }
 
-	float get_buffer_length() const { return buffer_length; }
-	void set_buffer_length(float p_buffer_length) { buffer_length = p_buffer_length; }
-
 	bool get_reflection_simulation_enabled() { return reflection_simulation_enabled; }
 	void set_reflection_simulation_enabled(bool p_enabled) { reflection_simulation_enabled = p_enabled; }
 
-	godot::Ref<godot::AudioStreamGenerator> get_generator() { return generator; }
-
-	godot::Ref<godot::AudioStreamGeneratorPlayback> play_on_audiostreamplayer(godot::Variant audiostreamplayer);
+	godot::Ref<AudioStreamSteamAudioListenerPlayback> play_on_audiostreamplayer(godot::Variant audiostreamplayer);
 
 	// Steam Audio objects for listener
 	IPLAmbisonicsPanningEffect panning_effect = nullptr;
@@ -72,7 +67,7 @@ public:
 	godot::PackedStringArray _get_configuration_warnings() const override;
 
 private:
-	godot::Ref<godot::AudioStreamGenerator> generator;
+	godot::Ref<AudioStreamSteamAudioListener> generator;
 };
 
 #endif // STEAM_AUDIO_LISTENER_HPP

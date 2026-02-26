@@ -25,9 +25,11 @@ inline IPLStaticMesh godot_mesh_to_ipl_mesh(godot::Ref<godot::Mesh> mesh, IPLSce
 	godot::Array verts = dat[godot::Mesh::ARRAY_VERTEX];
 	godot::Array tris = dat[godot::Mesh::ARRAY_INDEX];
 
+	int numTris = int(tris.size()) / 3;
+
 	std::vector<IPLVector3> ipl_verts(verts.size());
-	std::vector<IPLTriangle> ipl_tris(tris.size() / 3);
-	std::vector<IPLint32> ipl_mat_indices(tris.size() / 3);
+	std::vector<IPLTriangle> ipl_tris(numTris);
+	std::vector<IPLint32> ipl_mat_indices(numTris);
 
 	for (int j = 0; j < verts.size(); j++) {
 		godot::Vector3 vert = verts[j];
@@ -36,7 +38,7 @@ inline IPLStaticMesh godot_mesh_to_ipl_mesh(godot::Ref<godot::Mesh> mesh, IPLSce
 		ipl_verts[j] = ipl_vec3_from(vert);
 	}
 
-	for (int j = 0; j < tris.size(); j += 3) {
+	for (int j = 0; j < numTris * 3; j += 3) {
 		// godot tris are cw, ipl tris are ccw
 		ipl_tris[j / 3].indices[0] = tris[j];
 		ipl_tris[j / 3].indices[1] = tris[j + 2];
@@ -47,7 +49,7 @@ inline IPLStaticMesh godot_mesh_to_ipl_mesh(godot::Ref<godot::Mesh> mesh, IPLSce
 	IPLMaterial mats[1] = { material };
 	IPLStaticMeshSettings static_mesh_cfg{};
 	static_mesh_cfg.numVertices = int(verts.size());
-	static_mesh_cfg.numTriangles = int(tris.size() / 3);
+	static_mesh_cfg.numTriangles = numTris;
 	static_mesh_cfg.numMaterials = 1;
 	static_mesh_cfg.vertices = ipl_verts.data();
 	static_mesh_cfg.triangles = ipl_tris.data();
@@ -158,15 +160,44 @@ inline std::vector<IPLStaticMesh> create_meshes_from_coll_inst_3d(godot::Collisi
 		arr_mesh->add_surface_from_arrays(godot::Mesh::PRIMITIVE_TRIANGLES, surface_array);
 		mesh = arr_mesh;
 	} else if (godot::Object::cast_to<godot::ConvexPolygonShape3D>(coll_inst->get_shape().ptr())) {
-		mesh = coll_inst->get_shape()->get_debug_mesh();
+		godot::Ref<godot::Mesh> debug_mesh = coll_inst->get_shape()->get_debug_mesh();
+		godot::Ref<godot::ArrayMesh> arr_mesh;
+		arr_mesh.instantiate();
+
+		for (int i = 0; i < debug_mesh->get_surface_count(); i++) {
+			godot::Array surface_data = debug_mesh->surface_get_arrays(i);
+			godot::PackedVector3Array vertices = surface_data[godot::Mesh::ARRAY_VERTEX];
+			godot::Array idx_array = surface_data[godot::Mesh::ARRAY_INDEX];
+
+			if (idx_array.size() == 0 && vertices.size() >= 3) {
+				godot::PackedInt32Array tris;
+				tris.resize(vertices.size());
+				for (int j = 0; j < vertices.size(); j++) {
+					tris[j] = j;
+				}
+
+				godot::Array surface_array;
+				surface_array.resize(godot::Mesh::ArrayType::ARRAY_MAX);
+				surface_array[godot::Mesh::ArrayType::ARRAY_VERTEX] = vertices;
+				surface_array[godot::Mesh::ArrayType::ARRAY_INDEX] = tris;
+				arr_mesh->add_surface_from_arrays(godot::Mesh::PRIMITIVE_TRIANGLES, surface_array);
+			} else {
+				arr_mesh->add_surface_from_arrays(godot::Mesh::PRIMITIVE_TRIANGLES, surface_data);
+			}
+		}
+		mesh = arr_mesh;
 	} else {
 		SteamAudio::log(SteamAudio::log_error, "SteamAudioGeometry supports sphere, box, cylinder, capsule, concave polygon and convex polygon shapes. Something else was provided, so this geometry will not do anything.");
 		return p_meshes;
 	}
 
+
 	for (int i = 0; i < mesh->get_surface_count(); i++) {
 		auto ipl_mesh = godot_mesh_to_ipl_mesh(mesh, scene, material, trf, i);
-		if (ipl_mesh) p_meshes.push_back(ipl_mesh);
+		if (ipl_mesh)
+			p_meshes.push_back(ipl_mesh);
+		else
+			godot::UtilityFunctions::print("Godot mesh to ipl mesh failed");
 	}
 	mesh.unref();
 	return p_meshes;

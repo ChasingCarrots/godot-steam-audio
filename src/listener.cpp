@@ -8,9 +8,6 @@
 using namespace godot;
 
 void SteamAudioListener::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("get_generator"), &SteamAudioListener::get_generator);
-	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "generator", PROPERTY_HINT_RESOURCE_TYPE, "AudioStreamGenerator"), "", "get_generator");
-
 	ClassDB::bind_method(D_METHOD("play_on_audiostreamplayer", "audiostreamplayer"), &SteamAudioListener::play_on_audiostreamplayer);
 
 	ClassDB::bind_method(D_METHOD("get_reflection_simulation_enabled"), &SteamAudioListener::get_reflection_simulation_enabled);
@@ -31,8 +28,6 @@ void SteamAudioListener::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_mask", "mask"), &SteamAudioListener::set_mask);
 	ClassDB::bind_method(D_METHOD("get_range"), &SteamAudioListener::get_range);
 	ClassDB::bind_method(D_METHOD("set_range", "range"), &SteamAudioListener::set_range);
-	ClassDB::bind_method(D_METHOD("get_buffer_length"), &SteamAudioListener::get_buffer_length);
-	ClassDB::bind_method(D_METHOD("set_buffer_length", "buffer_length"), &SteamAudioListener::set_buffer_length);
 
 	ADD_GROUP("Reflection Simulation", "reflection_simulation_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "reflection_simulation_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_reflection_simulation_enabled", "get_reflection_simulation_enabled");
@@ -45,19 +40,11 @@ void SteamAudioListener::_bind_methods() {
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "mask", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_mask", "get_mask");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "range", PROPERTY_HINT_RANGE, "0.0,10000.0,0.1,or_greater"), "set_range", "get_range");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "buffer_length", PROPERTY_HINT_RANGE, "0.01,1.0,0.01"), "set_buffer_length", "get_buffer_length");
 }
 
 void SteamAudioListener::ready_internal() {
 	generator.instantiate();
-	generator->set_mix_rate(ProjectSettings::get_singleton()->get_setting("audio/driver/mix_rate"));
-	// we need at least the frame size of the SteamAudioServer as our buffer length, but
-	// to be on the safe side, we'll reserve more.
-	auto sas = SteamAudioServer::get_singleton();
-	float frame_size_seconds = (float)sas->get_frame_size() / (float)sas->get_sampling_rate();
-	generator->set_buffer_length(MAX(buffer_length, frame_size_seconds * 1.25f));
-
-	sas->add_listener(this);
+	SteamAudioServer::get_singleton()->add_listener(this);
 }
 
 void SteamAudioListener::_notification(int p_what) {
@@ -85,8 +72,8 @@ void SteamAudioListener::_notification(int p_what) {
 	}
 }
 
-Ref<AudioStreamGeneratorPlayback> SteamAudioListener::play_on_audiostreamplayer(godot::Variant audiostreamplayer) {
-	Ref<AudioStreamGeneratorPlayback> playback;
+Ref<AudioStreamSteamAudioListenerPlayback> SteamAudioListener::play_on_audiostreamplayer(Variant audiostreamplayer) {
+	Ref<AudioStreamSteamAudioListenerPlayback> playback;
 	if (!generator.is_valid()) {
 		ERR_PRINT("SteamAudioListener: generator is invalid, the SteamAudioListener has to be added to the tree before calling play_on_audiostreamplayer.");
 		return playback;
@@ -104,6 +91,9 @@ Ref<AudioStreamGeneratorPlayback> SteamAudioListener::play_on_audiostreamplayer(
 		playback = audiostreamplayer.call("play_stream", generator);
 	}
 	if (playback.is_valid()) {
+		// the output buffer should just be 2 times the frame size (so it can essentially
+		// fit 2 rounds of steam simulation mixed audio)
+		playback->set_buffer_size(SteamAudioServer::get_singleton()->get_frame_size() * 2);
 		SteamAudioServer::get_singleton()->add_playback_to_listener(this, playback);
 	}
 	else {

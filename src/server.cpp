@@ -91,12 +91,12 @@ void SteamAudioServer::register_settings() {
 	auto ps = ProjectSettings::get_singleton();
 	if (!ps->has_setting("steamaudio/max_ambisonics_order"))
 		ps->set_setting("steamaudio/max_ambisonics_order", 1);
-	if (!ps->has_setting("steamaudio/reflections/max_rays"))
-		ps->set_setting("steamaudio/reflections/max_rays", 512);
-	if (!ps->has_setting("steamaudio/reflections/num_bounces"))
-		ps->set_setting("steamaudio/reflections/num_bounces", 1);
+	if (!ps->has_setting("steamaudio/max_rays"))
+		ps->set_setting("steamaudio/max_rays", 512);
+	if (!ps->has_setting("steamaudio/num_bounces"))
+		ps->set_setting("steamaudio/num_bounces", 1);
 	if (!ps->has_setting("steamaudio/scene_type"))
-		ps->set_setting("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT);
+		ps->set_setting("steamaudio/scene_type", IPL_SCENETYPE_EMBREE);
 	if (!ps->has_setting("steamaudio/max_occlusion_samples"))
 		ps->set_setting("steamaudio/max_occlusion_samples", 64);
 }
@@ -174,13 +174,15 @@ String SteamAudioServer::get_source_debug_string(int index) {
 	String s;
 	s += "mixed_frames_ready: " + String::num_int64(sd.mixed_frames_ready) + "/" + String::num_int64(frame_size) + "\n";
 	s += "pending_consumers: " + String::num_int64(sd.pending_consumers) + "\n";
+	s += "debug_times_mixed: " + String::num_int64(sd.debug_times_mixed) + "\n";
 	s += "playbacks: " + String::num_int64((int)sd.playbacks.size()) + "\n";
 	for (uint32_t i = 0; i < sd.playbacks.size(); ++i) {
 		auto &pb = sd.playbacks[i];
 		s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
 		s += " vol=" + String::num(pb.volume_linear, 3);
 		s += " pitch=" + String::num(pb.pitch_scale, 3);
-		s += " mixed_too_much=" + String::num_int64(pb.num_mixed_too_much_last_round) + "\n";
+		s += " num_mixed=" + String::num_int64(pb.debug_num_mixed);
+		s += " mixed_in_mixed_frames=" + String::num_int64(pb.num_mixed_in_current_mixed_frames) + "\n";
 	}
 	s += "effect_instances: " + String::num_int64((int)sd.effect_instances.size()) + "\n";
 	s += "listener_data: " + String::num_int64((int)sd.listener_data.size()) + "\n";
@@ -190,8 +192,9 @@ String SteamAudioServer::get_source_debug_string(int index) {
 		s += "  sld[" + String::num_int64(i) + "] listener=" + lname;
 		s += " dist=" + String::num(sld.dist_to_listener, 2);
 		s += " doppler=" + String::num(sld.doppler_pitch, 3);
-		s += " oor=" + String(sld.out_of_range ? "yes" : "no");
+		s += " OutOfRange=" + String(sld.out_of_range ? "yes" : "no");
 		s += " last_gen=" + String::num_int64(sld.last_contributed_generation);
+		s += " times_contributed=" + String::num_int64(sld.debug_times_contributed);
  	s += "\n";
 	}
 	return s;
@@ -207,6 +210,7 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 	String s;
 	s += "pending_contributors: " + String::num_int64(ld.pending_contributors) + "\n";
 	s += "pending_drains: " + String::num_int64(ld.pending_drains) + "\n";
+	s += "times_pushed: " + String::num_int64(ld.debug_times_pushed) + "\n";
 	s += "generation: " + String::num_int64(ld.generation) + "\n";
 	s += "push_buffer size: " + String::num_int64((int)ld.push_buffer.size()) + "/" + String::num_int64(frame_size) + "\n";
 	{
@@ -216,7 +220,8 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 			auto &pb = ld.playbacks[i];
 			s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
 			s += " remaining=" + String::num_int64(pb.remaining_from_push_buffer);
-			s += " avail=" + String::num_int64(pb.playback->get_frames_available()) + "\n";
+			s += " times_drained=" + String::num_int64(pb.debug_times_drained);
+			s += " avail=" + String::num_int64(pb.playback->get_free_buffer_size()) + "\n";
 		}
 	}
 	s += "has_simulator: " + String(ld.simulator ? "yes" : "no") + "\n";
@@ -622,9 +627,9 @@ void SteamAudioServer::simulation_thread_func() {
 void SteamAudioServer::mixing_thread_func() {
 	using clock = std::chrono::steady_clock;
 	auto wait_time = std::chrono::milliseconds(
-		5
+		1
 	);
-	auto spin_threshold = std::chrono::milliseconds(1);
+	auto spin_threshold = std::chrono::microseconds(500);
 	while (is_running.load()) {
 		auto start = clock::now();
 		process_audio();
@@ -886,11 +891,12 @@ void SteamAudioServer::process_audio() {
 				auto &pb = ld.playbacks[i];
 				if (pb.remaining_from_push_buffer <= 0)
 					continue;
-				if (pb.playback->can_push_buffer(pb.remaining_from_push_buffer)) {
+				int free_available_in_buffer = pb.playback->get_free_buffer_size();
+				if (pb.remaining_from_push_buffer <= free_available_in_buffer) {
 					pb.playback->push_buffer(ld.push_buffer.slice(frame_size - pb.remaining_from_push_buffer));
 					pb.remaining_from_push_buffer = 0;
 				} else {
-					int num_to_push = MIN(pb.remaining_from_push_buffer, pb.playback->get_frames_available());
+					int num_to_push = MIN(pb.remaining_from_push_buffer, free_available_in_buffer);
 					if (num_to_push > 0) {
 						int start = frame_size - pb.remaining_from_push_buffer;
 						pb.playback->push_buffer(ld.push_buffer.slice(start, start + num_to_push));
@@ -903,6 +909,7 @@ void SteamAudioServer::process_audio() {
 
 			// All playbacks drained — clear buffer and recount contributors.
 			if (ld.pending_drains <= 0) {
+				ld.debug_times_pushed += 1;
 				ld.pending_drains = 0;
 				ld.push_buffer.fill(Vector2(0, 0));
 				ld.generation++;
@@ -944,6 +951,11 @@ void SteamAudioServer::process_audio() {
 			if (sd.mixed_frames_ready >= frame_size) {
 				sd.mixed_frames.fill(Vector2(0, 0));
 				sd.mixed_frames_ready = 0;
+				for (auto &pb : sd.playbacks) {
+					pb.num_mixed_in_current_mixed_frames = 0;
+				}
+
+				sd.debug_times_mixed += 1;
 			}
 
 			// Already full (shouldn't happen after reset above)
@@ -964,35 +976,25 @@ void SteamAudioServer::process_audio() {
 				int pull_num_frames = frame_size - sd.mixed_frames_ready;
 				int min_frames_ready = frame_size;
 				for (auto &pb : sd.playbacks) {
-					if (pb.num_mixed_too_much_last_round >= pull_num_frames)
+					if (pb.num_mixed_in_current_mixed_frames >= frame_size)
 						continue;
-					int to_pull = pull_num_frames - pb.num_mixed_too_much_last_round;
+					int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
 					const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, to_pull);
-					int pulled = MIN((int)frames.size(), to_pull);
-					if (pulled != to_pull) {
-						UtilityFunctions::print("playback should have pulled ", to_pull, " but got ", pulled);
-					}
+					pb.debug_num_mixed += frames.size();
 
-					int mixed_index = sd.mixed_frames_ready + pb.num_mixed_too_much_last_round;
+					int pulled = MIN((int)frames.size(), to_pull);
+
+					int mixed_index = pb.num_mixed_in_current_mixed_frames;
 					for (int frames_index = 0; frames_index < pulled; ++frames_index) {
+						if (mixed_index >= frame_size)
+							break; // precaution, but should really not happen...
 						sd.mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear;
 						++mixed_index;
 					}
 					min_frames_ready = MIN(min_frames_ready, mixed_index);
-					// Temporarily store total mixed index; corrected in second loop below
-					pb.num_mixed_too_much_last_round = mixed_index;
+					pb.num_mixed_in_current_mixed_frames = mixed_index;
 				}
 				sd.mixed_frames_ready = min_frames_ready;
-				for (auto &pb : sd.playbacks) {
-					pb.num_mixed_too_much_last_round -= min_frames_ready;
-					if (pb.num_mixed_too_much_last_round > 0) {
-						UtilityFunctions::print("num mixed too much: ", pb.num_mixed_too_much_last_round);
-					}
-					else if (pb.num_mixed_too_much_last_round < 0) {
-						UtilityFunctions::print("num_mixed_too_much was < 0! value: ", pb.num_mixed_too_much_last_round);
-						pb.num_mixed_too_much_last_round = 0;
-					}
-				}
 			}
 
 			if (!sd.effect_instances.is_empty()) {
@@ -1161,6 +1163,9 @@ void SteamAudioServer::process_audio() {
 				}
 				// Mark contributed and decrement counters
 				sld->last_contributed_generation = ld.generation;
+
+				sld->debug_times_contributed += 1;
+
 				if (ld.pending_contributors > 0)
 					ld.pending_contributors--;
 				if (sd.pending_consumers > 0)
@@ -1288,12 +1293,14 @@ void SteamAudioServer::process_audio() {
 					auto &pb = ld.playbacks[i];
 					pb.remaining_from_push_buffer = frame_size;
 					ld.pending_drains++;
-					if (pb.playback->can_push_buffer(frame_size)) {
+					int free_available_in_buffer = pb.playback->get_free_buffer_size();
+					if (frame_size <= free_available_in_buffer) {
 						pb.playback->push_buffer(ld.push_buffer);
 						pb.remaining_from_push_buffer = 0;
 						ld.pending_drains--;
+						pb.debug_times_drained += 1;
 					} else {
-						int num_to_push = MIN(frame_size, pb.playback->get_frames_available());
+						int num_to_push = MIN(frame_size, free_available_in_buffer);
 						if (num_to_push > 0) {
 							pb.playback->push_buffer(ld.push_buffer.slice(0, num_to_push));
 							pb.remaining_from_push_buffer -= num_to_push;
@@ -1303,6 +1310,7 @@ void SteamAudioServer::process_audio() {
 
 				// All playbacks consumed immediately — clear and recount contributors
 				if (ld.pending_drains <= 0) {
+					ld.debug_times_pushed += 1;
 					ld.pending_drains = 0;
 					ld.push_buffer.fill(Vector2(0, 0));
 					ld.generation++;
@@ -1362,7 +1370,7 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 	}
 }
 
-void SteamAudioServer::add_playback_to_listener(SteamAudioListener *listener, godot::Ref<godot::AudioStreamGeneratorPlayback> playback) {
+void SteamAudioServer::add_playback_to_listener(SteamAudioListener *listener, godot::Ref<AudioStreamSteamAudioListenerPlayback> playback) {
 	PROFILE_FUNCTION();
 	std::lock_guard lock(pending_ops_mutex);
 	pending_ops.push_back(PendingAddPlaybackToListener{ listener, playback });

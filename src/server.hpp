@@ -2,8 +2,6 @@
 #define STEAM_AUDIO_SERVER_H
 
 #include "godot_cpp/classes/audio_effect_instance.hpp"
-#include "godot_cpp/classes/audio_frame.hpp"
-#include "godot_cpp/classes/audio_stream_generator_playback.hpp"
 #include "godot_cpp/classes/node3d.hpp"
 #include "godot_cpp/classes/object.hpp"
 #include "godot_cpp/classes/thread.hpp"
@@ -19,6 +17,9 @@
 #include <variant>
 #include <vector>
 
+#include "AudioStreamSteamAudioListener.h"
+#include "godot_cpp/classes/audio_stream_playback.hpp"
+
 namespace godot {
 class AudioStream;
 }
@@ -26,8 +27,10 @@ class SteamAudioListener;
 class SteamAudioSource;
 
 struct ListenerPlaybackEntry {
-	godot::Ref<godot::AudioStreamGeneratorPlayback> playback;
+	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
 	int remaining_from_push_buffer = 0;
+
+	uint32_t debug_times_drained = 0;
 };
 
 struct ListenerData {
@@ -61,6 +64,8 @@ struct ListenerData {
 	IPLCoordinateSpace3 cached_coords{};
 	godot::Transform3D last_trf;
 	bool dirty = false;
+
+	uint32_t debug_times_pushed = 0;
 };
 
 struct SourceListenerData {
@@ -79,13 +84,17 @@ struct SourceListenerData {
 	IPLAudioBuffer input_buffer{};
 	IPLAudioBuffer output_buffer{};
 	IPLAudioBuffer ambisonics_buffer{};
+
+	uint32_t debug_times_contributed = 0;
 };
 
 struct SourcePlaybackEntry {
 	godot::Ref<godot::AudioStreamPlayback> playback;
-	int num_mixed_too_much_last_round = 0;
+	int num_mixed_in_current_mixed_frames = 0;
 	float volume_linear = 1.0f;
 	float pitch_scale = 1.0f;
+
+	uint32_t debug_num_mixed = 0;
 };
 
 struct SourceData {
@@ -109,6 +118,8 @@ struct SourceData {
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
 	godot::Transform3D last_trf;
+
+	uint32_t debug_times_mixed = 0;
 };
 
 struct DynamicGeometryData {
@@ -155,7 +166,7 @@ struct PendingAddPlaybackToSource {
 
 struct PendingAddPlaybackToListener {
 	SteamAudioListener *listener;
-	godot::Ref<godot::AudioStreamGeneratorPlayback> playback;
+	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
 };
 
 using PendingOp = std::variant<
@@ -238,7 +249,7 @@ public:
 
 	// Listener management
 	void add_listener(SteamAudioListener *listener);
-	void add_playback_to_listener(SteamAudioListener *listener, godot::Ref<godot::AudioStreamGeneratorPlayback> playback);
+	void add_playback_to_listener(SteamAudioListener *listener, godot::Ref<AudioStreamSteamAudioListenerPlayback> playback);
 	void remove_listener(SteamAudioListener *listener);
 
 	// Source management (for SteamAudioSource nodes)
