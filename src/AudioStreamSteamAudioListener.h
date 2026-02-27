@@ -16,8 +16,39 @@ protected:
 
     bool active = false;
     uint64_t mixed = 0;
-    bool fill_with_zero = true;
+	uint32_t num_underrun_samples = 0;
     godot::RingBuffer<godot::AudioFrame> ring_buffer;
+
+	// for the buffer underrun concealment logic
+	static constexpr int HISTORY_SIZE = 16;
+	godot::AudioFrame history[HISTORY_SIZE];
+	int history_pos = 0;
+	int history_count = 0;
+	inline void push_history(const godot::AudioFrame &frame)
+	{
+		history[history_pos] = frame;
+		history_pos = (history_pos + 1) % HISTORY_SIZE;
+
+		if (history_count < HISTORY_SIZE)
+			history_count++;
+	}
+
+	inline godot::AudioFrame get_history(int idx) const
+	{
+		// idx = 0 -> newest
+		int pos = history_pos - 1 - idx;
+		if (pos < 0)
+			pos += HISTORY_SIZE;
+
+		return history[pos];
+	}
+
+	float ar_a1 = 0.0f;
+	float ar_a2 = 0.0f;
+	void compute_ar2();
+
+	bool predictor_valid = false;
+	bool underrun_active = false;
 
 public:
     AudioStreamSteamAudioListenerPlayback();
@@ -26,7 +57,7 @@ public:
     bool push_buffer( const godot::PackedVector2Array& p_buffer );
     int get_free_buffer_size() const;
     int get_available_buffer_size() const;
-    void set_fill_with_zero(bool fwz) { fill_with_zero = fwz; }
+	uint32_t get_num_underrun_samples() const { return num_underrun_samples; }
 
     void _start( double p_from_pos ) override;
     void _stop() override;

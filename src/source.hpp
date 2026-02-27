@@ -32,9 +32,6 @@ private:
 	uint32_t layers = 1;
 
 	bool air_absorption_enabled = true;
-	float air_absorption_low = 0.7f;
-	float air_absorption_med = 0.4f;
-	float air_absorption_high = 0.2f;
 
 	bool occlusion_enabled = false;
 	int occlusion_type = IPL_OCCLUSIONTYPE_RAYCAST;
@@ -44,9 +41,6 @@ private:
 	bool transmission_enabled = false;
 	int transmission_type = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
 	int transmission_rays = 16;
-	float transmission_low = 0.3f;
-	float transmission_med = 0.1f;
-	float transmission_high = 0.05f;
 
 	bool reflection_enabled = false;
 	float reflection_duration = 2.0f;
@@ -99,21 +93,9 @@ public:
 	void set_transmission_type(int p_type) { transmission_type = p_type; }
 	int get_transmission_rays() const { return transmission_rays; }
 	void set_transmission_rays(int p_rays) { transmission_rays = p_rays; }
-	float get_transmission_low() const { return transmission_low; }
-	void set_transmission_low(float p_val) { transmission_low = p_val; }
-	float get_transmission_med() const { return transmission_med; }
-	void set_transmission_med(float p_val) { transmission_med = p_val; }
-	float get_transmission_high() const { return transmission_high; }
-	void set_transmission_high(float p_val) { transmission_high = p_val; }
 
 	bool get_air_absorption_enabled() const { return air_absorption_enabled; }
 	void set_air_absorption_enabled(bool p_enabled) { air_absorption_enabled = p_enabled; }
-	float get_air_absorption_low() const { return air_absorption_low; }
-	void set_air_absorption_low(float p_val) { air_absorption_low = p_val; }
-	float get_air_absorption_med() const { return air_absorption_med; }
-	void set_air_absorption_med(float p_val) { air_absorption_med = p_val; }
-	float get_air_absorption_high() const { return air_absorption_high; }
-	void set_air_absorption_high(float p_val) { air_absorption_high = p_val; }
 
 	bool get_distance_attenuation_enabled() const { return distance_attenuation_enabled; }
 	void set_distance_attenuation_enabled(bool p_enabled) { distance_attenuation_enabled = p_enabled; }

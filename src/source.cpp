@@ -42,21 +42,9 @@ void SteamAudioSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_transmission_type", "type"), &SteamAudioSource::set_transmission_type);
 	ClassDB::bind_method(D_METHOD("get_transmission_rays"), &SteamAudioSource::get_transmission_rays);
 	ClassDB::bind_method(D_METHOD("set_transmission_rays", "rays"), &SteamAudioSource::set_transmission_rays);
-	ClassDB::bind_method(D_METHOD("get_transmission_low"), &SteamAudioSource::get_transmission_low);
-	ClassDB::bind_method(D_METHOD("set_transmission_low", "val"), &SteamAudioSource::set_transmission_low);
-	ClassDB::bind_method(D_METHOD("get_transmission_med"), &SteamAudioSource::get_transmission_med);
-	ClassDB::bind_method(D_METHOD("set_transmission_med", "val"), &SteamAudioSource::set_transmission_med);
-	ClassDB::bind_method(D_METHOD("get_transmission_high"), &SteamAudioSource::get_transmission_high);
-	ClassDB::bind_method(D_METHOD("set_transmission_high", "val"), &SteamAudioSource::set_transmission_high);
 
 	ClassDB::bind_method(D_METHOD("get_air_absorption_enabled"), &SteamAudioSource::get_air_absorption_enabled);
 	ClassDB::bind_method(D_METHOD("set_air_absorption_enabled", "enabled"), &SteamAudioSource::set_air_absorption_enabled);
-	ClassDB::bind_method(D_METHOD("get_air_absorption_low"), &SteamAudioSource::get_air_absorption_low);
-	ClassDB::bind_method(D_METHOD("set_air_absorption_low", "val"), &SteamAudioSource::set_air_absorption_low);
-	ClassDB::bind_method(D_METHOD("get_air_absorption_med"), &SteamAudioSource::get_air_absorption_med);
-	ClassDB::bind_method(D_METHOD("set_air_absorption_med", "val"), &SteamAudioSource::set_air_absorption_med);
-	ClassDB::bind_method(D_METHOD("get_air_absorption_high"), &SteamAudioSource::get_air_absorption_high);
-	ClassDB::bind_method(D_METHOD("set_air_absorption_high", "val"), &SteamAudioSource::set_air_absorption_high);
 
 	ClassDB::bind_method(D_METHOD("get_distance_attenuation_enabled"), &SteamAudioSource::get_distance_attenuation_enabled);
 	ClassDB::bind_method(D_METHOD("set_distance_attenuation_enabled", "enabled"), &SteamAudioSource::set_distance_attenuation_enabled);
@@ -81,6 +69,10 @@ void SteamAudioSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_effect_stack", "stack"), &SteamAudioSource::set_effect_stack);
 
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "direct_enabled"), "set_direct_enabled", "get_direct_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dynamic_registration"), "set_dynamic_registration", "get_dynamic_registration");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "doppler_factor", PROPERTY_HINT_RANGE, "0.0,10.0,0.01"), "set_doppler_factor", "get_doppler_factor");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "layers", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_layers", "get_layers");
+	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "effect_stack", PROPERTY_HINT_TYPE_STRING, String::num(Variant::OBJECT) + "/" + String::num(PROPERTY_HINT_RESOURCE_TYPE) + ":AudioEffect"), "set_effect_stack", "get_effect_stack");
 
 	ADD_GROUP("Binaural", "binaural_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "binaural_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_binaural_enabled", "get_binaural_enabled");
@@ -92,15 +84,9 @@ void SteamAudioSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "distance_attenuation_min", PROPERTY_HINT_RANGE, "0.0,100.0,0.1"), "set_distance_attenuation_min", "get_distance_attenuation_min");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "distance_attenuation_max", PROPERTY_HINT_RANGE, "0.0,100.0,0.1"), "set_distance_attenuation_max", "get_distance_attenuation_max");
 
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "layers", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_layers", "get_layers");
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dynamic_registration"), "set_dynamic_registration", "get_dynamic_registration");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "doppler_factor", PROPERTY_HINT_RANGE, "0.0,10.0,0.01"), "set_doppler_factor", "get_doppler_factor");
 
 	ADD_GROUP("Air Absorption", "air_absorption_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "air_absorption_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_air_absorption_enabled", "get_air_absorption_enabled");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "air_absorption_low", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_air_absorption_low", "get_air_absorption_low");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "air_absorption_med", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_air_absorption_med", "get_air_absorption_med");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "air_absorption_high", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_air_absorption_high", "get_air_absorption_high");
 
 	ADD_GROUP("Occlusion", "occlusion_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "occlusion_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_occlusion_enabled", "get_occlusion_enabled");
@@ -112,16 +98,12 @@ void SteamAudioSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "transmission_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_transmission_enabled", "get_transmission_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "transmission_type", PROPERTY_HINT_ENUM, "Frequency Independent,Frequency Dependent"), "set_transmission_type", "get_transmission_type");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "transmission_rays"), "set_transmission_rays", "get_transmission_rays");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "transmission_low", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_transmission_low", "get_transmission_low");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "transmission_med", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_transmission_med", "get_transmission_med");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "transmission_high", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_transmission_high", "get_transmission_high");
 
 	ADD_GROUP("Reflection", "reflection_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "reflection_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_reflection_enabled", "get_reflection_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_duration"), "set_reflection_duration", "get_reflection_duration");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "reflection_hybrid_delay", PROPERTY_HINT_RANGE, "0.0,10.0,0.01"), "set_reflection_hybrid_delay", "get_reflection_hybrid_delay");
 
-	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "effect_stack", PROPERTY_HINT_TYPE_STRING, String::num(Variant::OBJECT) + "/" + String::num(PROPERTY_HINT_RESOURCE_TYPE) + ":AudioEffect"), "set_effect_stack", "get_effect_stack");
 
 	ADD_SIGNAL(MethodInfo("removed_from_simulation"));
 }

@@ -60,10 +60,6 @@ public:
 
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> play_on_audiostreamplayer(godot::Variant audiostreamplayer);
 
-	// Steam Audio objects for listener
-	IPLAmbisonicsPanningEffect panning_effect = nullptr;
-	IPLAmbisonicsBinauralEffect binaural_effect = nullptr;
-
 	godot::PackedStringArray _get_configuration_warnings() const override;
 
 private:

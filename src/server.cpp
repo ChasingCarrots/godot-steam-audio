@@ -94,7 +94,7 @@ void SteamAudioServer::register_settings() {
 	if (!ps->has_setting("steamaudio/max_rays"))
 		ps->set_setting("steamaudio/max_rays", 512);
 	if (!ps->has_setting("steamaudio/num_bounces"))
-		ps->set_setting("steamaudio/num_bounces", 1);
+		ps->set_setting("steamaudio/num_bounces", 8);
 	if (!ps->has_setting("steamaudio/scene_type"))
 		ps->set_setting("steamaudio/scene_type", IPL_SCENETYPE_EMBREE);
 	if (!ps->has_setting("steamaudio/max_occlusion_samples"))
@@ -221,7 +221,8 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 			s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
 			s += " remaining=" + String::num_int64(pb.remaining_from_push_buffer);
 			s += " times_drained=" + String::num_int64(pb.debug_times_drained);
-			s += " avail=" + String::num_int64(pb.playback->get_free_buffer_size()) + "\n";
+			s += " avail=" + String::num_int64(pb.playback->get_free_buffer_size());
+			s += " underruns=" + String::num_int64(pb.playback->get_num_underrun_samples()) + "\n";
 		}
 	}
 	s += "has_simulator: " + String(ld.simulator ? "yes" : "no") + "\n";
@@ -466,6 +467,10 @@ void SteamAudioServer::tick(float delta) {
 
 				// Range check with hysteresis
 				float listener_range = ld.listener->get_range();
+				// when the source doesn't have reflection enabled,
+				// we can also use the max distance of that
+				if (!sd.source_node->get_reflection_enabled())
+					listener_range = MIN(listener_range, sd.source_node->get_distance_attenuation_max());
 				if (listener_range > 0.0f) {
 					if (!sld->out_of_range && sld->dist_to_listener > listener_range * 1.1f) {
 						sld->out_of_range = true;
@@ -958,44 +963,62 @@ void SteamAudioServer::process_audio() {
 				sd.debug_times_mixed += 1;
 			}
 
-			// Already full (shouldn't happen after reset above)
-			if (sd.mixed_frames_ready >= frame_size)
+			// Clean up finished playbacks
+			for (int i = (int)sd.playbacks.size() - 1; i >= 0; --i) {
+				if (!sd.playbacks[i].playback->is_playing()) {
+					sd.playbacks.remove_at(i);
+				}
+			}
+
+			// quick check if there are any listeners that would actually
+			// consume the mixed data (skip mixing otherwise!)
+			bool skip_mixing = true;
+			for (auto &sld : sd.listener_data) {
+				if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
+					continue;
+				if (sld.out_of_range)
+					continue;
+				// Check if this listener has active (playing) playbacks
+				for (auto &ld : listeners) {
+					if (ld.listener == sld.listener) {
+						std::lock_guard pb_lock(*ld.playbacks_mutex);
+						for (auto &pb : ld.playbacks) {
+							if (pb.playback->is_playing()) {
+								skip_mixing = false;
+								break;
+							}
+						}
+						break;
+					}
+				}
+				if (!skip_mixing)
+					break;
+			}
+			if (skip_mixing)
 				continue;
 
-			{
-				// Clean up finished playbacks
-				for (int i = (int)sd.playbacks.size() - 1; i >= 0; --i) {
-					if (!sd.playbacks[i].playback->is_playing()) {
-						sd.playbacks.remove_at(i);
-					}
-				}
-			}
-
 			int prev_mixed_count = sd.mixed_frames_ready;
-			{
-				int pull_num_frames = frame_size - sd.mixed_frames_ready;
-				int min_frames_ready = frame_size;
-				for (auto &pb : sd.playbacks) {
-					if (pb.num_mixed_in_current_mixed_frames >= frame_size)
-						continue;
-					int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
-					const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, to_pull);
-					pb.debug_num_mixed += frames.size();
+			int min_frames_ready = frame_size;
+			for (auto &pb : sd.playbacks) {
+				if (pb.num_mixed_in_current_mixed_frames >= frame_size)
+					continue;
+				int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
+				const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, to_pull);
+				pb.debug_num_mixed += frames.size();
 
-					int pulled = MIN((int)frames.size(), to_pull);
+				int pulled = MIN((int)frames.size(), to_pull);
 
-					int mixed_index = pb.num_mixed_in_current_mixed_frames;
-					for (int frames_index = 0; frames_index < pulled; ++frames_index) {
-						if (mixed_index >= frame_size)
-							break; // precaution, but should really not happen...
-						sd.mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear;
-						++mixed_index;
-					}
-					min_frames_ready = MIN(min_frames_ready, mixed_index);
-					pb.num_mixed_in_current_mixed_frames = mixed_index;
+				int mixed_index = pb.num_mixed_in_current_mixed_frames;
+				for (int frames_index = 0; frames_index < pulled; ++frames_index) {
+					if (mixed_index >= frame_size)
+						break; // precaution, but should really not happen...
+					sd.mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear;
+					++mixed_index;
 				}
-				sd.mixed_frames_ready = min_frames_ready;
+				min_frames_ready = MIN(min_frames_ready, mixed_index);
+				pb.num_mixed_in_current_mixed_frames = mixed_index;
 			}
+			sd.mixed_frames_ready = min_frames_ready;
 
 			if (!sd.effect_instances.is_empty()) {
 				PROFILE_FUNCTION_NAMED("Effect Stack Processing");
@@ -1187,16 +1210,15 @@ void SteamAudioServer::process_audio() {
 					if (sd.source_node->get_transmission_enabled()) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
 						direct_params.transmissionType = static_cast<IPLTransmissionType>(sd.source_node->get_transmission_type());
-						direct_params.transmission[0] = sd.source_node->get_transmission_low();
-						direct_params.transmission[1] = sd.source_node->get_transmission_med();
-						direct_params.transmission[2] = sd.source_node->get_transmission_high();
 					}
 
 					if (sd.source_node->get_air_absorption_enabled()) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
-						direct_params.airAbsorption[0] = sd.source_node->get_air_absorption_low();
-						direct_params.airAbsorption[1] = sd.source_node->get_air_absorption_med();
-						direct_params.airAbsorption[2] = sd.source_node->get_air_absorption_high();
+
+						IPLAirAbsorptionModel airAbsorptionModel{};
+						airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+
+						iplAirAbsorptionCalculate(phonon_context, sd.cached_coords.origin, ld.cached_coords.origin, &airAbsorptionModel, direct_params.airAbsorption);
 					}
 
 					if (sd.source_node->get_distance_attenuation_enabled()) {
