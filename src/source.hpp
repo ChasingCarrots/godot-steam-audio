@@ -28,7 +28,7 @@ private:
 
 	bool distance_attenuation_enabled = true;
 	float distance_attenuation_min = 1.0f;
-	float distance_attenuation_max = 60.0f;
+	float distance_attenuation_max = 120.0f;
 	uint32_t layers = 1;
 
 	bool air_absorption_enabled = true;

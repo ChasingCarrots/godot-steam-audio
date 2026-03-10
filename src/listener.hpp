@@ -10,9 +10,32 @@
 #include <vector>
 
 #include "AudioStreamSteamAudioListener.h"
+#include "lib/steamaudio/core/src/core/array.h"
+#include "lib/steamaudio/core/src/core/vector.h"
+
+class SteamAudioSource;
+
+class SteamAudioListenerSensorSlot : public godot::RefCounted {
+	GDCLASS(SteamAudioListenerSensorSlot, godot::RefCounted);
+protected:
+	static void _bind_methods();
+
+	SteamAudioSource *source_node;
+	godot::Vector3 position;
+	float db_level;
+public:
+	void set_steam_audio_source(SteamAudioSource *p_source_node);
+	SteamAudioSource *get_steam_audio_source();
+	void set_position(const godot::Vector3 &p_position);
+	godot::Vector3 get_position();
+	void set_db_level(float db_level);
+	float get_db_level();
+};
 
 class SteamAudioListener : public godot::Node3D {
 	GDCLASS(SteamAudioListener, godot::Node3D);
+protected:
+	static void _bind_methods();
 
 private:
 	bool reflection_simulation_enabled = true;
@@ -24,12 +47,9 @@ private:
 	float irradiance_min_dist = 1.0f;
 	uint32_t mask = 1;
 	float range = 0.0f;
+	godot::Ref<AudioStreamSteamAudioListener> generator;
 
 	void ready_internal();
-
-protected:
-	static void _bind_methods();
-
 public:
 	SteamAudioListener();
 	~SteamAudioListener();
@@ -58,12 +78,17 @@ public:
 	bool get_reflection_simulation_enabled() { return reflection_simulation_enabled; }
 	void set_reflection_simulation_enabled(bool p_enabled) { reflection_simulation_enabled = p_enabled; }
 
+	void set_num_source_db_sensor_slots(int p_num_source_db_sensor_slots);
+	int get_num_source_db_sensor_slots();
+	godot::Ref<SteamAudioListenerSensorSlot> get_sensor_slot(int p_sensor_slot);
+	godot::Array get_sensor_slots() const;
+
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> play_on_audiostreamplayer(godot::Variant audiostreamplayer);
 
 	godot::PackedStringArray _get_configuration_warnings() const override;
 
 private:
-	godot::Ref<AudioStreamSteamAudioListener> generator;
+	std::vector<godot::Ref<SteamAudioListenerSensorSlot>> sensor_slots;
 };
 
 #endif // STEAM_AUDIO_LISTENER_HPP

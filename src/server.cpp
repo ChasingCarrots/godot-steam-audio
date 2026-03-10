@@ -16,6 +16,22 @@ using namespace godot;
 
 SteamAudioServer *SteamAudioServer::self = nullptr;
 
+static float calculate_attenuation(float dist, float min_dist, float max_dist) {
+	if (dist <= min_dist) {
+		return 1.0f;
+	} else if (dist >= max_dist) {
+		return 0.0f;
+	} else {
+		// Inverse-distance falloff: min_dist / dist
+		// At min_dist → 1.0, approaches 0 as dist grows
+		// Normalized so it reaches 0 at max_dist
+		float inv_falloff = min_dist / dist;
+		float inv_at_max = min_dist / max_dist;
+		// Remap [inv_at_max, 1.0] → [0.0, 1.0]
+		return (inv_falloff - inv_at_max) / (1.0f - inv_at_max);
+	}
+}
+
 static int get_project_int(const String &key, int def) {
 	Variant v = ProjectSettings::get_singleton()->get_setting(key);
 	if (v.get_type() == Variant::NIL)
@@ -225,6 +241,19 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 			s += " underruns=" + String::num_int64(pb.playback->get_num_underrun_samples()) + "\n";
 		}
 	}
+	s += "source_db_levels: " + String::num_int64((int)ld.source_db_levels.size()) + "\n";
+	for (uint32_t i = 0; i < ld.source_db_levels.size(); ++i) {
+		auto &sldb = ld.source_db_levels[i];
+		s += "  " + String(sldb.source->get_name()) + ": db_level=" + String::num_real(sldb.db_level) + "\n";
+	}
+	if (ld.listener->get_num_source_db_sensor_slots() > 0) {
+		s += "source_db_sensor_slots: " + String::num_int64((int)ld.listener->get_num_source_db_sensor_slots()) + "\n";
+		for (uint32_t i = 0; i < ld.listener->get_num_source_db_sensor_slots(); ++i) {
+			const auto& slot = ld.listener->get_sensor_slot(i);
+			String name = slot->get_steam_audio_source() ? String(slot->get_steam_audio_source()->get_name()) : "<null>";
+			s += "  slot[" + String::num_int64(i) + "]: " + name + " db=" + String::num_real(slot->get_db_level()) + "\n";
+		}
+	}
 	s += "has_simulator: " + String(ld.simulator ? "yes" : "no") + "\n";
 	s += "dirty: " + String(ld.dirty ? "yes" : "no") + "\n";
 	return s;
@@ -263,7 +292,6 @@ void SteamAudioServer::init() {
 	scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
 	if (scene_cfg.type == IPL_SCENETYPE_EMBREE) {
 		IPLEmbreeDeviceSettings embree_cfg{};
-		IPLEmbreeDevice embree_dev;
 		iplEmbreeDeviceCreate(phonon_context, &embree_cfg, &embree_dev);
 		scene_cfg.embreeDevice = embree_dev;
 	}
@@ -574,6 +602,138 @@ void SteamAudioServer::tick(float delta) {
 			if (!ld.simulator)
 				continue;
 			iplSimulatorRunDirect(ld.simulator);
+
+			{
+				PROFILE_FUNCTION_NAMED("updating_source_db_levels");
+				static LocalVector<Ref<SteamAudioListenerSensorSlot>> temp_sensor_slots;
+				temp_sensor_slots.resize(ld.listener->get_num_source_db_sensor_slots());
+				for (int source_slot_index = 0; source_slot_index < ld.listener->get_num_source_db_sensor_slots(); ++source_slot_index) {
+					temp_sensor_slots[source_slot_index] = ld.listener->get_sensor_slot(source_slot_index);
+					// decay dB level
+					float current_db = temp_sensor_slots[source_slot_index]->get_db_level();
+					current_db -= delta * 30.0f; // decay by 30 dB per second
+					if (current_db < -60.0f) {
+						temp_sensor_slots[source_slot_index]->set_db_level(-500.0f);
+						temp_sensor_slots[source_slot_index]->set_steam_audio_source(nullptr);
+					} else {
+						temp_sensor_slots[source_slot_index]->set_db_level(current_db);
+					}
+				}
+				// update source db levels
+				ld.source_db_levels.clear();
+				for (auto &sd : sources) {
+					for (auto &sld : sd.listener_data) {
+						if (sld.listener != ld.listener)
+							continue;
+						if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
+							continue;
+						if (sld.out_of_range)
+							continue;
+						IPLSimulationOutputs outputs{};
+						iplSourceGetOutputs(sld.source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+
+						ListenerSourceDBLevel source_db_level;
+						source_db_level.source = sd.source_node;
+						source_db_level.position = sd.source_node->get_global_position();
+						source_db_level.db_level = sd.current_db_level;
+						IPLDirectEffectParams direct_params = outputs.direct;
+						float total_direct_factor = 1.0f;
+
+						if (sd.source_node->get_occlusion_enabled()) {
+							float occlusion = direct_params.occlusion;
+							float transmission = 0.0f;
+							if (sd.source_node->get_transmission_enabled()) {
+								transmission = (direct_params.transmission[0] + direct_params.transmission[1] + direct_params.transmission[2]) / 3.0f;
+							}
+							// Total direct sound = sound that goes around (occlusion) + sound that goes through (transmission)
+							// We assume transmission only applies to the occluded part.
+							total_direct_factor *= (occlusion + (1.0f - occlusion) * transmission);
+						}
+
+						if (sd.source_node->get_air_absorption_enabled()) {
+							IPLAirAbsorptionModel airAbsorptionModel{};
+							airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+							float air_absorption[3];
+							iplAirAbsorptionCalculate(phonon_context, sd.cached_coords.origin, ld.cached_coords.origin, &airAbsorptionModel, air_absorption);
+							float avg_air_absorption = (air_absorption[0] + air_absorption[1] + air_absorption[2]) / 3.0f;
+							total_direct_factor *= avg_air_absorption;
+						}
+
+						if (sd.source_node->get_distance_attenuation_enabled()) {
+							float dist = sld.dist_to_listener;
+							float min_dist = sd.source_node->get_distance_attenuation_min();
+							float max_dist = sd.source_node->get_distance_attenuation_max();
+							float attenuation = calculate_attenuation(dist, min_dist, max_dist);
+							total_direct_factor *= attenuation;
+						}
+
+						float final_db_level = source_db_level.db_level + 20.0f * Math::log(MAX(total_direct_factor, 1e-10f)) / Math::log(10.0f);
+						source_db_level.db_level = final_db_level;
+						ld.source_db_levels.push_back(source_db_level);
+						
+						if (final_db_level < -60.0f || temp_sensor_slots.is_empty())
+							continue;
+
+						// the following will update the sensor slots on the SteamAudioListener!
+
+						// update/insert current source in sensor slots if it's loud enough
+						int num_slots = (int)temp_sensor_slots.size();
+
+						// first check if the source is already in a slot
+						int existing_slot_index = -1;
+						for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
+							if (temp_sensor_slots[slot_index]->get_steam_audio_source() == sd.source_node) {
+								existing_slot_index = slot_index;
+								break;
+							}
+						}
+
+						if (existing_slot_index != -1) {
+							// source already exists, update it if the new level is higher
+							if (final_db_level > temp_sensor_slots[existing_slot_index]->get_db_level()) {
+								temp_sensor_slots[existing_slot_index]->set_db_level(final_db_level);
+								temp_sensor_slots[existing_slot_index]->set_position(sd.source_node->get_global_position());
+
+								// check if it needs to move up (becoming louder)
+								int current_slot = existing_slot_index;
+								while (current_slot > 0 && temp_sensor_slots[current_slot]->get_db_level() > temp_sensor_slots[current_slot - 1]->get_db_level()) {
+									// swap values with the slot above it
+									SteamAudioSource *prev_source = temp_sensor_slots[current_slot - 1]->get_steam_audio_source();
+									Vector3 prev_position = temp_sensor_slots[current_slot - 1]->get_position();
+									float prev_db = temp_sensor_slots[current_slot - 1]->get_db_level();
+
+									temp_sensor_slots[current_slot - 1]->set_steam_audio_source(temp_sensor_slots[current_slot]->get_steam_audio_source());
+									temp_sensor_slots[current_slot - 1]->set_position(temp_sensor_slots[current_slot]->get_position());
+									temp_sensor_slots[current_slot - 1]->set_db_level(temp_sensor_slots[current_slot]->get_db_level());
+
+									temp_sensor_slots[current_slot]->set_steam_audio_source(prev_source);
+									temp_sensor_slots[current_slot]->set_position(prev_position);
+									temp_sensor_slots[current_slot]->set_db_level(prev_db);
+
+									current_slot--;
+								}
+							}
+						} else {
+							for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
+								if (final_db_level > temp_sensor_slots[slot_index]->get_db_level()) {
+									// shift down remaining
+									for (int shift_index = num_slots - 1; shift_index > slot_index; --shift_index) {
+										temp_sensor_slots[shift_index]->set_steam_audio_source(temp_sensor_slots[shift_index - 1]->get_steam_audio_source());
+										temp_sensor_slots[shift_index]->set_position(temp_sensor_slots[shift_index - 1]->get_position());
+										temp_sensor_slots[shift_index]->set_db_level(temp_sensor_slots[shift_index - 1]->get_db_level());
+									}
+									temp_sensor_slots[slot_index]->set_steam_audio_source(sd.source_node);
+									temp_sensor_slots[slot_index]->set_position(sd.source_node->get_global_position());
+									temp_sensor_slots[slot_index]->set_db_level(final_db_level);
+									break;
+								}
+							}
+						}
+
+					}
+				}
+				temp_sensor_slots.clear();
+			}
 		}
 	}
 
@@ -1064,6 +1224,19 @@ void SteamAudioServer::process_audio() {
 						}
 					}
 				}
+
+				// Calculate dB level for current mix
+				float sum_sq = 0.0f;
+				for (int i = 0; i < frame_size; ++i) {
+					sum_sq += sd.mixed_frames[i].x * sd.mixed_frames[i].x;
+					sum_sq += sd.mixed_frames[i].y * sd.mixed_frames[i].y;
+				}
+				float rms = sqrtf(sum_sq / (frame_size * 2));
+				if (rms > 0.000001f) {
+					sd.current_db_level = 20.0f * log10f(rms);
+				} else {
+					sd.current_db_level = -200; // Silenced/Noise floor
+				}
 			}
 		}
 	}
@@ -1228,8 +1401,8 @@ void SteamAudioServer::process_audio() {
 						float min_dist = sd.source_node->get_distance_attenuation_min();
 						float max_dist = sd.source_node->get_distance_attenuation_max();
 
-						float attenuation = 1.0f - CLAMP(Math::inverse_lerp(min_dist, max_dist, dist), 0.0f, 1.0f);
-						direct_params.distanceAttenuation = attenuation * attenuation;
+						float attenuation = calculate_attenuation(dist, min_dist, max_dist);
+						direct_params.distanceAttenuation = attenuation;
 					} else {
 						direct_params.distanceAttenuation = 1.0f;
 					}
@@ -1404,6 +1577,15 @@ void SteamAudioServer::remove_listener(SteamAudioListener *listener) {
 	pending_ops.push_back(PendingRemoveListener{ listener });
 }
 
+const LocalVector<ListenerSourceDBLevel>& SteamAudioServer::get_source_db_levels_for_listener(SteamAudioListener *listener) {
+	for (const auto& ld : listeners) {
+		if ( ld.listener == listener )
+			return ld.source_db_levels;
+	}
+	static LocalVector<ListenerSourceDBLevel> empty;
+	return empty;
+}
+
 void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 	PROFILE_FUNCTION();
 
@@ -1547,7 +1729,12 @@ void SteamAudioServer::add_dynamic_geometry(Node *p_node, Ref<SteamAudioMaterial
 	dg.node = node3d;
 
 	IPLSceneSettings sub_scene_cfg{};
+	sub_scene_cfg.radeonRaysDevice = nullptr;
 	sub_scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+	if (sub_scene_cfg.type == IPL_SCENETYPE_EMBREE) {
+		ERR_FAIL_COND_MSG(embree_dev == nullptr, "ERROR: steam audio add_dynamic_geometry with scene_type IPL_SCENETYPE_EMBREE and uninitialized embree device.");
+		sub_scene_cfg.embreeDevice = embree_dev;
+	}
 	if (!handleErr(iplSceneCreate(phonon_context, &sub_scene_cfg, &dg.sub_scene), "SteamAudio: Failed to create sub-scene")) {
 		return;
 	}

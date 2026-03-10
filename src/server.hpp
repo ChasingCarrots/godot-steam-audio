@@ -33,6 +33,12 @@ struct ListenerPlaybackEntry {
 	uint32_t debug_times_drained = 0;
 };
 
+struct ListenerSourceDBLevel {
+	SteamAudioSource* source;
+	godot::Vector3 position;
+	float db_level = 0.0f;
+};
+
 struct ListenerData {
 	SteamAudioListener *listener = nullptr;
 	IPLSimulator simulator = nullptr;
@@ -59,6 +65,8 @@ struct ListenerData {
 	// Multiple playbacks per listener, protected by playbacks_mutex
 	godot::LocalVector<ListenerPlaybackEntry> playbacks;
 	std::unique_ptr<std::mutex> playbacks_mutex = std::make_unique<std::mutex>();
+
+	godot::LocalVector<ListenerSourceDBLevel> source_db_levels;
 
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
@@ -111,6 +119,8 @@ struct SourceData {
 	// Set when mixed_frames_ready == frame_size, decremented as listeners consume.
 	// When it reaches 0, the source can reset and start a new mix.
 	int pending_consumers = 0;
+
+	float current_db_level = 0;
 
 	// AudioEffectInstances created from the source's effect stack
 	godot::LocalVector<godot::Ref<godot::AudioEffectInstance>> effect_instances;
@@ -190,6 +200,7 @@ private:
 	// HRTF is global for now, but could be per listener if needed.
 	// SteamAudio uses one HRTF for the context usually.
 	IPLHRTF phonon_hrtf = nullptr;
+	IPLEmbreeDevice embree_dev = nullptr;
 
 	std::atomic<bool> is_running;
 
@@ -251,6 +262,7 @@ public:
 	void add_listener(SteamAudioListener *listener);
 	void add_playback_to_listener(SteamAudioListener *listener, godot::Ref<AudioStreamSteamAudioListenerPlayback> playback);
 	void remove_listener(SteamAudioListener *listener);
+	const godot::LocalVector<ListenerSourceDBLevel>& get_source_db_levels_for_listener(SteamAudioListener *listener);
 
 	// Source management (for SteamAudioSource nodes)
 	void add_source(SteamAudioSource *source_node);

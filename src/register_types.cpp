@@ -11,7 +11,6 @@
 
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/scene_tree.hpp"
-#include "godot_cpp/variant/utility_functions.hpp"
 #include <gdextension_interface.h>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/defs.hpp>
@@ -34,6 +33,7 @@ void init_ext(ModuleInitializationLevel p_level) {
 
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
 		ClassDB::register_class<SteamAudioListener>();
+		ClassDB::register_class<SteamAudioListenerSensorSlot>();
 		ClassDB::register_class<SteamAudioSource>();
 		ClassDB::register_class<SteamAudioMaterial>();
 		ClassDB::register_class<SteamAudioGeometry>();

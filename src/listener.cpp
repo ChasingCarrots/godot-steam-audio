@@ -4,8 +4,29 @@
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/project_settings.hpp"
 #include "server.hpp"
+#include "source.hpp"
 
 using namespace godot;
+
+void SteamAudioListenerSensorSlot::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_steam_audio_source", "p_source_node"), &SteamAudioListenerSensorSlot::set_steam_audio_source);
+	ClassDB::bind_method(D_METHOD("get_steam_audio_source"), &SteamAudioListenerSensorSlot::get_steam_audio_source);
+	ClassDB::bind_method(D_METHOD("set_position", "p_position"), &SteamAudioListenerSensorSlot::set_position);
+	ClassDB::bind_method(D_METHOD("get_position"), &SteamAudioListenerSensorSlot::get_position);
+	ClassDB::bind_method(D_METHOD("set_db_level", "db_level"), &SteamAudioListenerSensorSlot::set_db_level);
+	ClassDB::bind_method(D_METHOD("get_db_level"), &SteamAudioListenerSensorSlot::get_db_level);
+
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "steam_audio_source", PROPERTY_HINT_NODE_TYPE, "SteamAudioSource"), "set_steam_audio_source", "get_steam_audio_source");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "position"), "set_position", "get_position");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "db_level"), "set_db_level", "get_db_level");
+}
+
+void SteamAudioListenerSensorSlot::set_steam_audio_source(SteamAudioSource *p_source_node) { source_node = p_source_node; }
+SteamAudioSource *SteamAudioListenerSensorSlot::get_steam_audio_source() { return source_node; }
+void SteamAudioListenerSensorSlot::set_position(const godot::Vector3 &p_position) { position = p_position; }
+godot::Vector3 SteamAudioListenerSensorSlot::get_position() { return position; }
+void SteamAudioListenerSensorSlot::set_db_level(float p_db_level) { db_level = p_db_level; }
+float SteamAudioListenerSensorSlot::get_db_level() { return db_level; }
 
 void SteamAudioListener::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("play_on_audiostreamplayer", "audiostreamplayer"), &SteamAudioListener::play_on_audiostreamplayer);
@@ -40,6 +61,14 @@ void SteamAudioListener::_bind_methods() {
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "mask", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_mask", "get_mask");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "range", PROPERTY_HINT_RANGE, "0.0,10000.0,0.1,or_greater"), "set_range", "get_range");
+
+	ClassDB::bind_method(D_METHOD("get_num_source_db_sensor_slots"), &SteamAudioListener::get_num_source_db_sensor_slots);
+	ClassDB::bind_method(D_METHOD("set_num_source_db_sensor_slots", "p_num_source_db_sensor_slots"), &SteamAudioListener::set_num_source_db_sensor_slots);
+	ClassDB::bind_method(D_METHOD("get_sensor_slot", "p_sensor_slot"), &SteamAudioListener::get_sensor_slot);
+	ClassDB::bind_method(D_METHOD("get_sensor_slots"), &SteamAudioListener::get_sensor_slots);
+
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "num_source_db_sensor_slots"), "set_num_source_db_sensor_slots", "get_num_source_db_sensor_slots");
+	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "sensor_slots", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_READ_ONLY), "", "get_sensor_slots");
 }
 
 void SteamAudioListener::ready_internal() {
@@ -117,6 +146,41 @@ float SteamAudioListener::get_irradiance_min_dist() { return irradiance_min_dist
 void SteamAudioListener::set_irradiance_min_dist(float p_irradiance_min_dist) { irradiance_min_dist = p_irradiance_min_dist; }
 int SteamAudioListener::get_refl_type() { return refl_type; }
 void SteamAudioListener::set_refl_type(int p_refl_type) { refl_type = p_refl_type; }
+
+void SteamAudioListener::set_num_source_db_sensor_slots(int p_num_source_db_sensor_slots) {
+	int current_size = sensor_slots.size();
+	if (p_num_source_db_sensor_slots == current_size)
+		return;
+
+	if (p_num_source_db_sensor_slots < current_size) {
+		sensor_slots.resize(p_num_source_db_sensor_slots);
+	} else {
+		for (int i = current_size; i < p_num_source_db_sensor_slots; i++) {
+			Ref<SteamAudioListenerSensorSlot> slot;
+			slot.instantiate();
+			sensor_slots.push_back(slot);
+		}
+	}
+}
+
+int SteamAudioListener::get_num_source_db_sensor_slots() {
+	return sensor_slots.size();
+}
+
+Ref<SteamAudioListenerSensorSlot> SteamAudioListener::get_sensor_slot(int p_sensor_slot) {
+	if (p_sensor_slot < 0 || p_sensor_slot >= (int)sensor_slots.size()) {
+		return Ref<SteamAudioListenerSensorSlot>();
+	}
+	return sensor_slots[p_sensor_slot];
+}
+
+Array SteamAudioListener::get_sensor_slots() const {
+	Array arr;
+	for (const auto &slot : sensor_slots) {
+		arr.push_back(slot);
+	}
+	return arr;
+}
 
 PackedStringArray SteamAudioListener::_get_configuration_warnings() const {
 	PackedStringArray res;
