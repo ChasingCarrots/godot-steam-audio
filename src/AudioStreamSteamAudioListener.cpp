@@ -4,49 +4,6 @@
 
 // --- AudioStreamSteamAudioListenerPlayback ---
 
-void AudioStreamSteamAudioListenerPlayback::compute_ar2()
-{
-	predictor_valid = false;
-
-	if (history_count < 3)
-		return;
-
-	const int N = godot::MIN(history_count, HISTORY_SIZE);
-
-	float r0 = 0.0f;
-	float r1 = 0.0f;
-	float r2 = 0.0f;
-
-	// autocorrelation over mono mix
-	for (int i = 2; i < N; i++)
-	{
-		godot::AudioFrame x0 = get_history(i);
-		godot::AudioFrame x1 = get_history(i - 1);
-		godot::AudioFrame x2 = get_history(i - 2);
-
-		float s0 = 0.5f * (x0.left + x0.right);
-		float s1 = 0.5f * (x1.left + x1.right);
-		float s2 = 0.5f * (x2.left + x2.right);
-
-		r0 += s0 * s0;
-		r1 += s0 * s1;
-		r2 += s0 * s2;
-	}
-
-	if (fabs(r0) < 1e-9f)
-		return;
-
-	// Yule-Walker solve for AR(2)
-	float det = r0 * r0 - r1 * r1;
-	if (fabs(det) < 1e-9f)
-		return;
-
-	ar_a1 = (r0 * r1 - r1 * r2) / det;
-	ar_a2 = (r0 * r2 - r1 * r1) / det;
-
-	predictor_valid = true;
-}
-
 AudioStreamSteamAudioListenerPlayback::AudioStreamSteamAudioListenerPlayback()
 {
     ring_buffer.resize( godot::nearest_shift( 1024 ) );
@@ -121,44 +78,38 @@ int32_t AudioStreamSteamAudioListenerPlayback::_mix(
 	{
 		ring_buffer.read(p_buffer, to_mix);
 
-		for (int i = 0; i < to_mix; i++)
-			push_history(p_buffer[i]);
-
+		last_frame = p_buffer[to_mix - 1];
 		mixed += to_mix;
 
-		// If we were in underrun, and now recovered,
-		// reset predictor state
 		if (underrun_active)
 		{
 			underrun_active = false;
-			predictor_valid = false;
+			underrun_fade_pos = 0;
 		}
 	}
 
-	// ---- 2. Handle underrun ----
+	// ---- 2. Handle underrun: fade last frame to silence ----
 	if (to_mix < p_frames)
 	{
 		if (!underrun_active)
 		{
 			underrun_active = true;
-			compute_ar2(); // compute once per underrun burst
+			underrun_fade_pos = 0;
 		}
 
 		for (int i = to_mix; i < p_frames; i++)
 		{
-			godot::AudioFrame predicted = {0, 0};
-
-			if (predictor_valid && history_count >= 2)
+			if (underrun_fade_pos < UNDERRUN_FADE_LEN)
 			{
-				godot::AudioFrame x1 = get_history(0);
-				godot::AudioFrame x2 = get_history(1);
-
-				predicted.left = ar_a1 * x1.left + ar_a2 * x2.left;
-				predicted.right = ar_a1 * x1.right + ar_a2 * x2.right;
+				float t = 1.0f - (float)underrun_fade_pos / (float)UNDERRUN_FADE_LEN;
+				p_buffer[i].left = last_frame.left * t;
+				p_buffer[i].right = last_frame.right * t;
+				underrun_fade_pos++;
 			}
-
-			p_buffer[i] = predicted;
-			push_history(predicted);
+			else
+			{
+				p_buffer[i] = {0, 0};
+			}
 			num_underrun_samples++;
 		}
 	}

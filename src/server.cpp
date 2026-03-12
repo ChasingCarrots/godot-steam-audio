@@ -142,12 +142,24 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("tick", "delta"), &SteamAudioServer::tick);
 	ClassDB::bind_method(D_METHOD("mixing_thread_func"), &SteamAudioServer::mixing_thread_func);
 	ClassDB::bind_static_method("SteamAudioServer", D_METHOD("get_singleton"), &SteamAudioServer::get_singleton);
+	ClassDB::bind_method(D_METHOD("get_mixing_thread_usage_pct"), &SteamAudioServer::get_mixing_thread_usage_pct);
+	ClassDB::bind_method(D_METHOD("get_sim_thread_avg_duration_ms"), &SteamAudioServer::get_sim_thread_avg_duration_ms);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "mixing_thread_usage_pct"), "", "get_mixing_thread_usage_pct");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sim_thread_avg_duration_ms"), "", "get_sim_thread_avg_duration_ms");
 	ClassDB::bind_method(D_METHOD("get_source_count"), &SteamAudioServer::get_source_count);
 	ClassDB::bind_method(D_METHOD("get_listener_count"), &SteamAudioServer::get_listener_count);
 	ClassDB::bind_method(D_METHOD("get_source_name", "index"), &SteamAudioServer::get_source_name);
 	ClassDB::bind_method(D_METHOD("get_listener_name", "index"), &SteamAudioServer::get_listener_name);
 	ClassDB::bind_method(D_METHOD("get_source_debug_string", "index"), &SteamAudioServer::get_source_debug_string);
 	ClassDB::bind_method(D_METHOD("get_listener_debug_string", "index"), &SteamAudioServer::get_listener_debug_string);
+}
+
+float SteamAudioServer::get_mixing_thread_usage_pct() const {
+	return mixing_thread_usage_pct.load(std::memory_order_relaxed);
+}
+
+float SteamAudioServer::get_sim_thread_avg_duration_ms() const {
+	return sim_thread_avg_duration_ms.load(std::memory_order_relaxed);
 }
 
 int SteamAudioServer::get_source_count() {
@@ -457,6 +469,7 @@ void SteamAudioServer::tick(float delta) {
 
 				// Create IPLSource per SourceListenerData if needed
 				if (!sld->source) {
+					PROFILE_FUNCTION_NAMED("adding_ipl_source");
 					IPLSourceSettings source_settings{};
 					source_settings.flags = static_cast<IPLSimulationFlags>(
 							(sd.source_node->get_direct_enabled() ? IPL_SIMULATIONFLAGS_DIRECT : 0) | IPL_SIMULATIONFLAGS_REFLECTIONS);
@@ -761,6 +774,8 @@ void SteamAudioServer::simulation_thread_func() {
 			is_refl_thread_processing.store(true);
 			new_inputs_set.store(false);
 
+			auto sim_start = std::chrono::steady_clock::now();
+
 			PROFILE_FUNCTION_NAMED("refl_sim");
 
 			// Snapshot simulators with retain so we don't hold collections_mutex
@@ -784,6 +799,12 @@ void SteamAudioServer::simulation_thread_func() {
 			}
 			simulators.clear();
 
+			auto sim_end = std::chrono::steady_clock::now();
+			float dur_ms = std::chrono::duration<float, std::milli>(sim_end - sim_start).count();
+			// Exponential moving average (alpha = 0.1)
+			float prev = sim_thread_avg_duration_ms.load(std::memory_order_relaxed);
+			sim_thread_avg_duration_ms.store(prev * 0.9f + dur_ms * 0.1f, std::memory_order_relaxed);
+
 			is_refl_thread_processing.store(false);
 		}
 	}
@@ -798,6 +819,7 @@ void SteamAudioServer::mixing_thread_func() {
 	while (is_running.load()) {
 		auto start = clock::now();
 		process_audio();
+		auto work_end = clock::now();
 
 		// hybrid spin sleep (try to reduce CPU usage while still being responsive)
 		auto target = start + wait_time;
@@ -810,6 +832,13 @@ void SteamAudioServer::mixing_thread_func() {
 				}
 			}
 		}
+
+		auto total = clock::now() - start;
+		auto busy = work_end - start;
+		float pct = (total.count() > 0) ? (static_cast<float>(busy.count()) / static_cast<float>(total.count()) * 100.0f) : 0.0f;
+		// Exponential moving average (alpha = 0.1)
+		float prev = mixing_thread_usage_pct.load(std::memory_order_relaxed);
+		mixing_thread_usage_pct.store(prev * 0.9f + pct * 0.1f, std::memory_order_relaxed);
 	}
 }
 

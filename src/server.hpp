@@ -231,6 +231,9 @@ private:
 	std::atomic<bool> refl_thread_wait_for_commit;
 	std::atomic<bool> is_refl_thread_processing;
 	std::atomic<bool> new_inputs_set;
+
+	std::atomic<float> mixing_thread_usage_pct{0.0f};
+	std::atomic<float> sim_thread_avg_duration_ms{0.0f};
 	std::mutex refl_mux;
 	std::condition_variable refl_cv;
 
@@ -284,6 +287,8 @@ public:
 	int get_sampling_rate() const { return cached_audio_settings.samplingRate; }
 
 	// Debug functions
+	float get_mixing_thread_usage_pct() const;
+	float get_sim_thread_avg_duration_ms() const;
 	int get_source_count();
 	int get_listener_count();
 	godot::String get_source_name(int index);

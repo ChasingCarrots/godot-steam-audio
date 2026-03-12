@@ -20,35 +20,10 @@ protected:
     godot::RingBuffer<godot::AudioFrame> ring_buffer;
 
 	// for the buffer underrun concealment logic
-	static constexpr int HISTORY_SIZE = 16;
-	godot::AudioFrame history[HISTORY_SIZE];
-	int history_pos = 0;
-	int history_count = 0;
-	inline void push_history(const godot::AudioFrame &frame)
-	{
-		history[history_pos] = frame;
-		history_pos = (history_pos + 1) % HISTORY_SIZE;
-
-		if (history_count < HISTORY_SIZE)
-			history_count++;
-	}
-
-	inline godot::AudioFrame get_history(int idx) const
-	{
-		// idx = 0 -> newest
-		int pos = history_pos - 1 - idx;
-		if (pos < 0)
-			pos += HISTORY_SIZE;
-
-		return history[pos];
-	}
-
-	float ar_a1 = 0.0f;
-	float ar_a2 = 0.0f;
-	void compute_ar2();
-
-	bool predictor_valid = false;
+	godot::AudioFrame last_frame = {0, 0};
 	bool underrun_active = false;
+	int underrun_fade_pos = 0;
+	static constexpr int UNDERRUN_FADE_LEN = 64;
 
 public:
     AudioStreamSteamAudioListenerPlayback();
