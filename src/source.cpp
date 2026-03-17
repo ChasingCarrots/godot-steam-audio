@@ -62,6 +62,9 @@ void SteamAudioSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_doppler_factor"), &SteamAudioSource::get_doppler_factor);
 	ClassDB::bind_method(D_METHOD("set_doppler_factor", "factor"), &SteamAudioSource::set_doppler_factor);
 
+	ClassDB::bind_method(D_METHOD("get_volume_db"), &SteamAudioSource::get_volume_db);
+	ClassDB::bind_method(D_METHOD("set_volume_db", "volume_db"), &SteamAudioSource::set_volume_db);
+
 	ClassDB::bind_method(D_METHOD("get_binaural_spatial_blend"), &SteamAudioSource::get_binaural_spatial_blend);
 	ClassDB::bind_method(D_METHOD("set_binaural_spatial_blend", "blend"), &SteamAudioSource::set_binaural_spatial_blend);
 
@@ -71,6 +74,7 @@ void SteamAudioSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "direct_enabled"), "set_direct_enabled", "get_direct_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dynamic_registration"), "set_dynamic_registration", "get_dynamic_registration");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "doppler_factor", PROPERTY_HINT_RANGE, "0.0,10.0,0.01"), "set_doppler_factor", "get_doppler_factor");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "volume_db", PROPERTY_HINT_RANGE, "-80.0,24.0,0.01"), "set_volume_db", "get_volume_db");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "layers", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_layers", "get_layers");
 	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "effect_stack", PROPERTY_HINT_TYPE_STRING, String::num(Variant::OBJECT) + "/" + String::num(PROPERTY_HINT_RESOURCE_TYPE) + ":AudioEffect"), "set_effect_stack", "get_effect_stack");
 
@@ -81,8 +85,8 @@ void SteamAudioSource::_bind_methods() {
 
 	ADD_GROUP("Distance Attenuation", "distance_attenuation_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "distance_attenuation_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_distance_attenuation_enabled", "get_distance_attenuation_enabled");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "distance_attenuation_min", PROPERTY_HINT_RANGE, "0.0,100.0,0.1"), "set_distance_attenuation_min", "get_distance_attenuation_min");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "distance_attenuation_max", PROPERTY_HINT_RANGE, "0.0,100.0,0.1"), "set_distance_attenuation_max", "get_distance_attenuation_max");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "distance_attenuation_min", PROPERTY_HINT_RANGE, "0.0,200.0,0.1"), "set_distance_attenuation_min", "get_distance_attenuation_min");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "distance_attenuation_max", PROPERTY_HINT_RANGE, "0.0,200.0,0.1"), "set_distance_attenuation_max", "get_distance_attenuation_max");
 
 
 	ADD_GROUP("Air Absorption", "air_absorption_");

@@ -121,6 +121,7 @@ struct SourceData {
 	int pending_consumers = 0;
 
 	float current_db_level = 0;
+	float volume_linear = 1.0f;
 
 	// AudioEffectInstances created from the source's effect stack
 	godot::LocalVector<godot::Ref<godot::AudioEffectInstance>> effect_instances;

@@ -453,6 +453,11 @@ void SteamAudioServer::tick(float delta) {
 
 			// Update source transforms for this listener's simulator
 			for (auto &sd : sources) {
+				if (!sd.source_node)
+					continue;
+
+				sd.volume_linear = UtilityFunctions::db_to_linear(sd.source_node->get_volume_db());
+
 				if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
 					continue;
 
@@ -1201,7 +1206,7 @@ void SteamAudioServer::process_audio() {
 				for (int frames_index = 0; frames_index < pulled; ++frames_index) {
 					if (mixed_index >= frame_size)
 						break; // precaution, but should really not happen...
-					sd.mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear;
+					sd.mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear * sd.volume_linear;
 					++mixed_index;
 				}
 				min_frames_ready = MIN(min_frames_ready, mixed_index);
@@ -1621,6 +1626,7 @@ void SteamAudioServer::add_source(SteamAudioSource *source_node) {
 	// Pre-build SourceData outside any lock
 	SourceData sd;
 	sd.source_node = source_node;
+	sd.volume_linear = UtilityFunctions::db_to_linear(source_node->get_volume_db());
 	sd.mixed_frames.resize(cached_audio_settings.frameSize);
 	sd.mixed_frames.fill(Vector2(0,0));
 
@@ -1649,7 +1655,7 @@ void SteamAudioServer::add_playback_to_source(const SteamAudioSource *source_nod
 	if (playback.is_null())
 		return;
 
-	float volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
+	float volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
 	playback->start();
 
 	std::lock_guard lock(pending_ops_mutex);
@@ -1662,7 +1668,7 @@ void SteamAudioServer::set_source_playback_volume(const SteamAudioSource *source
 		if (sd.source_node == source_node) {
 			for (auto &entry : sd.playbacks) {
 				if (entry.playback == p_playback) {
-					entry.volume_linear = std::pow(10.0f, p_volume_db / 20.0f);
+					entry.volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
 					return;
 				}
 			}

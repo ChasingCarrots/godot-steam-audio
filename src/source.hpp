@@ -47,6 +47,7 @@ private:
 	float reflection_hybrid_delay = 0.5f;
 
 	float doppler_factor = 1.0f;
+	float volume_db = 0.0f;
 
 	godot::TypedArray<godot::AudioEffect> effect_stack;
 
@@ -112,6 +113,9 @@ public:
 
 	float get_doppler_factor() const { return doppler_factor; }
 	void set_doppler_factor(float p_factor) { doppler_factor = p_factor; }
+
+	float get_volume_db() const { return volume_db; }
+	void set_volume_db(float p_db) { volume_db = p_db; }
 
 	float get_binaural_spatial_blend() const { return binaural_spatial_blend; }
 	void set_binaural_spatial_blend(float p_blend) { binaural_spatial_blend = p_blend; }
