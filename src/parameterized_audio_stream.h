@@ -279,6 +279,7 @@ class AudioStreamPlaybackParameterized : public godot::AudioStreamPlayback {
 	godot::Ref<AudioStreamParameterized> parent_stream;
 	godot::HashMap<godot::StringName, float> parameters;
 	godot::LocalVector<ParameterizedOutputRuntimeInstanceBase*> runtime_outputs;
+	bool active = false;
 public:
 	~AudioStreamPlaybackParameterized() override;
 	const AudioStreamParameterized& GetParent() const { return *parent_stream.ptr(); }

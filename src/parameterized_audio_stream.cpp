@@ -567,21 +567,22 @@ void AudioStreamPlaybackParameterized::trigger(godot::StringName trigger_name) {
 }
 
 void AudioStreamPlaybackParameterized::_start(double p_from_pos) {
-
+	active = true;
 }
 
 void AudioStreamPlaybackParameterized::_stop() {
-
+	active = false;
 }
 
 bool AudioStreamPlaybackParameterized::_is_playing() const {
-	// TODO: create a parameter "StopPlayingWhenNoOutputsActive" and go through all outputs checking
-	// for now we just stay in the playing/mixing state forever...
-	return true;
+	return active;
 }
 
 int32_t AudioStreamPlaybackParameterized::_mix(godot::AudioFrame *p_buffer, float p_rate_scale, int32_t p_frames) {
 	PROFILE_FUNCTION();
+	if (!active) {
+		return 0;
+	}
 	for (int i = 0; i < p_frames; ++i) {
 		p_buffer[i].left = 0;
 		p_buffer[i].right = 0;
