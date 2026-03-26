@@ -1376,13 +1376,13 @@ void SteamAudioServer::process_audio() {
 				if (sld->last_contributed_generation == ld.generation)
 					continue;
 
+				// Mark contributed and decrement counters
+				sld->last_contributed_generation = ld.generation;
+
 				// Out of range — mark contributed and decrement counters, skip processing.
 				if (sld->out_of_range) {
-					sld->last_contributed_generation = ld.generation;
 					if (ld.pending_contributors > 0)
 						ld.pending_contributors--;
-					if (sd.pending_consumers > 0)
-						sd.pending_consumers--;
 					continue;
 				}
 
@@ -1391,8 +1391,6 @@ void SteamAudioServer::process_audio() {
 					Vector2 f = sd.mixed_frames[s];
 					sld->input_buffer.data[0][s] = (f.x + f.y) * 0.5f;
 				}
-				// Mark contributed and decrement counters
-				sld->last_contributed_generation = ld.generation;
 
 				sld->debug_times_contributed += 1;
 
