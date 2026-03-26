@@ -91,12 +91,16 @@ bool create_source_listener_data(SourceListenerData &sld, SteamAudioSource *sour
 		refl_cfg.irSize = int(source_node->get_reflection_duration() * audio_settings->samplingRate);
 		handleErr(iplReflectionEffectCreate(ctx, audio_settings, &refl_cfg, &sld.reflection_effect), "SteamAudio: Failed to create reflection effect");
 
-		IPLAmbisonicsDecodeEffectSettings decode_cfg{};
-		decode_cfg.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
-		decode_cfg.hrtf = hrtf;
-		decode_cfg.maxOrder = max_order;
-		handleErr(iplAmbisonicsDecodeEffectCreate(ctx, audio_settings, &decode_cfg, &sld.ambisonics_decode_effect), "SteamAudio: Failed to create ambisonics decode effect");
+		// hybrid reflection type doesn't support the reflection mixer, so we have to use
+		// individual ambisonics decode effects
+		if (listener->get_refl_type() == IPL_REFLECTIONEFFECTTYPE_HYBRID) {
+			IPLAmbisonicsDecodeEffectSettings decode_cfg{};
+			decode_cfg.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
+			decode_cfg.hrtf = hrtf;
+			decode_cfg.maxOrder = max_order;
+			handleErr(iplAmbisonicsDecodeEffectCreate(ctx, audio_settings, &decode_cfg, &sld.ambisonics_decode_effect), "SteamAudio: Failed to create ambisonics decode effect");
 
+		}
 		iplAudioBufferAllocate(ctx, num_channels, audio_settings->frameSize, &sld.ambisonics_buffer);
 	}
 
@@ -993,6 +997,14 @@ void SteamAudioServer::apply_pending_ops() {
 						if (it->simulator) {
 							iplSimulatorRelease(&it->simulator);
 						}
+						if (it->reflection_mixer) {
+							iplReflectionMixerRelease(&it->reflection_mixer);
+						}
+						if (it->ambisonics_decode_effect) {
+							iplAmbisonicsDecodeEffectRelease(&it->ambisonics_decode_effect);
+						}
+						iplAudioBufferFree(phonon_context, &it->mixed_ambisonics_buffer);
+						iplAudioBufferFree(phonon_context, &it->decode_output_buffer);
 						listeners.erase(it);
 						break;
 					}
@@ -1376,10 +1388,10 @@ void SteamAudioServer::process_audio() {
 				if (sld->last_contributed_generation == ld.generation)
 					continue;
 
-				// Mark contributed and decrement counters
+				// Mark contributed even when out of range
 				sld->last_contributed_generation = ld.generation;
 
-				// Out of range — mark contributed and decrement counters, skip processing.
+				// Out of range — decrement contributers, but skip processing.
 				if (sld->out_of_range) {
 					if (ld.pending_contributors > 0)
 						ld.pending_contributors--;
@@ -1476,7 +1488,7 @@ void SteamAudioServer::process_audio() {
 				}
 
 				// Reflections
-				if (sd.source_node->get_reflection_enabled() && sld->source && sld->reflection_effect && sld->ambisonics_decode_effect) {
+				if (sd.source_node->get_reflection_enabled() && sld->source && sld->reflection_effect) {
 					PROFILE_FUNCTION_NAMED("Reflection Effect Processing");
 					IPLSimulationOutputs outputs{};
 					iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
@@ -1486,21 +1498,45 @@ void SteamAudioServer::process_audio() {
 					refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
 
 					if (outputs.reflections.irSize > 0) {
-						iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, nullptr);
+						iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, ld.reflection_mixer);
+						if (!ld.reflection_mixer && sld->ambisonics_decode_effect) {
+							IPLAmbisonicsDecodeEffectParams decode_params{};
+							decode_params.order = ld.listener->get_refl_ambisonics_order();
+							decode_params.hrtf = phonon_hrtf;
+							decode_params.orientation = ld.cached_coords;
+							decode_params.binaural = IPL_TRUE;
 
-						IPLAmbisonicsDecodeEffectParams decode_params{};
-						decode_params.order = ld.listener->get_refl_ambisonics_order();
-						decode_params.hrtf = phonon_hrtf;
-						decode_params.orientation = ld.cached_coords;
-						decode_params.binaural = IPL_TRUE;
+							iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
 
-						iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
-
-						for (int s = 0; s < frame_size; ++s) {
-							ld.push_buffer[s].x += sld->output_buffer.data[0][s];
-							ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+							for (int s = 0; s < frame_size; ++s) {
+								ld.push_buffer[s].x += sld->output_buffer.data[0][s];
+								ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+							}
 						}
 					}
+
+				}
+			}
+
+			// If all contributors are done for this listener, finish reflections processing
+			if (ld.pending_contributors <= 0 && ld.reflection_mixer && ld.ambisonics_decode_effect) {
+				IPLReflectionEffectParams apply_refl_params{};
+				apply_refl_params.type = static_cast<IPLReflectionEffectType>(ld.listener->get_refl_type());
+				apply_refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
+
+				iplReflectionMixerApply(ld.reflection_mixer, &apply_refl_params, &ld.mixed_ambisonics_buffer);
+
+				IPLAmbisonicsDecodeEffectParams decode_params{};
+				decode_params.order = ld.listener->get_refl_ambisonics_order();
+				decode_params.hrtf = phonon_hrtf;
+				decode_params.orientation = ld.cached_coords;
+				decode_params.binaural = IPL_TRUE;
+
+				iplAmbisonicsDecodeEffectApply(ld.ambisonics_decode_effect, &decode_params, &ld.mixed_ambisonics_buffer, &ld.decode_output_buffer);
+
+				for (int s = 0; s < frame_size; ++s) {
+					ld.push_buffer[s].x += ld.decode_output_buffer.data[0][s];
+					ld.push_buffer[s].y += ld.decode_output_buffer.data[1][s];
 				}
 			}
 
@@ -1588,6 +1624,26 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 	if (handleErr(iplSimulatorCreate(phonon_context, &sim_cfg, &ld.simulator), "SteamAudio: Failed to create simulator for listener")) {
 		iplSimulatorSetScene(ld.simulator, phonon_scene);
 		iplSimulatorCommit(ld.simulator);
+	}
+
+	if (listener->get_reflection_simulation_enabled() && listener->get_refl_type() == IPL_REFLECTIONEFFECTTYPE_CONVOLUTION) {
+		int max_order = listener->get_refl_ambisonics_order();
+		int num_channels = ambisonic_channels_from(max_order);
+
+		IPLReflectionEffectSettings refl_cfg{};
+		refl_cfg.type = static_cast<IPLReflectionEffectType>(listener->get_refl_type());
+		refl_cfg.numChannels = num_channels;
+		refl_cfg.irSize = int(listener->get_refl_duration() * cached_audio_settings.samplingRate);
+		handleErr(iplReflectionMixerCreate(phonon_context, &cached_audio_settings, &refl_cfg, &ld.reflection_mixer), "SteamAudio: Failed to create reflection mixer");
+
+		IPLAmbisonicsDecodeEffectSettings decode_cfg{};
+		decode_cfg.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
+		decode_cfg.hrtf = phonon_hrtf;
+		decode_cfg.maxOrder = max_order;
+		handleErr(iplAmbisonicsDecodeEffectCreate(phonon_context, &cached_audio_settings, &decode_cfg, &ld.ambisonics_decode_effect), "SteamAudio: Failed to create listener ambisonics decode effect");
+
+		iplAudioBufferAllocate(phonon_context, num_channels, cached_audio_settings.frameSize, &ld.mixed_ambisonics_buffer);
+		iplAudioBufferAllocate(phonon_context, 2, cached_audio_settings.frameSize, &ld.decode_output_buffer);
 	}
 
 	// Enqueue — cross-references with sources will be created when applied

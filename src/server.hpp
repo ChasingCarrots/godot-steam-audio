@@ -73,6 +73,11 @@ struct ListenerData {
 	godot::Transform3D last_trf;
 	bool dirty = false;
 
+	IPLReflectionMixer reflection_mixer = nullptr;
+	IPLAmbisonicsDecodeEffect ambisonics_decode_effect = nullptr;
+	IPLAudioBuffer mixed_ambisonics_buffer{};
+	IPLAudioBuffer decode_output_buffer{};
+
 	uint32_t debug_times_pushed = 0;
 };
 
