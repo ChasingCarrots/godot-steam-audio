@@ -29,6 +29,8 @@ class SteamAudioSource;
 struct ListenerPlaybackEntry {
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
 	int remaining_from_push_buffer = 0;
+	// ONLY TO BE USED AS IDENTIFIER!
+	SteamAudioSource* is_playback_of_source = nullptr;
 
 	uint32_t debug_times_drained = 0;
 };
@@ -124,6 +126,7 @@ struct SourceData {
 	// Set when mixed_frames_ready == frame_size, decremented as listeners consume.
 	// When it reaches 0, the source can reset and start a new mix.
 	int pending_consumers = 0;
+	bool is_skipping_mixing = false;
 
 	float current_db_level = 0;
 	float volume_linear = 1.0f;

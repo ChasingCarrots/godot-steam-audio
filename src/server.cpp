@@ -207,6 +207,7 @@ String SteamAudioServer::get_source_debug_string(int index) {
 	s += "mixed_frames_ready: " + String::num_int64(sd.mixed_frames_ready) + "/" + String::num_int64(frame_size) + "\n";
 	s += "pending_consumers: " + String::num_int64(sd.pending_consumers) + "\n";
 	s += "debug_times_mixed: " + String::num_int64(sd.debug_times_mixed) + "\n";
+	s += "is_skipping_mixing: " + String(sd.is_skipping_mixing ? "yes\n" : "no\n");
 	s += "playbacks: " + String::num_int64((int)sd.playbacks.size()) + "\n";
 	for (uint32_t i = 0; i < sd.playbacks.size(); ++i) {
 		auto &pb = sd.playbacks[i];
@@ -528,6 +529,8 @@ void SteamAudioServer::tick(float delta) {
 							iplSourceRemove(sld->source, ld.simulator);
 							ld.dirty = true;
 						}
+						// this listener was a consumer, so we have to decrement the pending amount
+						sd.pending_consumers--;
 					} else if (sld->out_of_range && sld->dist_to_listener <= listener_range) {
 						sld->out_of_range = false;
 						if (sld->source) {
@@ -965,21 +968,21 @@ void SteamAudioServer::apply_pending_ops() {
 						if (sd.listener_data[i].listener == listener) {
 							SourceListenerData &sld = sd.listener_data[i];
 
- 						if (removing_ld && !sld.out_of_range &&
-								(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
-								sld.last_contributed_generation != removing_ld->generation &&
-								removing_ld->pending_contributors > 0) {
-							removing_ld->pending_contributors--;
-						}
-						// Also release pending_consumers if this listener was counted
-						if (!sld.out_of_range &&
-								(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
-								sd.mixed_frames_ready >= cached_audio_settings.frameSize &&
-								sd.pending_consumers > 0) {
-							sd.pending_consumers--;
-						}
+ 							if (removing_ld && !sld.out_of_range &&
+									(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
+									sld.last_contributed_generation != removing_ld->generation &&
+									removing_ld->pending_contributors > 0) {
+								removing_ld->pending_contributors--;
+							}
+							// Also release pending_consumers if this listener was counted
+							if (!sld.out_of_range &&
+									(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
+									sd.mixed_frames_ready >= cached_audio_settings.frameSize &&
+									sd.pending_consumers > 0) {
+								sd.pending_consumers--;
+							}
 
-						// Remove source from simulator before releasing
+							// Remove source from simulator before releasing
 							for (auto &ld_entry : listeners) {
 								if (ld_entry.listener == listener && ld_entry.simulator && sld.source) {
 									iplSourceRemove(sld.source, ld_entry.simulator);
@@ -1029,7 +1032,19 @@ void SteamAudioServer::apply_pending_ops() {
 						{
 							std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
 							was_empty = ld.playbacks.is_empty();
-							ld.playbacks.push_back({ pending.playback, 0 });
+							SteamAudioSource* is_playback_of_source = nullptr;
+							for (const auto& sd : sources) {
+								for (const auto& spb : sd.playbacks) {
+									if (spb.playback == pending.playback) {
+										is_playback_of_source = sd.source_node;
+										break;
+									}
+								}
+								if (is_playback_of_source) {
+									break;
+								}
+							}
+							ld.playbacks.push_back({ pending.playback, 0, is_playback_of_source });
 						}
 						if (was_empty) {
 							// Listener was inactive — start a fresh cycle.
@@ -1103,9 +1118,24 @@ void SteamAudioServer::process_audio() {
 				if (pb.remaining_from_push_buffer <= 0)
 					continue;
 				int free_available_in_buffer = pb.playback->get_free_buffer_size();
-				if (pb.remaining_from_push_buffer <= free_available_in_buffer) {
+				if (free_available_in_buffer == 0) {
+					if (pb.is_playback_of_source) {
+						// when this listener actually plays back via a source (e.g. walkie talkie),
+						// we have to check if that source is skipping mixing (leading to a full buffer)
+						for (const auto& sd : sources) {
+							if (sd.source_node == pb.is_playback_of_source) {
+								if (sd.is_skipping_mixing) {
+									pb.remaining_from_push_buffer = 0;
+								}
+								break;
+							}
+						}
+					}
+				}
+				else if (pb.remaining_from_push_buffer <= free_available_in_buffer) {
 					pb.playback->push_buffer(ld.push_buffer.slice(frame_size - pb.remaining_from_push_buffer));
 					pb.remaining_from_push_buffer = 0;
+					pb.debug_times_drained++;
 				} else {
 					int num_to_push = MIN(pb.remaining_from_push_buffer, free_available_in_buffer);
 					if (num_to_push > 0) {
@@ -1178,7 +1208,7 @@ void SteamAudioServer::process_audio() {
 
 			// quick check if there are any listeners that would actually
 			// consume the mixed data (skip mixing otherwise!)
-			bool skip_mixing = true;
+			sd.is_skipping_mixing = true;
 			for (auto &sld : sd.listener_data) {
 				if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
 					continue;
@@ -1190,17 +1220,17 @@ void SteamAudioServer::process_audio() {
 						std::lock_guard pb_lock(*ld.playbacks_mutex);
 						for (auto &pb : ld.playbacks) {
 							if (pb.playback->is_playing()) {
-								skip_mixing = false;
+								sd.is_skipping_mixing = false;
 								break;
 							}
 						}
 						break;
 					}
 				}
-				if (!skip_mixing)
+				if (!sd.is_skipping_mixing)
 					break;
 			}
-			if (skip_mixing)
+			if (sd.is_skipping_mixing)
 				continue;
 
 			int prev_mixed_count = sd.mixed_frames_ready;
@@ -1391,7 +1421,7 @@ void SteamAudioServer::process_audio() {
 				// Mark contributed even when out of range
 				sld->last_contributed_generation = ld.generation;
 
-				// Out of range — decrement contributers, but skip processing.
+				// Out of range — decrement contributors, but skip processing.
 				if (sld->out_of_range) {
 					if (ld.pending_contributors > 0)
 						ld.pending_contributors--;
