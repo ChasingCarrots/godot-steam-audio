@@ -147,8 +147,10 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("mixing_thread_func"), &SteamAudioServer::mixing_thread_func);
 	ClassDB::bind_static_method("SteamAudioServer", D_METHOD("get_singleton"), &SteamAudioServer::get_singleton);
 	ClassDB::bind_method(D_METHOD("get_mixing_thread_usage_pct"), &SteamAudioServer::get_mixing_thread_usage_pct);
+	ClassDB::bind_method(D_METHOD("get_stress_mitigation"), &SteamAudioServer::get_stress_mitigation);
 	ClassDB::bind_method(D_METHOD("get_sim_thread_avg_duration_ms"), &SteamAudioServer::get_sim_thread_avg_duration_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "mixing_thread_usage_pct"), "", "get_mixing_thread_usage_pct");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "stress_mitigation"), "", "get_stress_mitigation");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sim_thread_avg_duration_ms"), "", "get_sim_thread_avg_duration_ms");
 	ClassDB::bind_method(D_METHOD("get_source_count"), &SteamAudioServer::get_source_count);
 	ClassDB::bind_method(D_METHOD("get_listener_count"), &SteamAudioServer::get_listener_count);
@@ -160,6 +162,10 @@ void SteamAudioServer::_bind_methods() {
 
 float SteamAudioServer::get_mixing_thread_usage_pct() const {
 	return mixing_thread_usage_pct.load(std::memory_order_relaxed);
+}
+
+float SteamAudioServer::get_stress_mitigation() const {
+	return stress_mitigation.load(std::memory_order_relaxed);
 }
 
 float SteamAudioServer::get_sim_thread_avg_duration_ms() const {
@@ -228,7 +234,9 @@ String SteamAudioServer::get_source_debug_string(int index) {
 		s += " OutOfRange=" + String(sld.out_of_range ? "yes" : "no");
 		s += " last_gen=" + String::num_int64(sld.last_contributed_generation);
 		s += " times_contributed=" + String::num_int64(sld.debug_times_contributed);
- 	s += "\n";
+		if (sld.skip_reflection_applies > 0)
+			s += " skipping refl=" + String::num_int64(sld.skip_reflection_applies);
+ 		s += "\n";
 	}
 	return s;
 }
@@ -434,6 +442,8 @@ void SteamAudioServer::tick(float delta) {
 			if (!ld.simulator)
 				continue;
 
+			float stress_mitigation_factor = 0.1f + 0.9f * (1.0f - stress_mitigation.load());
+
 			// Update listener transform from node directly
 			Transform3D trf = ld.listener->get_global_transform();
 			if (!trf.is_equal_approx(ld.last_trf)) {
@@ -443,7 +453,7 @@ void SteamAudioServer::tick(float delta) {
 				shared_inputs.listener = ld.cached_coords;
 				shared_inputs.numRays = ld.listener->get_num_refl_rays();
 				shared_inputs.numBounces = ld.listener->get_num_refl_bounces();
-				shared_inputs.duration = ld.listener->get_refl_duration();
+				shared_inputs.duration = ld.listener->get_refl_duration() * stress_mitigation_factor;
 				shared_inputs.order = ld.listener->get_refl_ambisonics_order();
 				shared_inputs.irradianceMinDistance = ld.listener->get_irradiance_min_dist();
 
@@ -824,6 +834,12 @@ void SteamAudioServer::simulation_thread_func() {
 
 void SteamAudioServer::mixing_thread_func() {
 	using clock = std::chrono::steady_clock;
+
+	using dseconds = std::chrono::duration<double>;
+	const float STRESS_MITIGATION_SKIPS_PER_SECOND = 5.0f;
+	float stress_mitigation_skips_accumulator = 0;
+	auto last_stress_mitigation_check_time = clock::now();
+
 	auto wait_time = std::chrono::milliseconds(
 		1
 	);
@@ -851,6 +867,40 @@ void SteamAudioServer::mixing_thread_func() {
 		// Exponential moving average (alpha = 0.1)
 		float prev = mixing_thread_usage_pct.load(std::memory_order_relaxed);
 		mixing_thread_usage_pct.store(prev * 0.9f + pct * 0.1f, std::memory_order_relaxed);
+
+		// Update stress mitigation: start at 50% usage (0.0) to 100% usage (1.0).
+		// Reacts fast to increase (alpha = 0.2), damp down more slowly (alpha = 0.01).
+		float target_mitigation = CLAMP((mixing_thread_usage_pct - 50.0f) / 50.0f, 0.0f, 1.0f);
+		float current_mitigation = stress_mitigation.load(std::memory_order_relaxed);
+		float alpha = (target_mitigation > current_mitigation) ? 0.2f : 0.01f;
+		stress_mitigation.store(current_mitigation * (1.0f - alpha) + target_mitigation * alpha, std::memory_order_relaxed);
+
+		// and the most drastic stress mitigation: skip iplApplyReflectionEffect calls.
+		// all the other measures didn't seem very effective, but this will reduce the
+		// stress on this thread dramatically and "only" cost the reflection part of
+		// some audio sources.
+		dseconds stress_mitigation_check_duration = clock::now() - last_stress_mitigation_check_time;
+		last_stress_mitigation_check_time = clock::now();
+		stress_mitigation_skips_accumulator += STRESS_MITIGATION_SKIPS_PER_SECOND * stress_mitigation * stress_mitigation_check_duration.count();
+		if (stress_mitigation_skips_accumulator > 1) {
+			stress_mitigation_skips_accumulator -= 1;
+			for (int i = sources.size() - 1; i >= 0; --i) {
+				bool found = false;
+				for (auto& sld:sources[i].listener_data) {
+					if (sld.skip_reflection_applies > 0 || !sld.reflection_effect)
+						continue;
+					// 200 is quite long, with normal settings this will result in
+					// 2 seconds of skipping reflection for this source. but keeping
+					// STRESS_MITIGATION_SKIPS_PER_SECOND low and therefore the skip
+					// duration higher has proven to be more stable for the stress.
+					sld.skip_reflection_applies = 200;
+					found = true;
+					break;
+				}
+				if (found)
+					break;
+			}
+		}
 	}
 }
 
@@ -1526,30 +1576,40 @@ void SteamAudioServer::process_audio() {
 					IPLReflectionEffectParams refl_params = outputs.reflections;
 					refl_params.type = static_cast<IPLReflectionEffectType>(ld.listener->get_refl_type());
 					refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
+					// changing the irSize here doesn't seem to do anything, unfortunately
+					float stress_irsize_factor = 0.2f + 0.8f * (1.0f - stress_mitigation.load());
+					refl_params.irSize = static_cast<int>(static_cast<float>(refl_params.irSize) * stress_irsize_factor);
 
-					if (outputs.reflections.irSize > 0) {
-						iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, ld.reflection_mixer);
-						if (!ld.reflection_mixer && sld->ambisonics_decode_effect) {
-							IPLAmbisonicsDecodeEffectParams decode_params{};
-							decode_params.order = ld.listener->get_refl_ambisonics_order();
-							decode_params.hrtf = phonon_hrtf;
-							decode_params.orientation = ld.cached_coords;
-							decode_params.binaural = IPL_TRUE;
+					if (refl_params.irSize > 0) {
+						// the only way to really mitigate the stress of iplReflectionEffectApply seems to
+						// be to just not call it. but that has to be done en-block, otherwise heavy artifacting
+						// will occur.
+						if (sld->skip_reflection_applies > 0)
+							sld->skip_reflection_applies--;
+						else {
+							iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, ld.reflection_mixer);
+							if (!ld.reflection_mixer && sld->ambisonics_decode_effect) {
+								IPLAmbisonicsDecodeEffectParams decode_params{};
+								decode_params.order = ld.listener->get_refl_ambisonics_order();
+								decode_params.hrtf = phonon_hrtf;
+								decode_params.orientation = ld.cached_coords;
+								decode_params.binaural = IPL_TRUE;
 
-							iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
+								iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
 
-							for (int s = 0; s < frame_size; ++s) {
-								ld.push_buffer[s].x += sld->output_buffer.data[0][s];
-								ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+								for (int s = 0; s < frame_size; ++s) {
+									ld.push_buffer[s].x += sld->output_buffer.data[0][s];
+									ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+								}
 							}
 						}
 					}
-
 				}
 			}
 
 			// If all contributors are done for this listener, finish reflections processing
 			if (ld.pending_contributors <= 0 && ld.reflection_mixer && ld.ambisonics_decode_effect) {
+				PROFILE_FUNCTION_NAMED("Reflection Mixer Processing");
 				IPLReflectionEffectParams apply_refl_params{};
 				apply_refl_params.type = static_cast<IPLReflectionEffectType>(ld.listener->get_refl_type());
 				apply_refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
@@ -1638,7 +1698,10 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 
 	// Initialize Simulator for this listener
 	IPLSimulationSettings sim_cfg{};
-	sim_cfg.flags = static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+	sim_cfg.flags = IPL_SIMULATIONFLAGS_DIRECT;
+	if (listener->get_reflection_simulation_enabled()) {
+		sim_cfg.flags = static_cast<IPLSimulationFlags>(sim_cfg.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
+	}
 	sim_cfg.sceneType = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
 	sim_cfg.reflectionType = static_cast<IPLReflectionEffectType>(listener->get_refl_type());
 	sim_cfg.maxNumOcclusionSamples = get_project_int("steamaudio/max_occlusion_samples", 64);
