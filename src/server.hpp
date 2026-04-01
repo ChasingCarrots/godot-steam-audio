@@ -44,6 +44,7 @@ struct ListenerSourceDBLevel {
 struct ListenerData {
 	SteamAudioListener *listener = nullptr;
 	IPLSimulator simulator = nullptr;
+	bool simulator_reflection_enabled = false;
 
 	// This buffer will be filled by the pre-mixed and steam audio handled
 	// audio data from all relevant sources (additive). When all relevant sources have

@@ -806,7 +806,7 @@ void SteamAudioServer::simulation_thread_func() {
 			{
 				std::shared_lock lock(collections_mutex);
 				for (auto &ld : listeners) {
-					if (!ld.simulator)
+					if (!ld.simulator || !ld.simulator_reflection_enabled)
 						continue;
 					simulators.push_back(iplSimulatorRetain(ld.simulator));
 				}
@@ -1693,6 +1693,7 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 	// Pre-build ListenerData outside any lock
 	ListenerData ld;
 	ld.listener = listener;
+	ld.simulator_reflection_enabled = listener->get_reflection_simulation_enabled();
 	ld.dirty = true;
 	ld.push_buffer.resize(cached_audio_settings.frameSize);
 
@@ -1710,7 +1711,7 @@ void SteamAudioServer::add_listener(SteamAudioListener *listener) {
 	sim_cfg.maxDuration = listener->get_refl_duration();
 	sim_cfg.maxOrder = listener->get_refl_ambisonics_order();
 	sim_cfg.maxNumSources = 256;
-	sim_cfg.numThreads = OS::get_singleton()->get_processor_count();
+	sim_cfg.numThreads = 2;
 	sim_cfg.samplingRate = cached_audio_settings.samplingRate;
 	sim_cfg.frameSize = cached_audio_settings.frameSize;
 
