@@ -67,6 +67,7 @@ void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx) {
 bool create_source_listener_data(SourceListenerData &sld, SteamAudioSource *source_node, SteamAudioListener *listener, IPLContext ctx, IPLAudioSettings *audio_settings, IPLHRTF hrtf) {
 	PROFILE_FUNCTION();
 	sld.listener = listener;
+	sld.direct_simulated_once = false;
 
 	IPLBinauralEffectSettings binaural_cfg{};
 	binaural_cfg.hrtf = hrtf;
@@ -664,6 +665,11 @@ void SteamAudioServer::tick(float delta) {
 							continue;
 						if (sld.out_of_range)
 							continue;
+
+						// Simulation has now run at least once for this source/listener
+						// pair, so iplSourceGetOutputs data and cached coords are valid.
+						sld.direct_simulated_once = true;
+
 						IPLSimulationOutputs outputs{};
 						iplSourceGetOutputs(sld.source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 
@@ -1264,6 +1270,11 @@ void SteamAudioServer::process_audio() {
 					continue;
 				if (sld.out_of_range)
 					continue;
+				// Don't consume audio until simulation has run at least once for
+				// this pair — otherwise the start would be mixed with invalid
+				// (zero-initialised) simulation outputs and effectively lost.
+				if (!sld.direct_simulated_once)
+					continue;
 				// Check if this listener has active (playing) playbacks
 				for (auto &ld : listeners) {
 					if (ld.listener == sld.listener) {
@@ -1448,11 +1459,6 @@ void SteamAudioServer::process_audio() {
 				if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
 					continue;
 
-				if (sd.mixed_frames_ready < frame_size) {
-					// Source not ready yet
-					continue;
-				}
-
 				SourceListenerData *sld = nullptr;
 				for (auto &entry : sd.listener_data) {
 					if (entry.listener == ld.listener) {
@@ -1467,6 +1473,26 @@ void SteamAudioServer::process_audio() {
 				// Already contributed to this generation?
 				if (sld->last_contributed_generation == ld.generation)
 					continue;
+
+				// Not simulated yet: this source was counted as a contributor
+				// (unless out of range), but has no valid audio/effects. Decrement
+				// so the listener is NOT blocked, then skip. Phase 2 also withholds
+				// its mixing, so no audio is consumed in the meantime.
+				if (!sld->direct_simulated_once) {
+					sld->last_contributed_generation = ld.generation;
+					if (!sld->out_of_range) {
+						if (ld.pending_contributors > 0)
+							ld.pending_contributors--;
+						if (sd.pending_consumers > 0)
+							sd.pending_consumers--;
+					}
+					continue;
+				}
+
+				if (sd.mixed_frames_ready < frame_size) {
+					// Source not ready yet
+					continue;
+				}
 
 				// Mark contributed even when out of range
 				sld->last_contributed_generation = ld.generation;

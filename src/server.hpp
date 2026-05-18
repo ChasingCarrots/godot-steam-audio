@@ -89,6 +89,7 @@ struct SourceListenerData {
 	float dist_to_listener = 0.0f;
 	float doppler_pitch = 1.0f;
 	bool out_of_range = false;
+	bool direct_simulated_once = false;
 	// Generation of the listener's push_buffer that this SLD last contributed to.
 	// Compared against ListenerData::generation to determine if contribution is needed.
 	uint32_t last_contributed_generation = 0;
