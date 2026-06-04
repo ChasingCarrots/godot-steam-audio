@@ -5,6 +5,7 @@
 #include "godot_cpp/classes/os.hpp"
 #include "godot_cpp/classes/project_settings.hpp"
 #include "godot_cpp/core/class_db.hpp"
+#include "godot_cpp/classes/worker_thread_pool.hpp"
 #include "godot_cpp/variant/utility_functions.hpp"
 #include <phonon.h>
 
@@ -150,9 +151,11 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_mixing_thread_usage_pct"), &SteamAudioServer::get_mixing_thread_usage_pct);
 	ClassDB::bind_method(D_METHOD("get_stress_mitigation"), &SteamAudioServer::get_stress_mitigation);
 	ClassDB::bind_method(D_METHOD("get_sim_thread_avg_duration_ms"), &SteamAudioServer::get_sim_thread_avg_duration_ms);
+	ClassDB::bind_method(D_METHOD("get_direct_job_avg_duration_ms"), &SteamAudioServer::get_direct_job_avg_duration_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "mixing_thread_usage_pct"), "", "get_mixing_thread_usage_pct");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "stress_mitigation"), "", "get_stress_mitigation");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sim_thread_avg_duration_ms"), "", "get_sim_thread_avg_duration_ms");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "direct_job_avg_duration_ms"), "", "get_direct_job_avg_duration_ms");
 	ClassDB::bind_method(D_METHOD("get_source_count"), &SteamAudioServer::get_source_count);
 	ClassDB::bind_method(D_METHOD("get_listener_count"), &SteamAudioServer::get_listener_count);
 	ClassDB::bind_method(D_METHOD("get_source_name", "index"), &SteamAudioServer::get_source_name);
@@ -171,6 +174,10 @@ float SteamAudioServer::get_stress_mitigation() const {
 
 float SteamAudioServer::get_sim_thread_avg_duration_ms() const {
 	return sim_thread_avg_duration_ms.load(std::memory_order_relaxed);
+}
+
+float SteamAudioServer::get_direct_job_avg_duration_ms() const {
+	return direct_job_avg_duration_ms.load(std::memory_order_relaxed);
 }
 
 int SteamAudioServer::get_source_count() {
@@ -360,6 +367,12 @@ void SteamAudioServer::finish() {
 		mixing_thread->wait_to_finish();
 	}
 
+	// Wait for any in-flight direct-sim job before releasing simulators/sources.
+	if (direct_job_pending) {
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(direct_task_id);
+		direct_job_pending = false;
+	}
+
 	// Drain any remaining pending ops now that threads are stopped
 	apply_pending_ops();
 
@@ -417,6 +430,166 @@ void SteamAudioServer::tick(float delta) {
 	PROFILE_FUNCTION();
 
 	std::shared_lock lock(collections_mutex);
+
+	// ── STEP 1: Barrier ──────────────────────────────────────────────────────
+	// Wait for the previous tick's direct-sim job before touching any simulator,
+	// scene or output state. This should almost never actually block; if it does
+	// regularly, the job is overrunning a tick (watch get_direct_job_avg_duration_ms).
+	if (direct_job_pending) {
+		PROFILE_FUNCTION_NAMED("waiting_for_direct_job");
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(direct_task_id);
+		direct_job_pending = false;
+	}
+
+	// ── STEP 2: Consume the previous job's results ───────────────────────────
+	// The direct-sim job has finished iplSimulatorRunDirect, so iplSourceGetOutputs
+	// is valid. Update per-source dB levels and listener sensor slots here, on the
+	// main thread, because this reads/writes Godot nodes and Resources.
+	for (auto &ld : listeners) {
+		if (!ld.simulator)
+			continue;
+
+		{
+			PROFILE_FUNCTION_NAMED("updating_source_db_levels");
+			static LocalVector<Ref<SteamAudioListenerSensorSlot>> temp_sensor_slots;
+			temp_sensor_slots.resize(ld.listener->get_num_source_db_sensor_slots());
+			for (int source_slot_index = 0; source_slot_index < ld.listener->get_num_source_db_sensor_slots(); ++source_slot_index) {
+				temp_sensor_slots[source_slot_index] = ld.listener->get_sensor_slot(source_slot_index);
+				// decay dB level
+				float current_db = temp_sensor_slots[source_slot_index]->get_db_level();
+				current_db -= delta * 30.0f; // decay by 30 dB per second
+				if (current_db < -60.0f) {
+					temp_sensor_slots[source_slot_index]->set_db_level(-500.0f);
+					temp_sensor_slots[source_slot_index]->set_steam_audio_source(nullptr);
+				} else {
+					temp_sensor_slots[source_slot_index]->set_db_level(current_db);
+				}
+			}
+			// update source db levels
+			ld.source_db_levels.clear();
+			for (auto &sd : sources) {
+				for (auto &sld : sd.listener_data) {
+					if (sld.listener != ld.listener)
+						continue;
+					if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
+						continue;
+					if (sld.out_of_range)
+						continue;
+					// No IPLSource yet (not created by the job, or creation failed) —
+					// nothing to read.
+					if (!sld.source)
+						continue;
+
+					// Simulation has now run at least once for this source/listener
+					// pair, so iplSourceGetOutputs data and cached coords are valid.
+					sld.direct_simulated_once = true;
+
+					IPLSimulationOutputs outputs{};
+					iplSourceGetOutputs(sld.source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+
+					ListenerSourceDBLevel source_db_level;
+					source_db_level.source = sd.source_node;
+					source_db_level.position = sd.source_node->get_global_position();
+					source_db_level.db_level = sd.current_db_level;
+					IPLDirectEffectParams direct_params = outputs.direct;
+					float total_direct_factor = 1.0f;
+
+					if (sd.source_node->get_occlusion_enabled()) {
+						float occlusion = direct_params.occlusion;
+						float transmission = 0.0f;
+						if (sd.source_node->get_transmission_enabled()) {
+							transmission = (direct_params.transmission[0] + direct_params.transmission[1] + direct_params.transmission[2]) / 3.0f;
+						}
+						// Total direct sound = sound that goes around (occlusion) + sound that goes through (transmission)
+						// We assume transmission only applies to the occluded part.
+						total_direct_factor *= (occlusion + (1.0f - occlusion) * transmission);
+					}
+
+					if (sd.source_node->get_air_absorption_enabled()) {
+						IPLAirAbsorptionModel airAbsorptionModel{};
+						airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+						float air_absorption[3];
+						iplAirAbsorptionCalculate(phonon_context, sd.cached_coords.origin, ld.cached_coords.origin, &airAbsorptionModel, air_absorption);
+						float avg_air_absorption = (air_absorption[0] + air_absorption[1] + air_absorption[2]) / 3.0f;
+						total_direct_factor *= avg_air_absorption;
+					}
+
+					if (sd.source_node->get_distance_attenuation_enabled()) {
+						float dist = sld.dist_to_listener;
+						float min_dist = sd.source_node->get_distance_attenuation_min();
+						float max_dist = sd.source_node->get_distance_attenuation_max();
+						float attenuation = calculate_attenuation(dist, min_dist, max_dist);
+						total_direct_factor *= attenuation;
+					}
+
+					float final_db_level = source_db_level.db_level + 20.0f * Math::log(MAX(total_direct_factor, 1e-10f)) / Math::log(10.0f);
+					source_db_level.db_level = final_db_level;
+					ld.source_db_levels.push_back(source_db_level);
+
+					if (final_db_level < -60.0f || temp_sensor_slots.is_empty())
+						continue;
+
+					// the following will update the sensor slots on the SteamAudioListener!
+
+					// update/insert current source in sensor slots if it's loud enough
+					int num_slots = (int)temp_sensor_slots.size();
+
+					// first check if the source is already in a slot
+					int existing_slot_index = -1;
+					for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
+						if (temp_sensor_slots[slot_index]->get_steam_audio_source() == sd.source_node) {
+							existing_slot_index = slot_index;
+							break;
+						}
+					}
+
+					if (existing_slot_index != -1) {
+						// source already exists, update it if the new level is higher
+						if (final_db_level > temp_sensor_slots[existing_slot_index]->get_db_level()) {
+							temp_sensor_slots[existing_slot_index]->set_db_level(final_db_level);
+							temp_sensor_slots[existing_slot_index]->set_position(sd.source_node->get_global_position());
+
+							// check if it needs to move up (becoming louder)
+							int current_slot = existing_slot_index;
+							while (current_slot > 0 && temp_sensor_slots[current_slot]->get_db_level() > temp_sensor_slots[current_slot - 1]->get_db_level()) {
+								// swap values with the slot above it
+								SteamAudioSource *prev_source = temp_sensor_slots[current_slot - 1]->get_steam_audio_source();
+								Vector3 prev_position = temp_sensor_slots[current_slot - 1]->get_position();
+								float prev_db = temp_sensor_slots[current_slot - 1]->get_db_level();
+
+								temp_sensor_slots[current_slot - 1]->set_steam_audio_source(temp_sensor_slots[current_slot]->get_steam_audio_source());
+								temp_sensor_slots[current_slot - 1]->set_position(temp_sensor_slots[current_slot]->get_position());
+								temp_sensor_slots[current_slot - 1]->set_db_level(temp_sensor_slots[current_slot]->get_db_level());
+
+								temp_sensor_slots[current_slot]->set_steam_audio_source(prev_source);
+								temp_sensor_slots[current_slot]->set_position(prev_position);
+								temp_sensor_slots[current_slot]->set_db_level(prev_db);
+
+								current_slot--;
+							}
+						}
+					} else {
+						for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
+							if (final_db_level > temp_sensor_slots[slot_index]->get_db_level()) {
+								// shift down remaining
+								for (int shift_index = num_slots - 1; shift_index > slot_index; --shift_index) {
+									temp_sensor_slots[shift_index]->set_steam_audio_source(temp_sensor_slots[shift_index - 1]->get_steam_audio_source());
+									temp_sensor_slots[shift_index]->set_position(temp_sensor_slots[shift_index - 1]->get_position());
+									temp_sensor_slots[shift_index]->set_db_level(temp_sensor_slots[shift_index - 1]->get_db_level());
+								}
+								temp_sensor_slots[slot_index]->set_steam_audio_source(sd.source_node);
+								temp_sensor_slots[slot_index]->set_position(sd.source_node->get_global_position());
+								temp_sensor_slots[slot_index]->set_db_level(final_db_level);
+								break;
+							}
+						}
+					}
+
+				}
+			}
+			temp_sensor_slots.clear();
+		}
+	}
 
 	{
 		PROFILE_FUNCTION_NAMED("update_dynamic_geometry");
@@ -488,17 +661,8 @@ void SteamAudioServer::tick(float delta) {
 				if (!sld)
 					continue;
 
-				// Create IPLSource per SourceListenerData if needed
-				if (!sld->source) {
-					PROFILE_FUNCTION_NAMED("adding_ipl_source");
-					IPLSourceSettings source_settings{};
-					source_settings.flags = static_cast<IPLSimulationFlags>(
-							(sd.source_node->get_direct_enabled() ? IPL_SIMULATIONFLAGS_DIRECT : 0) | IPL_SIMULATIONFLAGS_REFLECTIONS);
-					if (handleErr(iplSourceCreate(ld.simulator, &source_settings, &sld->source), "SteamAudio: Failed to create source")) {
-						iplSourceAdd(sld->source, ld.simulator);
-						ld.dirty = true;
-					}
-				}
+				// IPLSource creation is deferred to the direct-sim job (see below) —
+				// it is allocation-heavy and should not run on the main thread.
 
 				Transform3D src_trf = sd.source_node->get_global_transform();
 				sd.cached_coords = ipl_coords_from(src_trf);
@@ -563,6 +727,18 @@ void SteamAudioServer::tick(float delta) {
 					continue;
 				}
 
+				// Record a deferred IPLSource creation for the direct-sim job. We
+				// only do this for in-range sources, so a source that spawns out of
+				// range never gets created until it actually comes into range.
+				if (!sld->source && !sld->pending_create) {
+					sld->pending_create = true;
+					sld->pending_source_settings = IPLSourceSettings{};
+					sld->pending_source_settings.flags = static_cast<IPLSimulationFlags>(
+							(sd.source_node->get_direct_enabled() ? IPL_SIMULATIONFLAGS_DIRECT : 0) |
+							(sd.source_node->get_reflection_enabled() ? IPL_SIMULATIONFLAGS_REFLECTIONS : 0));
+					ld.dirty = true;
+				}
+
 				IPLSimulationInputs inputs{};
 				inputs.flags = static_cast<IPLSimulationFlags>(0);
 				if (sd.source_node->get_direct_enabled()) {
@@ -603,186 +779,116 @@ void SteamAudioServer::tick(float delta) {
 				inputs.hybridReverbOverlapPercent = 0.25f;
 				inputs.baked = IPL_FALSE;
 
-				iplSourceSetInputs(sld->source, inputs.flags, &inputs);
+				if (sld->source) {
+					iplSourceSetInputs(sld->source, inputs.flags, &inputs);
+				} else {
+					// Source not created yet — stash the inputs so the job can apply
+					// them right after iplSourceCreate (first run is already correct).
+					sld->pending_inputs = inputs;
+				}
 				sd.last_trf = src_trf;
 			}
+		}
+	}
 
-			if (ld.dirty) {
-				refl_thread_wait_for_commit.store(true);
+	// ── STEP 5: Submit the direct-sim job ────────────────────────────────────
+	// The job performs deferred IPLSource creation, the scene/simulator commit
+	// (coordinated with the reflection thread), iplSimulatorRunDirect, and finally
+	// wakes the reflection thread. It is fire-and-forget — the next tick's STEP 1
+	// barrier waits on it.
+	direct_task_id = WorkerThreadPool::get_singleton()->add_native_task(
+			&SteamAudioServer::run_direct_job, this, true, "SteamAudio direct sim");
+	direct_job_pending = true;
+}
+
+void SteamAudioServer::run_direct_job(void *p_self) {
+	SteamAudioServer *self = static_cast<SteamAudioServer *>(p_self);
+	PROFILE_FUNCTION_NAMED("direct_sim_job");
+	auto job_start = std::chrono::steady_clock::now();
+
+	// Shared lock keeps the collections stable for the job's duration —
+	// apply_pending_ops() (mixing thread) unique-locks the same mutex, so it
+	// cannot add/remove sources or listeners while the job runs.
+	std::shared_lock lock(self->collections_mutex);
+
+	// 1. Deferred IPLSource creation (the old "adding_ipl_source" work, moved off
+	//    the main thread). Inputs were stashed by tick() so the first run is correct.
+	{
+		PROFILE_FUNCTION_NAMED("adding_ipl_source");
+		for (auto &ld : self->listeners) {
+			if (!ld.simulator)
+				continue;
+			for (auto &sd : self->sources) {
+				for (auto &sld : sd.listener_data) {
+					if (sld.listener != ld.listener || !sld.pending_create)
+						continue;
+					if (handleErr(iplSourceCreate(ld.simulator, &sld.pending_source_settings, &sld.source), "SteamAudio: Failed to create source")) {
+						iplSourceAdd(sld.source, ld.simulator);
+						iplSourceSetInputs(sld.source, sld.pending_inputs.flags, &sld.pending_inputs);
+					}
+					sld.pending_create = false;
+				}
 			}
 		}
 	}
 
-	if (scene_dirty) {
-		refl_thread_wait_for_commit.store(true);
-	}
-
-	if (refl_thread_wait_for_commit.load() && !is_refl_thread_processing.load()) {
-		PROFILE_FUNCTION_NAMED("committing_scene_and_simulators");
-		if (scene_dirty) {
-			iplSceneCommit(phonon_scene);
-			scene_dirty = false;
-		}
-		for (auto &ld : listeners) {
+	// 2. Commit scene + simulators, coordinated with the reflection thread.
+	//    Only commit/add conflict with a running simulation, and the reflection
+	//    thread only starts a pass once new_inputs_set is true (set in step 4) —
+	//    so during this step the reflection thread is either mid-pass (defer the
+	//    commit) or blocked (safe to commit now).
+	bool need_commit = self->scene_dirty;
+	if (!need_commit) {
+		for (auto &ld : self->listeners) {
 			if (ld.dirty) {
-				iplSimulatorCommit(ld.simulator);
-				ld.dirty = false;
+				need_commit = true;
+				break;
 			}
 		}
-		refl_thread_wait_for_commit.store(false);
+	}
+	if (need_commit) {
+		// Hold off the reflection thread from starting a new pass until committed.
+		self->refl_thread_wait_for_commit.store(true);
+		if (!self->is_refl_thread_processing.load()) {
+			PROFILE_FUNCTION_NAMED("committing_scene_and_simulators");
+			if (self->scene_dirty) {
+				iplSceneCommit(self->phonon_scene);
+				self->scene_dirty = false;
+			}
+			for (auto &ld : self->listeners) {
+				if (ld.dirty) {
+					iplSimulatorCommit(ld.simulator);
+					ld.dirty = false;
+				}
+			}
+			self->refl_thread_wait_for_commit.store(false);
+		}
+		// else: reflection thread is mid-pass — leave refl_thread_wait_for_commit
+		// set and the dirty flags pending; a later job commits when it is idle.
 	}
 
+	// 3. Run the direct simulation for every simulator.
 	{
 		PROFILE_FUNCTION_NAMED("running_direct_simulation");
-		for (auto &ld : listeners) {
+		for (auto &ld : self->listeners) {
 			if (!ld.simulator)
 				continue;
 			iplSimulatorRunDirect(ld.simulator);
-
-			{
-				PROFILE_FUNCTION_NAMED("updating_source_db_levels");
-				static LocalVector<Ref<SteamAudioListenerSensorSlot>> temp_sensor_slots;
-				temp_sensor_slots.resize(ld.listener->get_num_source_db_sensor_slots());
-				for (int source_slot_index = 0; source_slot_index < ld.listener->get_num_source_db_sensor_slots(); ++source_slot_index) {
-					temp_sensor_slots[source_slot_index] = ld.listener->get_sensor_slot(source_slot_index);
-					// decay dB level
-					float current_db = temp_sensor_slots[source_slot_index]->get_db_level();
-					current_db -= delta * 30.0f; // decay by 30 dB per second
-					if (current_db < -60.0f) {
-						temp_sensor_slots[source_slot_index]->set_db_level(-500.0f);
-						temp_sensor_slots[source_slot_index]->set_steam_audio_source(nullptr);
-					} else {
-						temp_sensor_slots[source_slot_index]->set_db_level(current_db);
-					}
-				}
-				// update source db levels
-				ld.source_db_levels.clear();
-				for (auto &sd : sources) {
-					for (auto &sld : sd.listener_data) {
-						if (sld.listener != ld.listener)
-							continue;
-						if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
-							continue;
-						if (sld.out_of_range)
-							continue;
-
-						// Simulation has now run at least once for this source/listener
-						// pair, so iplSourceGetOutputs data and cached coords are valid.
-						sld.direct_simulated_once = true;
-
-						IPLSimulationOutputs outputs{};
-						iplSourceGetOutputs(sld.source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
-
-						ListenerSourceDBLevel source_db_level;
-						source_db_level.source = sd.source_node;
-						source_db_level.position = sd.source_node->get_global_position();
-						source_db_level.db_level = sd.current_db_level;
-						IPLDirectEffectParams direct_params = outputs.direct;
-						float total_direct_factor = 1.0f;
-
-						if (sd.source_node->get_occlusion_enabled()) {
-							float occlusion = direct_params.occlusion;
-							float transmission = 0.0f;
-							if (sd.source_node->get_transmission_enabled()) {
-								transmission = (direct_params.transmission[0] + direct_params.transmission[1] + direct_params.transmission[2]) / 3.0f;
-							}
-							// Total direct sound = sound that goes around (occlusion) + sound that goes through (transmission)
-							// We assume transmission only applies to the occluded part.
-							total_direct_factor *= (occlusion + (1.0f - occlusion) * transmission);
-						}
-
-						if (sd.source_node->get_air_absorption_enabled()) {
-							IPLAirAbsorptionModel airAbsorptionModel{};
-							airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
-							float air_absorption[3];
-							iplAirAbsorptionCalculate(phonon_context, sd.cached_coords.origin, ld.cached_coords.origin, &airAbsorptionModel, air_absorption);
-							float avg_air_absorption = (air_absorption[0] + air_absorption[1] + air_absorption[2]) / 3.0f;
-							total_direct_factor *= avg_air_absorption;
-						}
-
-						if (sd.source_node->get_distance_attenuation_enabled()) {
-							float dist = sld.dist_to_listener;
-							float min_dist = sd.source_node->get_distance_attenuation_min();
-							float max_dist = sd.source_node->get_distance_attenuation_max();
-							float attenuation = calculate_attenuation(dist, min_dist, max_dist);
-							total_direct_factor *= attenuation;
-						}
-
-						float final_db_level = source_db_level.db_level + 20.0f * Math::log(MAX(total_direct_factor, 1e-10f)) / Math::log(10.0f);
-						source_db_level.db_level = final_db_level;
-						ld.source_db_levels.push_back(source_db_level);
-						
-						if (final_db_level < -60.0f || temp_sensor_slots.is_empty())
-							continue;
-
-						// the following will update the sensor slots on the SteamAudioListener!
-
-						// update/insert current source in sensor slots if it's loud enough
-						int num_slots = (int)temp_sensor_slots.size();
-
-						// first check if the source is already in a slot
-						int existing_slot_index = -1;
-						for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
-							if (temp_sensor_slots[slot_index]->get_steam_audio_source() == sd.source_node) {
-								existing_slot_index = slot_index;
-								break;
-							}
-						}
-
-						if (existing_slot_index != -1) {
-							// source already exists, update it if the new level is higher
-							if (final_db_level > temp_sensor_slots[existing_slot_index]->get_db_level()) {
-								temp_sensor_slots[existing_slot_index]->set_db_level(final_db_level);
-								temp_sensor_slots[existing_slot_index]->set_position(sd.source_node->get_global_position());
-
-								// check if it needs to move up (becoming louder)
-								int current_slot = existing_slot_index;
-								while (current_slot > 0 && temp_sensor_slots[current_slot]->get_db_level() > temp_sensor_slots[current_slot - 1]->get_db_level()) {
-									// swap values with the slot above it
-									SteamAudioSource *prev_source = temp_sensor_slots[current_slot - 1]->get_steam_audio_source();
-									Vector3 prev_position = temp_sensor_slots[current_slot - 1]->get_position();
-									float prev_db = temp_sensor_slots[current_slot - 1]->get_db_level();
-
-									temp_sensor_slots[current_slot - 1]->set_steam_audio_source(temp_sensor_slots[current_slot]->get_steam_audio_source());
-									temp_sensor_slots[current_slot - 1]->set_position(temp_sensor_slots[current_slot]->get_position());
-									temp_sensor_slots[current_slot - 1]->set_db_level(temp_sensor_slots[current_slot]->get_db_level());
-
-									temp_sensor_slots[current_slot]->set_steam_audio_source(prev_source);
-									temp_sensor_slots[current_slot]->set_position(prev_position);
-									temp_sensor_slots[current_slot]->set_db_level(prev_db);
-
-									current_slot--;
-								}
-							}
-						} else {
-							for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
-								if (final_db_level > temp_sensor_slots[slot_index]->get_db_level()) {
-									// shift down remaining
-									for (int shift_index = num_slots - 1; shift_index > slot_index; --shift_index) {
-										temp_sensor_slots[shift_index]->set_steam_audio_source(temp_sensor_slots[shift_index - 1]->get_steam_audio_source());
-										temp_sensor_slots[shift_index]->set_position(temp_sensor_slots[shift_index - 1]->get_position());
-										temp_sensor_slots[shift_index]->set_db_level(temp_sensor_slots[shift_index - 1]->get_db_level());
-									}
-									temp_sensor_slots[slot_index]->set_steam_audio_source(sd.source_node);
-									temp_sensor_slots[slot_index]->set_position(sd.source_node->get_global_position());
-									temp_sensor_slots[slot_index]->set_db_level(final_db_level);
-									break;
-								}
-							}
-						}
-
-					}
-				}
-				temp_sensor_slots.clear();
-			}
 		}
 	}
 
-	new_inputs_set.store(true);
-	if (!is_refl_thread_processing.load()) {
-		std::unique_lock<std::mutex> lock_refl(refl_mux);
-		refl_cv.notify_one();
+	// 4. Inputs are committed/ready — wake the reflection thread.
+	self->new_inputs_set.store(true);
+	if (!self->is_refl_thread_processing.load()) {
+		std::unique_lock<std::mutex> lock_refl(self->refl_mux);
+		self->refl_cv.notify_one();
 	}
+
+	auto job_end = std::chrono::steady_clock::now();
+	float dur_ms = std::chrono::duration<float, std::milli>(job_end - job_start).count();
+	// Exponential moving average (alpha = 0.1)
+	float prev = self->direct_job_avg_duration_ms.load(std::memory_order_relaxed);
+	self->direct_job_avg_duration_ms.store(prev * 0.9f + dur_ms * 0.1f, std::memory_order_relaxed);
 }
 
 void SteamAudioServer::simulation_thread_func() {

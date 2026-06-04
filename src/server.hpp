@@ -5,6 +5,7 @@
 #include "godot_cpp/classes/node3d.hpp"
 #include "godot_cpp/classes/object.hpp"
 #include "godot_cpp/classes/thread.hpp"
+#include "godot_cpp/classes/worker_thread_pool.hpp"
 #include "godot_cpp/templates/local_vector.hpp"
 #include "godot_cpp/variant/packed_vector2_array.hpp"
 #include "material.hpp"
@@ -102,6 +103,14 @@ struct SourceListenerData {
 	IPLAudioBuffer output_buffer{};
 	IPLAudioBuffer ambisonics_buffer{};
 	uint8_t skip_reflection_applies = 0;
+
+	// IPLSource creation is allocation-heavy, so it is deferred from tick() (main
+	// thread) to the direct-sim job. When tick() decides this pair needs a source,
+	// it records the settings and the first frame's inputs here; the job performs
+	// the actual iplSourceCreate / iplSourceAdd / iplSourceSetInputs.
+	bool pending_create = false;
+	IPLSourceSettings pending_source_settings{};
+	IPLSimulationInputs pending_inputs{};
 
 	uint32_t debug_times_contributed = 0;
 };
@@ -216,9 +225,16 @@ private:
 
 	std::atomic<bool> is_running;
 
-	// Simulation Thread
+	// Reflection Simulation Thread
 	godot::Ref<godot::Thread> simulation_thread;
 	void simulation_thread_func();
+
+	// Direct simulation runs as a fire-and-forget WorkerThreadPool job, kicked off
+	// at the end of tick() and waited on (the barrier) at the start of the next
+	// tick(). It also owns the commit + reflection-thread handshake.
+	static void run_direct_job(void *p_self);
+	godot::WorkerThreadPool::TaskID direct_task_id = 0;
+	bool direct_job_pending = false;
 
 	// Mixing Thread
 	godot::Ref<godot::Thread> mixing_thread;
@@ -247,6 +263,7 @@ private:
 	std::atomic<float> mixing_thread_usage_pct{0.0f};
 	std::atomic<float> stress_mitigation{0.0f};
 	std::atomic<float> sim_thread_avg_duration_ms{0.0f};
+	std::atomic<float> direct_job_avg_duration_ms{0.0f};
 	std::mutex refl_mux;
 	std::condition_variable refl_cv;
 
@@ -303,6 +320,7 @@ public:
 	float get_mixing_thread_usage_pct() const;
 	float get_stress_mitigation() const;
 	float get_sim_thread_avg_duration_ms() const;
+	float get_direct_job_avg_duration_ms() const;
 	int get_source_count();
 	int get_listener_count();
 	godot::String get_source_name(int index);
