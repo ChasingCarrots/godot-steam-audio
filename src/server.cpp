@@ -306,7 +306,7 @@ String SteamAudioServer::get_source_debug_string(int index) {
 	String s;
 	s += "name: " + sd->debug_name + "\n";
 	s += "mixed_frames_ready: " + String::num_int64(sd->mixed_frames_ready) + "/" + String::num_int64(frame_size) + "\n";
-	s += "pending_consumers: " + String::num_int64(sd->pending_consumers) + "\n";
+	s += "mix_generation: " + String::num_int64((int64_t)sd->mix_generation) + "\n";
 	s += "debug_times_mixed: " + String::num_int64(sd->debug_times_mixed) + "\n";
 	s += "is_skipping_mixing: " + String(sd->is_skipping_mixing ? "yes\n" : "no\n");
 	s += "playbacks: " + String::num_int64((int)sd->playbacks.size()) + "\n";
@@ -328,6 +328,7 @@ String SteamAudioServer::get_source_debug_string(int index) {
 		s += " doppler=" + String::num(sld.doppler_pitch, 3);
 		s += " OutOfRange=" + String(sld.out_of_range ? "yes" : "no");
 		s += " last_gen=" + String::num_int64(sld.last_contributed_generation);
+		s += " last_consumed_mix=" + String::num_int64((int64_t)sld.last_consumed_mix);
 		s += " times_contributed=" + String::num_int64(sld.debug_times_contributed);
 		if (sld.skip_reflection_applies > 0)
 			s += " skipping refl=" + String::num_int64(sld.skip_reflection_applies);
@@ -345,10 +346,19 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 
 	String s;
 	s += "name: " + ld->debug_name + "\n";
-	s += "pending_contributors: " + String::num_int64(ld->pending_contributors) + "\n";
-	s += "pending_drains: " + String::num_int64(ld->pending_drains) + "\n";
 	s += "times_pushed: " + String::num_int64(ld->debug_times_pushed) + "\n";
 	s += "generation: " + String::num_int64(ld->generation) + "\n";
+	// Contributors-pending and drains-pending are now derived; per-playback
+	// "remaining" below shows drain state. Show pending drains as a quick summary.
+	{
+		std::lock_guard pb_lock(*ld->playbacks_mutex);
+		int pending_drains = 0;
+		for (const auto &pb : ld->playbacks) {
+			if (pb.remaining_from_push_buffer > 0)
+				pending_drains++;
+		}
+		s += "pending_drains (derived): " + String::num_int64(pending_drains) + "\n";
+	}
 	s += "push_buffer size: " + String::num_int64((int)ld->push_buffer.size()) + "/" + String::num_int64(frame_size) + "\n";
 	{
 		std::lock_guard pb_lock(*ld->playbacks_mutex);
@@ -725,8 +735,10 @@ void SteamAudioServer::tick(float delta) {
 							iplSourceRemove(sld->source, ld->simulator);
 							ld->dirty = true;
 						}
-						// this listener was a consumer, so we have to decrement the pending amount
-						sd->pending_consumers--;
+						// No consumer bookkeeping needed: the mixing thread's mix-reset
+						// gate recomputes consumers each cycle and simply skips
+						// out_of_range pairs. (Previously this decremented
+						// sd->pending_consumers here — a cross-thread RMW race.)
 					} else if (sld->out_of_range && sld->dist_to_listener <= listener_range) {
 						sld->out_of_range = false;
 						if (sld->source) {
@@ -1120,6 +1132,9 @@ void SteamAudioServer::apply_pending_ops() {
 				for (auto *ld : listeners) {
 					SourceListenerData sld;
 					if (create_source_listener_data(sld, sd, ld, phonon_context, &cached_audio_settings, phonon_hrtf)) {
+						// New source starts at mix_generation 0; align the pair so it
+						// doesn't appear to owe a consumption of a mix that never existed.
+						sld.last_consumed_mix = sd->mix_generation;
 						sd->listener_data.push_back(sld);
 					}
 				}
@@ -1134,16 +1149,8 @@ void SteamAudioServer::apply_pending_ops() {
 					if (sources[i] != sd)
 						continue;
 					for (auto &sld : sd->listener_data) {
-						// Adjust listener pending_contributors if this source was counted
-						// but hasn't contributed yet to the current generation.
-						for (auto *ld : listeners) {
-							if (sld.listener == ld && !sld.out_of_range &&
-									(sd->cfg.layers & ld->cfg.mask) != 0 &&
-									sld.last_contributed_generation != ld->generation &&
-									ld->pending_contributors > 0) {
-								ld->pending_contributors--;
-							}
-						}
+						// No counter fix-up needed: removing the source removes it from
+						// every listener's derived contributor scan next cycle.
 
 						// Remove source from its simulator (reuse ld loop)
 						for (auto *ld : listeners) {
@@ -1176,22 +1183,16 @@ void SteamAudioServer::apply_pending_ops() {
 				for (auto *sd : sources) {
 					SourceListenerData sld;
 					if (create_source_listener_data(sld, sd, ld, phonon_context, &cached_audio_settings, phonon_hrtf)) {
+						// Align the new pair with the source's current mix so it doesn't
+						// force re-consumption of a mix this listener was never present for.
+						sld.last_consumed_mix = sd->mix_generation;
 						sd->listener_data.push_back(sld);
 					}
 				}
 
-				// Initialize pending_contributors so Phase 3 can start immediately
-				ld->pending_contributors = 0;
-				for (auto *sd : sources) {
-					if ((sd->cfg.layers & ld->cfg.mask) == 0)
-						continue;
-					for (auto &sld : sd->listener_data) {
-						if (sld.listener == ld && !sld.out_of_range) {
-							ld->pending_contributors++;
-							break;
-						}
-					}
-				}
+				// No contributor seeding needed: the new listener's generation (1) does
+				// not match any pair's last_contributed_generation (0), so Phase 3's
+				// derived scan treats every relevant source as a pending contributor.
 
 				listeners.push_back(ld);
 
@@ -1207,19 +1208,9 @@ void SteamAudioServer::apply_pending_ops() {
 							continue;
 						SourceListenerData &sld = sd->listener_data[i];
 
-						if (!sld.out_of_range &&
-								(sd->cfg.layers & ld->cfg.mask) != 0 &&
-								sld.last_contributed_generation != ld->generation &&
-								ld->pending_contributors > 0) {
-							ld->pending_contributors--;
-						}
-						// Also release pending_consumers if this listener was counted
-						if (!sld.out_of_range &&
-								(sd->cfg.layers & ld->cfg.mask) != 0 &&
-								sd->mixed_frames_ready >= cached_audio_settings.frameSize &&
-								sd->pending_consumers > 0) {
-							sd->pending_consumers--;
-						}
+						// No counter fix-up needed: removing this pair drops the listener
+						// from each source's derived consumer scan and removes the source
+						// from this (now-gone) listener's contributor scan automatically.
 
 						// Remove source from simulator before releasing
 						if (ld->simulator && sld.source) {
@@ -1284,28 +1275,16 @@ void SteamAudioServer::apply_pending_ops() {
 					ld->playbacks.push_back({ pending.playback, 0, is_playback_of_source });
 				}
 				if (was_empty) {
-					// Listener was inactive — start a fresh cycle.
-					// Bump generation so stale last_contributed_generation won't match.
+					// Listener was inactive — start a fresh cycle. Clearing the buffer
+					// and bumping the generation together keeps the invariant that a new
+					// generation always starts from a zeroed push_buffer; the bump makes
+					// stale last_contributed_generation values mismatch, re-arming Phase 3
+					// to re-contribute every relevant source. No counter seeding: both
+					// contributors and consumers are derived each cycle, so a pair whose
+					// last_consumed_mix lags the source's mix_generation is picked up by
+					// the mix-reset gate once the listener is active again.
+					ld->push_buffer.fill(Vector2(0, 0));
 					ld->generation++;
-					ld->pending_contributors = 0;
-					ld->pending_drains = 0;
-
-					const int frame_size = cached_audio_settings.frameSize;
-					for (auto *sd : sources) {
-						if ((sd->cfg.layers & ld->cfg.mask) == 0)
-							continue;
-						for (auto &sld : sd->listener_data) {
-							if (sld.listener == ld && !sld.out_of_range) {
-								ld->pending_contributors++;
-								// If source has a ready mix, increment pending_consumers
-								// so it waits for this listener to consume before resetting.
-								if (sd->mixed_frames_ready >= frame_size) {
-									sd->pending_consumers++;
-								}
-								break;
-							}
-						}
-					}
 				}
 
 			} else if constexpr (std::is_same_v<T, PendingAddGeometry>) {
@@ -1367,22 +1346,29 @@ void SteamAudioServer::process_audio() {
 		PROFILE_FUNCTION_NAMED("process_audio_phase1");
 		// =========================================================================
 		// PHASE 1: Drain push_buffers into listener playbacks.
-		// Push ready push_buffers to playbacks. When fully drained, clear and
-		// recount pending_contributors for the next round.
+		// Push ready push_buffers to playbacks. When fully drained, clear and bump
+		// the generation to arm the next contribution round.
 		// =========================================================================
 		for (auto *ld : listeners) {
-			if (ld->pending_drains <= 0)
+			std::lock_guard pb_lock(*ld->playbacks_mutex);
+
+			// Drain gate (derived): is any playback still holding data from the
+			// current push_buffer? If not, there is nothing to drain this cycle.
+			bool any_pending = false;
+			for (const auto &pb : ld->playbacks) {
+				if (pb.remaining_from_push_buffer > 0) {
+					any_pending = true;
+					break;
+				}
+			}
+			if (!any_pending)
 				continue;
 
 			PROFILE_FUNCTION_NAMED("Listener draining");
-			std::lock_guard pb_lock(*ld->playbacks_mutex);
 
 			// Remove dead playbacks and push remaining data to active ones.
 			for (int i = (int)ld->playbacks.size() - 1; i >= 0; --i) {
 				if (!ld->playbacks[i].playback->is_playing()) {
-					if (ld->playbacks[i].remaining_from_push_buffer > 0) {
-						ld->pending_drains--;
-					}
 					ld->playbacks.remove_at(i);
 					continue;
 				}
@@ -1416,29 +1402,22 @@ void SteamAudioServer::process_audio() {
 						pb.remaining_from_push_buffer -= num_to_push;
 					}
 				}
-				if (pb.remaining_from_push_buffer <= 0)
-					ld->pending_drains--;
 			}
 
-			// All playbacks drained — clear buffer and recount contributors.
-			if (ld->pending_drains <= 0) {
-				ld->debug_times_pushed += 1;
-				ld->pending_drains = 0;
-				ld->push_buffer.fill(Vector2(0, 0));
-				ld->generation++;
-
-				// Count relevant in-range sources as contributors
-				ld->pending_contributors = 0;
-				for (auto *sd : sources) {
-					if ((sd->cfg.layers & ld->cfg.mask) == 0)
-						continue;
-					for (auto &sld : sd->listener_data) {
-						if (sld.listener == ld && !sld.out_of_range) {
-							ld->pending_contributors++;
-							break;
-						}
-					}
+			// All playbacks drained — clear buffer and arm the next round.
+			bool still_pending = false;
+			for (const auto &pb : ld->playbacks) {
+				if (pb.remaining_from_push_buffer > 0) {
+					still_pending = true;
+					break;
 				}
+			}
+			if (!still_pending) {
+				ld->debug_times_pushed += 1;
+				ld->push_buffer.fill(Vector2(0, 0));
+				// Bumping the generation re-arms Phase 3's derived contributor scan;
+				// no explicit contributor count is maintained.
+				ld->generation++;
 			}
 		}
 	}
@@ -1470,9 +1449,35 @@ void SteamAudioServer::process_audio() {
 					sd->current_db_level = -200;
 			}
 
-			// Skip if listeners still need the previous mix.
-			if (sd->pending_consumers > 0)
-				continue;
+			// Mix-reset gate (derived): if a completed mix is still owed to any
+			// active consumer, don't reset/re-mix yet. A consumer is "active" when
+			// its mask matches, it is in range, and the listener has a playing
+			// playback; it still owes consumption while last_consumed_mix <
+			// mix_generation. Recomputed each cycle, so a removed/inactive/out-of-range
+			// listener can never strand the source.
+			if (sd->mixed_frames_ready >= frame_size) {
+				bool consumers_pending = false;
+				for (auto &sld : sd->listener_data) {
+					if ((sd->cfg.layers & sld.listener->cfg.mask) == 0)
+						continue;
+					if (sld.out_of_range)
+						continue;
+					if (sld.last_consumed_mix >= sd->mix_generation)
+						continue;
+					ListenerData *ld = sld.listener;
+					std::lock_guard pb_lock(*ld->playbacks_mutex);
+					for (auto &pb : ld->playbacks) {
+						if (pb.playback->is_playing()) {
+							consumers_pending = true;
+							break;
+						}
+					}
+					if (consumers_pending)
+						break;
+				}
+				if (consumers_pending)
+					continue;
+			}
 
 			// Reset completed+consumed mix
 			if (sd->mixed_frames_ready >= frame_size) {
@@ -1564,29 +1569,12 @@ void SteamAudioServer::process_audio() {
 				}
 			}
 			if (sd->mixed_frames_ready == frame_size) {
-				// Mix complete — count listeners with active playbacks as consumers.
-				sd->pending_consumers = 0;
-				for (auto &sld : sd->listener_data) {
-					if ((sd->cfg.layers & sld.listener->cfg.mask) == 0)
-						continue;
-					if (sld.out_of_range)
-						continue;
-					// Check if this listener has active (playing) playbacks
-					ListenerData *ld = sld.listener;
-					{
-						std::lock_guard pb_lock(*ld->playbacks_mutex);
-						bool has_playing = false;
-						for (auto &pb : ld->playbacks) {
-							if (pb.playback->is_playing()) {
-								has_playing = true;
-								break;
-							}
-						}
-						if (has_playing) {
-							sd->pending_consumers++;
-						}
-					}
-				}
+				// Mix complete — advance the mix generation. Every active consumer now
+				// has last_consumed_mix < mix_generation and so "owes" a consumption,
+				// which the mix-reset gate above derives next cycle. This block runs
+				// once per completed mix: the gate then blocks re-entry until the mix
+				// is reset, and the reset only happens once all consumers have caught up.
+				sd->mix_generation++;
 
 				// Calculate dB level for current mix
 				float sum_sq = 0.0f;
@@ -1612,9 +1600,8 @@ void SteamAudioServer::process_audio() {
 		// from ready sources and accumulate into push_buffer.
 		// =========================================================================
 		for (auto *ld : listeners) {
-			// Skip listeners without active playbacks — they would cycle through
-			// generations instantly, consuming source mixes before real listeners can.
 			bool has_active_playbacks;
+			bool drains_pending = false;
 			{
 				std::lock_guard pb_lock(*ld->playbacks_mutex);
 				// Remove dead playbacks
@@ -1624,53 +1611,33 @@ void SteamAudioServer::process_audio() {
 					}
 				}
 				has_active_playbacks = !ld->playbacks.is_empty();
+				for (const auto &pb : ld->playbacks) {
+					if (pb.remaining_from_push_buffer > 0) {
+						drains_pending = true;
+						break;
+					}
+				}
 			}
 
 			if (!has_active_playbacks) {
-				// No playbacks — release pending_consumers to prevent stalls.
-				if (ld->pending_contributors > 0) {
-					for (auto *sd : sources) {
-						if ((sd->cfg.layers & ld->cfg.mask) == 0)
-							continue;
-						if (sd->mixed_frames_ready < frame_size)
-							continue;
-						for (auto &entry : sd->listener_data) {
-							if (entry.listener == ld && !entry.out_of_range &&
-									entry.last_contributed_generation != ld->generation) {
-								if (sd->pending_consumers > 0)
-									sd->pending_consumers--;
-								entry.last_contributed_generation = ld->generation;
-								break;
-							}
-						}
-					}
-				}
-				ld->pending_contributors = 0;
-				ld->pending_drains = 0;
+				// Inactive listeners are excluded from every source's derived consumer
+				// scan (which requires a playing playback), so they can no longer stall a
+				// source. No fake-consumption bookkeeping needed.
 				continue;
 			}
 
-			if (ld->pending_contributors <= 0 && ld->pending_drains <= 0) {
-				ld->push_buffer.fill(Vector2(0, 0));
-				ld->generation++;
-				ld->pending_contributors = 0;
-				for (auto *sd : sources) {
-					if ((sd->cfg.layers & ld->cfg.mask) == 0)
-						continue;
-					for (auto &sld : sd->listener_data) {
-						if (sld.listener == ld && !sld.out_of_range) {
-							ld->pending_contributors++;
-							break;
-						}
-					}
-				}
-			}
-
-			if (ld->pending_contributors <= 0)
+			// If the previous push_buffer is still draining to playbacks, leave it
+			// untouched; Phase 1 finishes draining it and bumps the generation, which
+			// re-arms a fresh (cleared) contribution round.
+			if (drains_pending)
 				continue;
 
 			PROFILE_FUNCTION_NAMED("Listener mixing");
 
+			// "Contributors done" is derived, not counted: a relevant, in-range,
+			// already-simulated source whose mix isn't ready yet leaves the round
+			// pending. When nothing remains pending, the push_buffer is complete.
+			bool any_contributor_pending = false;
 			for (auto *sd : sources) {
 				if ((sd->cfg.layers & ld->cfg.mask) == 0)
 					continue;
@@ -1690,35 +1657,35 @@ void SteamAudioServer::process_audio() {
 				if (sld->last_contributed_generation == ld->generation)
 					continue;
 
-				// Not simulated yet: this source was counted as a contributor
-				// (unless out of range), but has no valid audio/effects. Decrement
-				// so the listener is NOT blocked, then skip. Phase 2 also withholds
-				// its mixing, so no audio is consumed in the meantime.
+				// Out of range — counts as done for this round, adds no audio, and must
+				// NEVER block: an idle out-of-range source stops mixing and resets its
+				// mix, so it sits at mixed_frames_ready < frame_size indefinitely. This
+				// check must precede the readiness check below, or the round would stall
+				// the moment a source leaves range. (Out-of-range pairs are excluded from
+				// the source's consumer scan, so no last_consumed_mix stamp is needed.)
+				if (sld->out_of_range) {
+					sld->last_contributed_generation = ld->generation;
+					continue;
+				}
+
+				// Not simulated yet: has no valid audio/effects. Mark it done for this
+				// generation (and consumed) so it never blocks the round. Phase 2 also
+				// withholds its mixing, so no audio is consumed meanwhile.
 				if (!sld->direct_simulated_once) {
 					sld->last_contributed_generation = ld->generation;
-					if (!sld->out_of_range) {
-						if (ld->pending_contributors > 0)
-							ld->pending_contributors--;
-						if (sd->pending_consumers > 0)
-							sd->pending_consumers--;
-					}
+					sld->last_consumed_mix = sd->mix_generation;
 					continue;
 				}
 
 				if (sd->mixed_frames_ready < frame_size) {
-					// Source not ready yet
+					// In range and simulated, but its mix isn't ready yet — the round
+					// legitimately waits for this source to complete its mix.
+					any_contributor_pending = true;
 					continue;
 				}
 
-				// Mark contributed even when out of range
+				// In range, simulated, ready — contribute.
 				sld->last_contributed_generation = ld->generation;
-
-				// Out of range — decrement contributors, but skip processing.
-				if (sld->out_of_range) {
-					if (ld->pending_contributors > 0)
-						ld->pending_contributors--;
-					continue;
-				}
 
 				// Copy pre-mixed source audio into SteamAudio input buffer
 				for (int s = 0; s < frame_size; ++s) {
@@ -1728,10 +1695,10 @@ void SteamAudioServer::process_audio() {
 
 				sld->debug_times_contributed += 1;
 
-				if (ld->pending_contributors > 0)
-					ld->pending_contributors--;
-				if (sd->pending_consumers > 0)
-					sd->pending_consumers--;
+				// This pair has now consumed the source's current mix for this round.
+				// (Stamped at the contribute point, not at playback drain, so a listener
+				// whose ring buffer is full still releases the source's mix-reset gate.)
+				sld->last_consumed_mix = sd->mix_generation;
 
 				// Direct effects
 				if (sd->cfg.direct_enabled && sld->source && sld->direct_effect) {
@@ -1850,7 +1817,7 @@ void SteamAudioServer::process_audio() {
 			}
 
 			// If all contributors are done for this listener, finish reflections processing
-			if (ld->pending_contributors <= 0 && ld->reflection_mixer && ld->ambisonics_decode_effect) {
+			if (!any_contributor_pending && ld->reflection_mixer && ld->ambisonics_decode_effect) {
 				PROFILE_FUNCTION_NAMED("Reflection Mixer Processing");
 				IPLReflectionEffectParams apply_refl_params{};
 				apply_refl_params.type = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
@@ -1873,8 +1840,7 @@ void SteamAudioServer::process_audio() {
 			}
 
 			// All contributors done — start draining push_buffer to playbacks
-			if (ld->pending_contributors <= 0) {
-				ld->pending_contributors = 0;
+			if (!any_contributor_pending) {
 				std::lock_guard pb_lock(*ld->playbacks_mutex);
 
 				for (int i = (int)ld->playbacks.size() - 1; i >= 0; --i) {
@@ -1883,16 +1849,13 @@ void SteamAudioServer::process_audio() {
 					}
 				}
 
-				ld->pending_drains = 0;
 				for (int i = (int)ld->playbacks.size() - 1; i >= 0; --i) {
 					auto &pb = ld->playbacks[i];
 					pb.remaining_from_push_buffer = frame_size;
-					ld->pending_drains++;
 					int free_available_in_buffer = pb.playback->get_free_buffer_size();
 					if (frame_size <= free_available_in_buffer) {
 						pb.playback->push_buffer(ld->push_buffer);
 						pb.remaining_from_push_buffer = 0;
-						ld->pending_drains--;
 						pb.debug_times_drained += 1;
 					} else {
 						int num_to_push = MIN(frame_size, free_available_in_buffer);
@@ -1903,24 +1866,19 @@ void SteamAudioServer::process_audio() {
 					}
 				}
 
-				// All playbacks consumed immediately — clear and recount contributors
-				if (ld->pending_drains <= 0) {
+				// All playbacks consumed immediately — clear and re-arm the next round.
+				// (Bumping the generation makes every pair pending again next cycle.)
+				bool still_pending = false;
+				for (const auto &pb : ld->playbacks) {
+					if (pb.remaining_from_push_buffer > 0) {
+						still_pending = true;
+						break;
+					}
+				}
+				if (!still_pending) {
 					ld->debug_times_pushed += 1;
-					ld->pending_drains = 0;
 					ld->push_buffer.fill(Vector2(0, 0));
 					ld->generation++;
-
-					ld->pending_contributors = 0;
-					for (auto *sd : sources) {
-						if ((sd->cfg.layers & ld->cfg.mask) == 0)
-							continue;
-						for (auto &sld : sd->listener_data) {
-							if (sld.listener == ld && !sld.out_of_range) {
-								ld->pending_contributors++;
-								break;
-							}
-						}
-					}
 				}
 			}
 		}

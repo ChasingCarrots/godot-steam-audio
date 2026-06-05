@@ -76,17 +76,13 @@ struct ListenerData {
 	// added to it, it will be pushed to the listener's playbacks, ready for a new round.
 	godot::PackedVector2Array push_buffer;
 
-	// Counter-based flow control:
-	// pending_contributors: number of relevant (to this listener) sources that still need to contribute
-	// to the push_buffer. Set when push_buffer is cleared, decremented as sources contribute.
-	// When it reaches 0, the push_buffer is ready to be pushed to playbacks.
-	int pending_contributors = 0;
-	// pending_drains: number of playbacks that still need to fully consume the push_buffer.
-	// Set when push_buffer becomes ready, decremented as playbacks finish draining.
-	// When it reaches 0, the push_buffer can be cleared and reused.
-	int pending_drains = 0;
-	// Generation counter: incremented each time the push_buffer is cleared and
-	// pending_contributors is recomputed. Used with SourceListenerData::last_contributed_generation
+	// Generation-based flow control (no maintained counters):
+	// - "Contributors still pending" is derived each cycle in Phase 3 by scanning the
+	//   relevant sources and checking last_contributed_generation against `generation`.
+	// - "Drains still pending" is derived in Phase 1 by scanning playbacks for any with
+	//   remaining_from_push_buffer > 0.
+	// Generation counter: incremented each time the push_buffer is cleared, which arms a
+	// fresh contribution round. Used with SourceListenerData::last_contributed_generation
 	// to track which sources have already contributed without needing reset loops.
 	uint32_t generation = 1;
 
@@ -124,6 +120,10 @@ struct SourceListenerData {
 	// Generation of the listener's push_buffer that this SLD last contributed to.
 	// Compared against ListenerData::generation to determine if contribution is needed.
 	uint32_t last_contributed_generation = 0;
+	// mix_generation of the source that this pair last consumed. Compared against
+	// SourceData::mix_generation to decide whether this listener still owes a
+	// consumption of the source's current mix (gates the source's mix-reset).
+	uint64_t last_consumed_mix = 0;
 	IPLSource source = nullptr;
 	IPLBinauralEffect binaural_effect = nullptr;
 	IPLDirectEffect direct_effect = nullptr;
@@ -192,10 +192,12 @@ struct SourceData {
 	// Pre-mixed audio frames from source playbacks.
 	godot::PackedVector2Array mixed_frames;
 	int mixed_frames_ready = 0;
-	// Number of listeners that still need to consume the current mix.
-	// Set when mixed_frames_ready == frame_size, decremented as listeners consume.
-	// When it reaches 0, the source can reset and start a new mix.
-	int pending_consumers = 0;
+	// Monotonic generation of the current full mix. Bumped once each time
+	// mixed_frames becomes a complete frame. Consumption is tracked per-pair via
+	// SourceListenerData::last_consumed_mix, so there is no maintained consumer
+	// counter to desync: the mix-reset gate is recomputed each cycle by comparing
+	// each active listener's last_consumed_mix against this value.
+	uint64_t mix_generation = 0;
 	bool is_skipping_mixing = false;
 
 	float current_db_level = 0;
