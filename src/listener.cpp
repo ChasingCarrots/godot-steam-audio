@@ -9,26 +9,28 @@
 using namespace godot;
 
 void SteamAudioListenerSensorSlot::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("set_steam_audio_source", "p_source_node"), &SteamAudioListenerSensorSlot::set_steam_audio_source);
+	ClassDB::bind_method(D_METHOD("get_source_rid"), &SteamAudioListenerSensorSlot::get_source_rid);
 	ClassDB::bind_method(D_METHOD("get_steam_audio_source"), &SteamAudioListenerSensorSlot::get_steam_audio_source);
 	ClassDB::bind_method(D_METHOD("set_position", "p_position"), &SteamAudioListenerSensorSlot::set_position);
 	ClassDB::bind_method(D_METHOD("get_position"), &SteamAudioListenerSensorSlot::get_position);
 	ClassDB::bind_method(D_METHOD("set_db_level", "db_level"), &SteamAudioListenerSensorSlot::set_db_level);
 	ClassDB::bind_method(D_METHOD("get_db_level"), &SteamAudioListenerSensorSlot::get_db_level);
 
-	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "steam_audio_source", PROPERTY_HINT_NODE_TYPE, "SteamAudioSource"), "set_steam_audio_source", "get_steam_audio_source");
+	ADD_PROPERTY(PropertyInfo(Variant::RID, "source_rid", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "", "get_source_rid");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "position"), "set_position", "get_position");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "db_level"), "set_db_level", "get_db_level");
 }
 
-void SteamAudioListenerSensorSlot::set_steam_audio_source(SteamAudioSource *p_source_node) { source_node = p_source_node; }
-SteamAudioSource *SteamAudioListenerSensorSlot::get_steam_audio_source() { return source_node; }
+void SteamAudioListenerSensorSlot::set_source_rid(const RID &p_source) { source = p_source; }
+RID SteamAudioListenerSensorSlot::get_source_rid() const { return source; }
+SteamAudioSource *SteamAudioListenerSensorSlot::get_steam_audio_source() { return SteamAudioSource::for_rid(source); }
 void SteamAudioListenerSensorSlot::set_position(const godot::Vector3 &p_position) { position = p_position; }
 godot::Vector3 SteamAudioListenerSensorSlot::get_position() { return position; }
 void SteamAudioListenerSensorSlot::set_db_level(float p_db_level) { db_level = p_db_level; }
 float SteamAudioListenerSensorSlot::get_db_level() { return db_level; }
 
 void SteamAudioListener::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_rid"), &SteamAudioListener::get_rid);
 	ClassDB::bind_method(D_METHOD("play_on_audiostreamplayer", "audiostreamplayer"), &SteamAudioListener::play_on_audiostreamplayer);
 
 	ClassDB::bind_method(D_METHOD("get_reflection_simulation_enabled"), &SteamAudioListener::get_reflection_simulation_enabled);
@@ -71,9 +73,106 @@ void SteamAudioListener::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "sensor_slots", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_READ_ONLY), "", "get_sensor_slots");
 }
 
+void SteamAudioListener::push_config() {
+	if (!rid.is_valid())
+		return;
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (!srv)
+		return;
+	srv->listener_set_mask(rid, mask);
+	srv->listener_set_range(rid, range);
+	srv->listener_set_reflection(rid, reflection_simulation_enabled, num_refl_rays, num_refl_bounces, refl_duration, refl_ambisonics_order, refl_type, irradiance_min_dist);
+}
+
 void SteamAudioListener::ready_internal() {
 	generator.instantiate();
-	SteamAudioServer::get_singleton()->add_listener(this);
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (!srv)
+		return;
+	rid = srv->listener_create();
+	srv->listener_set_debug_name(rid, get_name());
+	push_config();
+	srv->listener_set_transform(rid, get_global_transform());
+}
+
+void SteamAudioListener::update_sensor_slots(float delta) {
+	int num_slots = (int)sensor_slots.size();
+	if (num_slots == 0)
+		return;
+	if (!rid.is_valid())
+		return;
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (!srv)
+		return;
+
+	// decay dB levels
+	for (auto &slot : sensor_slots) {
+		float current_db = slot->get_db_level();
+		current_db -= delta * 30.0f; // decay by 30 dB per second
+		if (current_db < -60.0f) {
+			slot->set_db_level(-500.0f);
+			slot->set_source_rid(RID());
+		} else {
+			slot->set_db_level(current_db);
+		}
+	}
+
+	const LocalVector<ListenerSourceDBLevel> &levels = srv->listener_get_source_db_levels_ref(rid);
+	for (const auto &lvl : levels) {
+		float final_db_level = lvl.db_level;
+		if (final_db_level < -60.0f)
+			continue;
+
+		// first check if the source is already in a slot
+		int existing_slot_index = -1;
+		for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
+			if (sensor_slots[slot_index]->get_source_rid() == lvl.source) {
+				existing_slot_index = slot_index;
+				break;
+			}
+		}
+
+		if (existing_slot_index != -1) {
+			// source already exists, update it if the new level is higher
+			if (final_db_level > sensor_slots[existing_slot_index]->get_db_level()) {
+				sensor_slots[existing_slot_index]->set_db_level(final_db_level);
+				sensor_slots[existing_slot_index]->set_position(lvl.position);
+
+				// check if it needs to move up (becoming louder)
+				int current_slot = existing_slot_index;
+				while (current_slot > 0 && sensor_slots[current_slot]->get_db_level() > sensor_slots[current_slot - 1]->get_db_level()) {
+					RID prev_source = sensor_slots[current_slot - 1]->get_source_rid();
+					Vector3 prev_position = sensor_slots[current_slot - 1]->get_position();
+					float prev_db = sensor_slots[current_slot - 1]->get_db_level();
+
+					sensor_slots[current_slot - 1]->set_source_rid(sensor_slots[current_slot]->get_source_rid());
+					sensor_slots[current_slot - 1]->set_position(sensor_slots[current_slot]->get_position());
+					sensor_slots[current_slot - 1]->set_db_level(sensor_slots[current_slot]->get_db_level());
+
+					sensor_slots[current_slot]->set_source_rid(prev_source);
+					sensor_slots[current_slot]->set_position(prev_position);
+					sensor_slots[current_slot]->set_db_level(prev_db);
+
+					current_slot--;
+				}
+			}
+		} else {
+			for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
+				if (final_db_level > sensor_slots[slot_index]->get_db_level()) {
+					// shift down remaining
+					for (int shift_index = num_slots - 1; shift_index > slot_index; --shift_index) {
+						sensor_slots[shift_index]->set_source_rid(sensor_slots[shift_index - 1]->get_source_rid());
+						sensor_slots[shift_index]->set_position(sensor_slots[shift_index - 1]->get_position());
+						sensor_slots[shift_index]->set_db_level(sensor_slots[shift_index - 1]->get_db_level());
+					}
+					sensor_slots[slot_index]->set_source_rid(lvl.source);
+					sensor_slots[slot_index]->set_position(lvl.position);
+					sensor_slots[slot_index]->set_db_level(final_db_level);
+					break;
+				}
+			}
+		}
+	}
 }
 
 void SteamAudioListener::_notification(int p_what) {
@@ -81,13 +180,35 @@ void SteamAudioListener::_notification(int p_what) {
 		case NOTIFICATION_ENTER_TREE:
 			if (Engine::get_singleton()->is_editor_hint())
 				return;
+			set_notify_transform(true);
+			set_process(true);
 			ready_internal();
 			break;
 		case NOTIFICATION_EXIT_TREE:
 			if (Engine::get_singleton()->is_editor_hint())
 				return;
-			SteamAudioServer::get_singleton()->remove_listener(this);
+			set_notify_transform(false);
+			if (rid.is_valid()) {
+				SteamAudioServer *srv = SteamAudioServer::get_singleton();
+				if (srv)
+					srv->listener_free(rid);
+				rid = RID();
+			}
 			break;
+		case NOTIFICATION_TRANSFORM_CHANGED: {
+			if (Engine::get_singleton()->is_editor_hint() || !rid.is_valid())
+				return;
+			SteamAudioServer *srv = SteamAudioServer::get_singleton();
+			if (srv)
+				srv->listener_set_transform(rid, get_global_transform());
+			break;
+		}
+		case NOTIFICATION_PROCESS: {
+			if (Engine::get_singleton()->is_editor_hint())
+				return;
+			update_sensor_slots(get_process_delta_time());
+			break;
+		}
 		case NOTIFICATION_READY: {
 			if (Engine::get_singleton()->is_editor_hint())
 				return;
@@ -123,7 +244,7 @@ Ref<AudioStreamSteamAudioListenerPlayback> SteamAudioListener::play_on_audiostre
 		// the output buffer should just be 2 times the frame size (so it can essentially
 		// fit 2 rounds of steam simulation mixed audio)
 		playback->set_buffer_size(SteamAudioServer::get_singleton()->get_frame_size() * 2);
-		SteamAudioServer::get_singleton()->add_playback_to_listener(this, playback);
+		SteamAudioServer::get_singleton()->listener_add_playback(rid, playback);
 	}
 	else {
 		ERR_PRINT("SteamAudioListener: play_on_audiostreamplayer failed.");
@@ -135,17 +256,20 @@ SteamAudioListener::SteamAudioListener() {}
 SteamAudioListener::~SteamAudioListener() {}
 
 int SteamAudioListener::get_num_refl_rays() { return num_refl_rays; }
-void SteamAudioListener::set_num_refl_rays(int p_num_refl_rays) { num_refl_rays = p_num_refl_rays; }
+void SteamAudioListener::set_num_refl_rays(int p_num_refl_rays) { num_refl_rays = p_num_refl_rays; push_config(); }
 int SteamAudioListener::get_num_refl_bounces() { return num_refl_bounces; }
-void SteamAudioListener::set_num_refl_bounces(int p_num_refl_bounces) { num_refl_bounces = p_num_refl_bounces; }
+void SteamAudioListener::set_num_refl_bounces(int p_num_refl_bounces) { num_refl_bounces = p_num_refl_bounces; push_config(); }
 int SteamAudioListener::get_refl_ambisonics_order() { return refl_ambisonics_order; }
-void SteamAudioListener::set_refl_ambisonics_order(int p_refl_ambisonics_order) { refl_ambisonics_order = p_refl_ambisonics_order; }
+void SteamAudioListener::set_refl_ambisonics_order(int p_refl_ambisonics_order) { refl_ambisonics_order = p_refl_ambisonics_order; push_config(); }
 float SteamAudioListener::get_refl_duration() { return refl_duration; }
-void SteamAudioListener::set_refl_duration(float p_refl_duration) { refl_duration = p_refl_duration; }
+void SteamAudioListener::set_refl_duration(float p_refl_duration) { refl_duration = p_refl_duration; push_config(); }
 float SteamAudioListener::get_irradiance_min_dist() { return irradiance_min_dist; }
-void SteamAudioListener::set_irradiance_min_dist(float p_irradiance_min_dist) { irradiance_min_dist = p_irradiance_min_dist; }
+void SteamAudioListener::set_irradiance_min_dist(float p_irradiance_min_dist) { irradiance_min_dist = p_irradiance_min_dist; push_config(); }
 int SteamAudioListener::get_refl_type() { return refl_type; }
-void SteamAudioListener::set_refl_type(int p_refl_type) { refl_type = p_refl_type; }
+void SteamAudioListener::set_refl_type(int p_refl_type) { refl_type = p_refl_type; push_config(); }
+void SteamAudioListener::set_mask(uint32_t p_mask) { mask = p_mask; push_config(); }
+void SteamAudioListener::set_range(float p_range) { range = p_range; push_config(); }
+void SteamAudioListener::set_reflection_simulation_enabled(bool p_enabled) { reflection_simulation_enabled = p_enabled; push_config(); }
 
 void SteamAudioListener::set_num_source_db_sensor_slots(int p_num_source_db_sensor_slots) {
 	int current_size = sensor_slots.size();

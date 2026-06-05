@@ -7,8 +7,13 @@
 #include "godot_cpp/classes/thread.hpp"
 #include "godot_cpp/classes/worker_thread_pool.hpp"
 #include "godot_cpp/templates/local_vector.hpp"
+#include "godot_cpp/templates/rid_owner.hpp"
 #include "godot_cpp/variant/packed_vector2_array.hpp"
-#include "material.hpp"
+#include "godot_cpp/variant/packed_int32_array.hpp"
+#include "godot_cpp/variant/packed_vector3_array.hpp"
+#include "godot_cpp/variant/rid.hpp"
+#include "godot_cpp/variant/transform3d.hpp"
+#include "godot_cpp/variant/typed_array.hpp"
 #include <phonon.h>
 #include <atomic>
 #include <condition_variable>
@@ -19,31 +24,50 @@
 #include <vector>
 
 #include "AudioStreamSteamAudioListener.h"
+#include "godot_cpp/classes/audio_effect.hpp"
 #include "godot_cpp/classes/audio_stream_playback.hpp"
 
 namespace godot {
 class AudioStream;
 }
-class SteamAudioListener;
-class SteamAudioSource;
+
+struct ListenerData;
 
 struct ListenerPlaybackEntry {
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
 	int remaining_from_push_buffer = 0;
-	// ONLY TO BE USED AS IDENTIFIER!
-	SteamAudioSource* is_playback_of_source = nullptr;
+	// ONLY TO BE USED AS IDENTIFIER! RID of the source this playback belongs to
+	// (when a listener plays back through a source, e.g. walkie talkie), else invalid.
+	godot::RID is_playback_of_source;
 
 	uint32_t debug_times_drained = 0;
 };
 
 struct ListenerSourceDBLevel {
-	SteamAudioSource* source;
+	godot::RID source;
 	godot::Vector3 position;
 	float db_level = 0.0f;
 };
 
+// All configuration a listener pushes into the server. Plain data, read across
+// threads; no SteamAudioListener node knowledge.
+struct ListenerConfig {
+	uint32_t mask = 1;
+	float range = 0.0f;
+	bool reflection_simulation_enabled = true;
+	int num_refl_rays = 4096;
+	int num_refl_bounces = 16;
+	float refl_duration = 2.0f;
+	int refl_ambisonics_order = 1;
+	int refl_type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+	float irradiance_min_dist = 1.0f;
+};
+
 struct ListenerData {
-	SteamAudioListener *listener = nullptr;
+	godot::RID self;
+	ListenerConfig cfg;
+	godot::String debug_name;
+
 	IPLSimulator simulator = nullptr;
 	bool simulator_reflection_enabled = false;
 
@@ -72,6 +96,10 @@ struct ListenerData {
 
 	godot::LocalVector<ListenerSourceDBLevel> source_db_levels;
 
+	// Transform pushed by the owner (node or RID user); consumed on the main thread.
+	godot::Transform3D pending_transform;
+	bool has_transform = false;
+
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
 	godot::Transform3D last_trf;
@@ -86,7 +114,9 @@ struct ListenerData {
 };
 
 struct SourceListenerData {
-	SteamAudioListener *listener = nullptr;
+	// Stable pointer into listener_owner storage; identifies the listener this
+	// per-pair state belongs to.
+	ListenerData *listener = nullptr;
 	float dist_to_listener = 0.0f;
 	float doppler_pitch = 1.0f;
 	bool out_of_range = false;
@@ -124,8 +154,36 @@ struct SourcePlaybackEntry {
 	uint32_t debug_num_mixed = 0;
 };
 
+// All configuration a source pushes into the server. Plain data, read across
+// threads; no SteamAudioSource node knowledge.
+struct SourceConfig {
+	uint32_t layers = 1;
+	float volume_db = 0.0f;
+	bool direct_enabled = true;
+	bool binaural_enabled = true;
+	int binaural_interpolation = IPL_HRTFINTERPOLATION_NEAREST;
+	float binaural_spatial_blend = 1.0f;
+	bool distance_attenuation_enabled = true;
+	float distance_attenuation_min = 1.0f;
+	float distance_attenuation_max = 120.0f;
+	bool air_absorption_enabled = true;
+	bool occlusion_enabled = false;
+	int occlusion_type = IPL_OCCLUSIONTYPE_RAYCAST;
+	float occlusion_radius = 1.0f;
+	int occlusion_samples = 16;
+	bool transmission_enabled = false;
+	int transmission_type = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+	int transmission_rays = 16;
+	bool reflection_enabled = false;
+	float reflection_duration = 2.0f;
+	float reflection_hybrid_delay = 0.5f;
+	float doppler_factor = 1.0f;
+};
+
 struct SourceData {
-	SteamAudioSource *source_node = nullptr;
+	godot::RID self;
+	SourceConfig cfg;
+	godot::String debug_name;
 
 	godot::LocalVector<SourcePlaybackEntry> playbacks;
 
@@ -146,6 +204,10 @@ struct SourceData {
 	// AudioEffectInstances created from the source's effect stack
 	godot::LocalVector<godot::Ref<godot::AudioEffectInstance>> effect_instances;
 
+	// Transform pushed by the owner (node or RID user); consumed on the main thread.
+	godot::Transform3D pending_transform;
+	bool has_transform = false;
+
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
 	godot::Transform3D last_trf;
@@ -153,51 +215,61 @@ struct SourceData {
 	uint32_t debug_times_mixed = 0;
 };
 
-struct DynamicGeometryData {
-	godot::Node3D *node = nullptr;
-	IPLScene sub_scene = nullptr;
-	IPLInstancedMesh instanced_mesh = nullptr;
+// Static and dynamic geometry unified. For static geometry, sub_scene /
+// instanced_mesh are null and the meshes live directly in the main scene.
+struct GeometryData {
+	godot::RID self;
+	bool dynamic = false;
+	IPLScene sub_scene = nullptr;          // dynamic only
+	IPLInstancedMesh instanced_mesh = nullptr; // dynamic only
 	std::vector<IPLStaticMesh> meshes;
-	godot::Transform3D last_trf;
-};
 
-struct StaticGeometryData {
-	godot::Node *node = nullptr;
-	std::vector<IPLStaticMesh> meshes;
+	godot::Transform3D pending_transform;  // dynamic only
+	bool has_transform = false;
+	godot::Transform3D last_trf;
 };
 
 // Helper to clean up a SourceListenerData's IPL resources
 void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx);
 
-// Pending operation types for the commit queue
+// Pending operation types for the commit queue (RID-keyed). The data structs
+// themselves are allocated up-front by *_create() and live in the RID owners;
+// these ops only link/unlink them into the iteration lists and build/tear down
+// the IPL cross-references.
 struct PendingAddSource {
-	SteamAudioSource *source_node;
-	SourceData source_data;
+	godot::RID source;
 };
 
 struct PendingRemoveSource {
-	SteamAudioSource *source_node;
+	godot::RID source;
 };
 
 struct PendingAddListener {
-	SteamAudioListener *listener;
-	ListenerData listener_data;
+	godot::RID listener;
 };
 
 struct PendingRemoveListener {
-	SteamAudioListener *listener;
+	godot::RID listener;
 };
 
 struct PendingAddPlaybackToSource {
-	const SteamAudioSource *source_node;
+	godot::RID source;
 	godot::Ref<godot::AudioStreamPlayback> playback;
 	float volume_linear;
 	float pitch_scale;
 };
 
 struct PendingAddPlaybackToListener {
-	SteamAudioListener *listener;
+	godot::RID listener;
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
+};
+
+struct PendingAddGeometry {
+	godot::RID geometry;
+};
+
+struct PendingRemoveGeometry {
+	godot::RID geometry;
 };
 
 using PendingOp = std::variant<
@@ -206,7 +278,9 @@ using PendingOp = std::variant<
 	PendingAddListener,
 	PendingRemoveListener,
 	PendingAddPlaybackToSource,
-	PendingAddPlaybackToListener
+	PendingAddPlaybackToListener,
+	PendingAddGeometry,
+	PendingRemoveGeometry
 >;
 
 class SteamAudioServer : public godot::Object {
@@ -240,12 +314,17 @@ private:
 	godot::Ref<godot::Thread> mixing_thread;
 	void mixing_thread_func();
 
-	std::vector<ListenerData> listeners;
-	godot::LocalVector<SourceData> sources;
-	godot::LocalVector<DynamicGeometryData> dynamic_geometry;
-	godot::LocalVector<StaticGeometryData> static_geometry;
+	// RID owners hold the actual data structs (stable addresses); the vectors below
+	// are the per-frame iteration lists, maintained only inside apply_pending_ops().
+	godot::RID_PtrOwner<SourceData, true> source_owner;
+	godot::RID_PtrOwner<ListenerData, true> listener_owner;
+	godot::RID_PtrOwner<GeometryData, true> geometry_owner;
 
-	// Protects listeners and sources collections.
+	godot::LocalVector<SourceData *> sources;
+	std::vector<ListenerData *> listeners;
+	godot::LocalVector<GeometryData *> geometries;
+
+	// Protects the iteration lists (sources/listeners/geometries).
 	// Unique-locked briefly by the mixing thread to apply pending ops.
 	// Shared-locked by tick(), process_audio() (after applying ops),
 	// simulation_thread, and debug functions.
@@ -255,6 +334,9 @@ private:
 	std::mutex pending_ops_mutex;
 	std::vector<PendingOp> pending_ops;
 	void apply_pending_ops();
+
+	// Builds the IPL simulator and per-listener IPL objects from ld->cfg.
+	void create_listener_ipl(ListenerData *ld);
 
 	std::atomic<bool> refl_thread_wait_for_commit;
 	std::atomic<bool> is_refl_thread_processing;
@@ -291,24 +373,48 @@ public:
 
 	void tick(float delta);
 
-	// Listener management
-	void add_listener(SteamAudioListener *listener);
-	void add_playback_to_listener(SteamAudioListener *listener, godot::Ref<AudioStreamSteamAudioListenerPlayback> playback);
-	void remove_listener(SteamAudioListener *listener);
-	const godot::LocalVector<ListenerSourceDBLevel>& get_source_db_levels_for_listener(SteamAudioListener *listener);
+	// ── Listener RID API ─────────────────────────────────────────────────────
+	godot::RID listener_create();
+	void listener_free(godot::RID listener);
+	void listener_set_transform(godot::RID listener, const godot::Transform3D &xform);
+	void listener_set_mask(godot::RID listener, uint32_t mask);
+	void listener_set_range(godot::RID listener, float range);
+	void listener_set_reflection(godot::RID listener, bool enabled, int rays, int bounces, float duration, int ambisonics_order, int type, float irradiance_min_dist);
+	void listener_set_debug_name(godot::RID listener, const godot::String &name);
+	void listener_add_playback(godot::RID listener, godot::Ref<AudioStreamSteamAudioListenerPlayback> playback);
+	// Per-source dB levels for this listener (copied out, RID-keyed) — for GDScript.
+	godot::Array listener_get_source_db_levels(godot::RID listener);
+	// C++-only hot-path accessor (not bound); returns a reference valid until the
+	// next tick(). Used by the SteamAudioListener node for its sensor slots.
+	const godot::LocalVector<ListenerSourceDBLevel> &listener_get_source_db_levels_ref(godot::RID listener);
 
-	// Source management (for SteamAudioSource nodes)
-	void add_source(SteamAudioSource *source_node);
-	void add_playback_to_source(const SteamAudioSource *source_node, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_volume_db, float p_pitch_scale);
-	void set_source_playback_volume(const SteamAudioSource * source_node, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_volume_db);
-	void set_source_playback_pitch(const SteamAudioSource * source_node, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_pitch_scale);
-	int source_get_num_active_playbacks(const SteamAudioSource * source_node);
-	void remove_source(SteamAudioSource *source_node);
+	// ── Source RID API ───────────────────────────────────────────────────────
+	godot::RID source_create();
+	void source_free(godot::RID source);
+	void source_set_transform(godot::RID source, const godot::Transform3D &xform);
+	void source_set_layers(godot::RID source, uint32_t layers);
+	void source_set_volume_db(godot::RID source, float volume_db);
+	void source_set_doppler_factor(godot::RID source, float factor);
+	void source_set_direct_enabled(godot::RID source, bool enabled);
+	void source_set_binaural(godot::RID source, bool enabled, int interpolation, float spatial_blend);
+	void source_set_distance_attenuation(godot::RID source, bool enabled, float min, float max);
+	void source_set_air_absorption(godot::RID source, bool enabled);
+	void source_set_occlusion(godot::RID source, bool enabled, int type, float radius, int samples);
+	void source_set_transmission(godot::RID source, bool enabled, int type, int rays);
+	void source_set_reflection(godot::RID source, bool enabled, float duration, float hybrid_delay);
+	void source_set_effect_stack(godot::RID source, const godot::TypedArray<godot::AudioEffect> &stack);
+	void source_set_debug_name(godot::RID source, const godot::String &name);
+	void source_add_playback(godot::RID source, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_volume_db, float p_pitch_scale);
+	void source_set_playback_volume(godot::RID source, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_volume_db);
+	void source_set_playback_pitch(godot::RID source, godot::Ref<godot::AudioStreamPlayback> p_playback, float p_pitch_scale);
+	int source_get_num_active_playbacks(godot::RID source);
 
-	void add_static_geometry(godot::Node *p_node, godot::Ref<SteamAudioMaterial> p_material);
-	void remove_static_geometry(godot::Node *p_node);
-	void add_dynamic_geometry(godot::Node *p_node, godot::Ref<SteamAudioMaterial> p_material);
-	void remove_dynamic_geometry(godot::Node *node);
+	// ── Geometry RID API ─────────────────────────────────────────────────────
+	// Materials are passed as 7 floats: absorption[3], scattering, transmission[3].
+	godot::RID geometry_create_static(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material);
+	godot::RID geometry_create_dynamic(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material);
+	void geometry_set_transform(godot::RID geometry, const godot::Transform3D &xform);
+	void geometry_free(godot::RID geometry);
 
 	// Audio pulling and effect application
 	void process_audio();
@@ -327,6 +433,10 @@ public:
 	godot::String get_listener_name(int index);
 	godot::String get_source_debug_string(int index);
 	godot::String get_listener_debug_string(int index);
+
+private:
+	// Internal RID create/free shared by static and dynamic geometry.
+	godot::RID geometry_create_internal(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material, bool dynamic);
 };
 
 #endif // STEAM_AUDIO_SERVER_H

@@ -1,17 +1,18 @@
 #include "server.hpp"
-#include "geometry_common.hpp"
 #include "godot_cpp/classes/audio_effect.hpp"
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/os.hpp"
 #include "godot_cpp/classes/project_settings.hpp"
 #include "godot_cpp/core/class_db.hpp"
+#include "godot_cpp/core/memory.hpp"
 #include "godot_cpp/classes/worker_thread_pool.hpp"
+#include "godot_cpp/variant/array.hpp"
+#include "godot_cpp/variant/dictionary.hpp"
 #include "godot_cpp/variant/utility_functions.hpp"
 #include <phonon.h>
 
-#include "listener.hpp"
 #include "profiling.h"
-#include "source.hpp"
+#include "steam_audio.hpp"
 
 using namespace godot;
 
@@ -47,6 +48,60 @@ static float get_project_float(const String &key, float def) {
 	return float(v);
 }
 
+// Build an IPLStaticMesh from raw triangle data (no Godot node knowledge). The
+// vertices are expected pre-transformed into the desired space. Triangles are
+// given as a flat index array (3 indices per triangle), Godot CW winding (it is
+// flipped to IPL CCW here).
+static IPLStaticMesh create_ipl_mesh_from_raw(IPLScene scene, const PackedVector3Array &verts, const PackedInt32Array &tris, const IPLMaterial &material) {
+	int num_verts = (int)verts.size();
+	int num_tris = (int)tris.size() / 3;
+	if (num_verts == 0 || num_tris == 0)
+		return nullptr;
+
+	std::vector<IPLVector3> ipl_verts(num_verts);
+	std::vector<IPLTriangle> ipl_tris(num_tris);
+	std::vector<IPLint32> ipl_mat_indices(num_tris);
+
+	for (int j = 0; j < num_verts; j++) {
+		ipl_verts[j] = ipl_vec3_from(verts[j]);
+	}
+	for (int j = 0; j < num_tris * 3; j += 3) {
+		// godot tris are cw, ipl tris are ccw
+		ipl_tris[j / 3].indices[0] = tris[j];
+		ipl_tris[j / 3].indices[1] = tris[j + 2];
+		ipl_tris[j / 3].indices[2] = tris[j + 1];
+		ipl_mat_indices[j / 3] = 0;
+	}
+
+	IPLMaterial mats[1] = { material };
+	IPLStaticMeshSettings static_mesh_cfg{};
+	static_mesh_cfg.numVertices = num_verts;
+	static_mesh_cfg.numTriangles = num_tris;
+	static_mesh_cfg.numMaterials = 1;
+	static_mesh_cfg.vertices = ipl_verts.data();
+	static_mesh_cfg.triangles = ipl_tris.data();
+	static_mesh_cfg.materialIndices = ipl_mat_indices.data();
+	static_mesh_cfg.materials = mats;
+
+	IPLStaticMesh ipl_mesh = nullptr;
+	handleErr(iplStaticMeshCreate(scene, &static_mesh_cfg, &ipl_mesh), "Failed to create static mesh");
+	return ipl_mesh;
+}
+
+static IPLMaterial ipl_material_from_floats(const PackedFloat32Array &m) {
+	IPLMaterial mat{ { 0.f, 0.f, 0.f }, 0.f, { 0.f, 0.f, 0.f } };
+	if (m.size() >= 7) {
+		mat.absorption[0] = m[0];
+		mat.absorption[1] = m[1];
+		mat.absorption[2] = m[2];
+		mat.scattering = m[3];
+		mat.transmission[0] = m[4];
+		mat.transmission[1] = m[5];
+		mat.transmission[2] = m[6];
+	}
+	return mat;
+}
+
 void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx) {
 	PROFILE_FUNCTION();
 	if (sld.source) {
@@ -65,9 +120,9 @@ void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx) {
 	iplAudioBufferFree(ctx, &sld.ambisonics_buffer);
 }
 
-bool create_source_listener_data(SourceListenerData &sld, SteamAudioSource *source_node, SteamAudioListener *listener, IPLContext ctx, IPLAudioSettings *audio_settings, IPLHRTF hrtf) {
+static bool create_source_listener_data(SourceListenerData &sld, SourceData *sd, ListenerData *ld, IPLContext ctx, IPLAudioSettings *audio_settings, IPLHRTF hrtf) {
 	PROFILE_FUNCTION();
-	sld.listener = listener;
+	sld.listener = ld;
 	sld.direct_simulated_once = false;
 
 	IPLBinauralEffectSettings binaural_cfg{};
@@ -83,25 +138,24 @@ bool create_source_listener_data(SourceListenerData &sld, SteamAudioSource *sour
 	iplAudioBufferAllocate(ctx, 1, audio_settings->frameSize, &sld.input_buffer);
 	iplAudioBufferAllocate(ctx, 2, audio_settings->frameSize, &sld.output_buffer);
 
-	if (source_node->get_reflection_enabled() && listener->get_reflection_simulation_enabled()) {
-		int max_order = listener->get_refl_ambisonics_order();
+	if (sd->cfg.reflection_enabled && ld->cfg.reflection_simulation_enabled) {
+		int max_order = ld->cfg.refl_ambisonics_order;
 		int num_channels = ambisonic_channels_from(max_order);
 
 		IPLReflectionEffectSettings refl_cfg{};
-		refl_cfg.type = static_cast<IPLReflectionEffectType>(listener->get_refl_type());
+		refl_cfg.type = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
 		refl_cfg.numChannels = num_channels;
-		refl_cfg.irSize = int(source_node->get_reflection_duration() * audio_settings->samplingRate);
+		refl_cfg.irSize = int(sd->cfg.reflection_duration * audio_settings->samplingRate);
 		handleErr(iplReflectionEffectCreate(ctx, audio_settings, &refl_cfg, &sld.reflection_effect), "SteamAudio: Failed to create reflection effect");
 
 		// hybrid reflection type doesn't support the reflection mixer, so we have to use
 		// individual ambisonics decode effects
-		if (listener->get_refl_type() == IPL_REFLECTIONEFFECTTYPE_HYBRID) {
+		if (ld->cfg.refl_type == IPL_REFLECTIONEFFECTTYPE_HYBRID) {
 			IPLAmbisonicsDecodeEffectSettings decode_cfg{};
 			decode_cfg.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
 			decode_cfg.hrtf = hrtf;
 			decode_cfg.maxOrder = max_order;
 			handleErr(iplAmbisonicsDecodeEffectCreate(ctx, audio_settings, &decode_cfg, &sld.ambisonics_decode_effect), "SteamAudio: Failed to create ambisonics decode effect");
-
 		}
 		iplAudioBufferAllocate(ctx, num_channels, audio_settings->frameSize, &sld.ambisonics_buffer);
 	}
@@ -148,6 +202,44 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("tick", "delta"), &SteamAudioServer::tick);
 	ClassDB::bind_method(D_METHOD("mixing_thread_func"), &SteamAudioServer::mixing_thread_func);
 	ClassDB::bind_static_method("SteamAudioServer", D_METHOD("get_singleton"), &SteamAudioServer::get_singleton);
+
+	// Listener RID API
+	ClassDB::bind_method(D_METHOD("listener_create"), &SteamAudioServer::listener_create);
+	ClassDB::bind_method(D_METHOD("listener_free", "listener"), &SteamAudioServer::listener_free);
+	ClassDB::bind_method(D_METHOD("listener_set_transform", "listener", "xform"), &SteamAudioServer::listener_set_transform);
+	ClassDB::bind_method(D_METHOD("listener_set_mask", "listener", "mask"), &SteamAudioServer::listener_set_mask);
+	ClassDB::bind_method(D_METHOD("listener_set_range", "listener", "range"), &SteamAudioServer::listener_set_range);
+	ClassDB::bind_method(D_METHOD("listener_set_reflection", "listener", "enabled", "rays", "bounces", "duration", "ambisonics_order", "type", "irradiance_min_dist"), &SteamAudioServer::listener_set_reflection);
+	ClassDB::bind_method(D_METHOD("listener_set_debug_name", "listener", "name"), &SteamAudioServer::listener_set_debug_name);
+	ClassDB::bind_method(D_METHOD("listener_get_source_db_levels", "listener"), &SteamAudioServer::listener_get_source_db_levels);
+
+	// Source RID API
+	ClassDB::bind_method(D_METHOD("source_create"), &SteamAudioServer::source_create);
+	ClassDB::bind_method(D_METHOD("source_free", "source"), &SteamAudioServer::source_free);
+	ClassDB::bind_method(D_METHOD("source_set_transform", "source", "xform"), &SteamAudioServer::source_set_transform);
+	ClassDB::bind_method(D_METHOD("source_set_layers", "source", "layers"), &SteamAudioServer::source_set_layers);
+	ClassDB::bind_method(D_METHOD("source_set_volume_db", "source", "volume_db"), &SteamAudioServer::source_set_volume_db);
+	ClassDB::bind_method(D_METHOD("source_set_doppler_factor", "source", "factor"), &SteamAudioServer::source_set_doppler_factor);
+	ClassDB::bind_method(D_METHOD("source_set_direct_enabled", "source", "enabled"), &SteamAudioServer::source_set_direct_enabled);
+	ClassDB::bind_method(D_METHOD("source_set_binaural", "source", "enabled", "interpolation", "spatial_blend"), &SteamAudioServer::source_set_binaural);
+	ClassDB::bind_method(D_METHOD("source_set_distance_attenuation", "source", "enabled", "min", "max"), &SteamAudioServer::source_set_distance_attenuation);
+	ClassDB::bind_method(D_METHOD("source_set_air_absorption", "source", "enabled"), &SteamAudioServer::source_set_air_absorption);
+	ClassDB::bind_method(D_METHOD("source_set_occlusion", "source", "enabled", "type", "radius", "samples"), &SteamAudioServer::source_set_occlusion);
+	ClassDB::bind_method(D_METHOD("source_set_transmission", "source", "enabled", "type", "rays"), &SteamAudioServer::source_set_transmission);
+	ClassDB::bind_method(D_METHOD("source_set_reflection", "source", "enabled", "duration", "hybrid_delay"), &SteamAudioServer::source_set_reflection);
+	ClassDB::bind_method(D_METHOD("source_set_effect_stack", "source", "stack"), &SteamAudioServer::source_set_effect_stack);
+	ClassDB::bind_method(D_METHOD("source_set_debug_name", "source", "name"), &SteamAudioServer::source_set_debug_name);
+	ClassDB::bind_method(D_METHOD("source_add_playback", "source", "playback", "volume_db", "pitch_scale"), &SteamAudioServer::source_add_playback, DEFVAL(0.0f), DEFVAL(1.0f));
+	ClassDB::bind_method(D_METHOD("source_set_playback_volume", "source", "playback", "volume_db"), &SteamAudioServer::source_set_playback_volume);
+	ClassDB::bind_method(D_METHOD("source_set_playback_pitch", "source", "playback", "pitch_scale"), &SteamAudioServer::source_set_playback_pitch);
+	ClassDB::bind_method(D_METHOD("source_get_num_active_playbacks", "source"), &SteamAudioServer::source_get_num_active_playbacks);
+
+	// Geometry RID API
+	ClassDB::bind_method(D_METHOD("geometry_create_static", "verts", "tris", "material"), &SteamAudioServer::geometry_create_static);
+	ClassDB::bind_method(D_METHOD("geometry_create_dynamic", "verts", "tris", "material"), &SteamAudioServer::geometry_create_dynamic);
+	ClassDB::bind_method(D_METHOD("geometry_set_transform", "geometry", "xform"), &SteamAudioServer::geometry_set_transform);
+	ClassDB::bind_method(D_METHOD("geometry_free", "geometry"), &SteamAudioServer::geometry_free);
+
 	ClassDB::bind_method(D_METHOD("get_mixing_thread_usage_pct"), &SteamAudioServer::get_mixing_thread_usage_pct);
 	ClassDB::bind_method(D_METHOD("get_stress_mitigation"), &SteamAudioServer::get_stress_mitigation);
 	ClassDB::bind_method(D_METHOD("get_sim_thread_avg_duration_ms"), &SteamAudioServer::get_sim_thread_avg_duration_ms);
@@ -194,48 +286,43 @@ String SteamAudioServer::get_source_name(int index) {
 	std::shared_lock lock(collections_mutex);
 	if (index < 0 || index >= (int)sources.size())
 		return "";
-	auto &sd = sources[index];
-	if (!sd.source_node)
-		return "<null>";
-	return sd.source_node->get_name();
+	return sources[index]->debug_name;
 }
 
 String SteamAudioServer::get_listener_name(int index) {
 	std::shared_lock lock(collections_mutex);
 	if (index < 0 || index >= (int)listeners.size())
 		return "";
-	auto &ld = listeners[index];
-	if (!ld.listener)
-		return "<null>";
-	return ld.listener->get_name();
+	return listeners[index]->debug_name;
 }
 
 String SteamAudioServer::get_source_debug_string(int index) {
 	std::shared_lock lock(collections_mutex);
 	if (index < 0 || index >= (int)sources.size())
 		return "";
-	auto &sd = sources[index];
+	SourceData *sd = sources[index];
 	int frame_size = cached_audio_settings.frameSize;
 
 	String s;
-	s += "mixed_frames_ready: " + String::num_int64(sd.mixed_frames_ready) + "/" + String::num_int64(frame_size) + "\n";
-	s += "pending_consumers: " + String::num_int64(sd.pending_consumers) + "\n";
-	s += "debug_times_mixed: " + String::num_int64(sd.debug_times_mixed) + "\n";
-	s += "is_skipping_mixing: " + String(sd.is_skipping_mixing ? "yes\n" : "no\n");
-	s += "playbacks: " + String::num_int64((int)sd.playbacks.size()) + "\n";
-	for (uint32_t i = 0; i < sd.playbacks.size(); ++i) {
-		auto &pb = sd.playbacks[i];
+	s += "name: " + sd->debug_name + "\n";
+	s += "mixed_frames_ready: " + String::num_int64(sd->mixed_frames_ready) + "/" + String::num_int64(frame_size) + "\n";
+	s += "pending_consumers: " + String::num_int64(sd->pending_consumers) + "\n";
+	s += "debug_times_mixed: " + String::num_int64(sd->debug_times_mixed) + "\n";
+	s += "is_skipping_mixing: " + String(sd->is_skipping_mixing ? "yes\n" : "no\n");
+	s += "playbacks: " + String::num_int64((int)sd->playbacks.size()) + "\n";
+	for (uint32_t i = 0; i < sd->playbacks.size(); ++i) {
+		auto &pb = sd->playbacks[i];
 		s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
 		s += " vol=" + String::num(pb.volume_linear, 3);
 		s += " pitch=" + String::num(pb.pitch_scale, 3);
 		s += " num_mixed=" + String::num_int64(pb.debug_num_mixed);
 		s += " mixed_in_mixed_frames=" + String::num_int64(pb.num_mixed_in_current_mixed_frames) + "\n";
 	}
-	s += "effect_instances: " + String::num_int64((int)sd.effect_instances.size()) + "\n";
-	s += "listener_data: " + String::num_int64((int)sd.listener_data.size()) + "\n";
-	for (uint32_t i = 0; i < sd.listener_data.size(); ++i) {
-		auto &sld = sd.listener_data[i];
-		String lname = sld.listener ? String(sld.listener->get_name()) : "<null>";
+	s += "effect_instances: " + String::num_int64((int)sd->effect_instances.size()) + "\n";
+	s += "listener_data: " + String::num_int64((int)sd->listener_data.size()) + "\n";
+	for (uint32_t i = 0; i < sd->listener_data.size(); ++i) {
+		auto &sld = sd->listener_data[i];
+		String lname = sld.listener ? sld.listener->debug_name : "<null>";
 		s += "  sld[" + String::num_int64(i) + "] listener=" + lname;
 		s += " dist=" + String::num(sld.dist_to_listener, 2);
 		s += " doppler=" + String::num(sld.doppler_pitch, 3);
@@ -244,7 +331,7 @@ String SteamAudioServer::get_source_debug_string(int index) {
 		s += " times_contributed=" + String::num_int64(sld.debug_times_contributed);
 		if (sld.skip_reflection_applies > 0)
 			s += " skipping refl=" + String::num_int64(sld.skip_reflection_applies);
- 		s += "\n";
+		s += "\n";
 	}
 	return s;
 }
@@ -253,20 +340,21 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 	std::shared_lock lock(collections_mutex);
 	if (index < 0 || index >= (int)listeners.size())
 		return "";
-	auto &ld = listeners[index];
+	ListenerData *ld = listeners[index];
 	int frame_size = cached_audio_settings.frameSize;
 
 	String s;
-	s += "pending_contributors: " + String::num_int64(ld.pending_contributors) + "\n";
-	s += "pending_drains: " + String::num_int64(ld.pending_drains) + "\n";
-	s += "times_pushed: " + String::num_int64(ld.debug_times_pushed) + "\n";
-	s += "generation: " + String::num_int64(ld.generation) + "\n";
-	s += "push_buffer size: " + String::num_int64((int)ld.push_buffer.size()) + "/" + String::num_int64(frame_size) + "\n";
+	s += "name: " + ld->debug_name + "\n";
+	s += "pending_contributors: " + String::num_int64(ld->pending_contributors) + "\n";
+	s += "pending_drains: " + String::num_int64(ld->pending_drains) + "\n";
+	s += "times_pushed: " + String::num_int64(ld->debug_times_pushed) + "\n";
+	s += "generation: " + String::num_int64(ld->generation) + "\n";
+	s += "push_buffer size: " + String::num_int64((int)ld->push_buffer.size()) + "/" + String::num_int64(frame_size) + "\n";
 	{
-		std::lock_guard pb_lock(*ld.playbacks_mutex);
-		s += "playbacks: " + String::num_int64((int)ld.playbacks.size()) + "\n";
-		for (uint32_t i = 0; i < ld.playbacks.size(); ++i) {
-			auto &pb = ld.playbacks[i];
+		std::lock_guard pb_lock(*ld->playbacks_mutex);
+		s += "playbacks: " + String::num_int64((int)ld->playbacks.size()) + "\n";
+		for (uint32_t i = 0; i < ld->playbacks.size(); ++i) {
+			auto &pb = ld->playbacks[i];
 			s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
 			s += " remaining=" + String::num_int64(pb.remaining_from_push_buffer);
 			s += " times_drained=" + String::num_int64(pb.debug_times_drained);
@@ -274,21 +362,9 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 			s += " underruns=" + String::num_int64(pb.playback->get_num_underrun_samples()) + "\n";
 		}
 	}
-	s += "source_db_levels: " + String::num_int64((int)ld.source_db_levels.size()) + "\n";
-	for (uint32_t i = 0; i < ld.source_db_levels.size(); ++i) {
-		auto &sldb = ld.source_db_levels[i];
-		s += "  " + String(sldb.source->get_name()) + ": db_level=" + String::num_real(sldb.db_level) + "\n";
-	}
-	if (ld.listener->get_num_source_db_sensor_slots() > 0) {
-		s += "source_db_sensor_slots: " + String::num_int64((int)ld.listener->get_num_source_db_sensor_slots()) + "\n";
-		for (uint32_t i = 0; i < ld.listener->get_num_source_db_sensor_slots(); ++i) {
-			const auto& slot = ld.listener->get_sensor_slot(i);
-			String name = slot->get_steam_audio_source() ? String(slot->get_steam_audio_source()->get_name()) : "<null>";
-			s += "  slot[" + String::num_int64(i) + "]: " + name + " db=" + String::num_real(slot->get_db_level()) + "\n";
-		}
-	}
-	s += "has_simulator: " + String(ld.simulator ? "yes" : "no") + "\n";
-	s += "dirty: " + String(ld.dirty ? "yes" : "no") + "\n";
+	s += "source_db_levels: " + String::num_int64((int)ld->source_db_levels.size()) + "\n";
+	s += "has_simulator: " + String(ld->simulator ? "yes" : "no") + "\n";
+	s += "dirty: " + String(ld->dirty ? "yes" : "no") + "\n";
 	return s;
 }
 
@@ -376,37 +452,50 @@ void SteamAudioServer::finish() {
 	// Drain any remaining pending ops now that threads are stopped
 	apply_pending_ops();
 
-	for (auto &ld : listeners) {
-		if (ld.simulator) {
-			iplSimulatorRelease(&ld.simulator);
+	for (auto *ld : listeners) {
+		if (ld->simulator) {
+			iplSimulatorRelease(&ld->simulator);
 		}
+		if (ld->reflection_mixer) {
+			iplReflectionMixerRelease(&ld->reflection_mixer);
+		}
+		if (ld->ambisonics_decode_effect) {
+			iplAmbisonicsDecodeEffectRelease(&ld->ambisonics_decode_effect);
+		}
+		iplAudioBufferFree(phonon_context, &ld->mixed_ambisonics_buffer);
+		iplAudioBufferFree(phonon_context, &ld->decode_output_buffer);
+		listener_owner.free(ld->self);
+		memdelete(ld);
 	}
 	listeners.clear();
 
-	for (auto &sd : sources) {
-		for (auto &sld : sd.listener_data) {
+	for (auto *sd : sources) {
+		for (auto &sld : sd->listener_data) {
 			cleanup_source_listener_data(sld, phonon_context);
 		}
+		source_owner.free(sd->self);
+		memdelete(sd);
 	}
 	sources.clear();
 
-	for (auto &dg : dynamic_geometry) {
-		if (dg.instanced_mesh)
-			iplInstancedMeshRelease(&dg.instanced_mesh);
-		for (auto &m : dg.meshes)
-			iplStaticMeshRelease(&m);
-		if (dg.sub_scene)
-			iplSceneRelease(&dg.sub_scene);
-	}
-	dynamic_geometry.clear();
-
-	for (auto &sg : static_geometry) {
-		for (auto &m : sg.meshes) {
-			iplStaticMeshRemove(m, phonon_scene);
-			iplStaticMeshRelease(&m);
+	for (auto *g : geometries) {
+		if (g->dynamic) {
+			if (g->instanced_mesh)
+				iplInstancedMeshRelease(&g->instanced_mesh);
+			for (auto &m : g->meshes)
+				iplStaticMeshRelease(&m);
+			if (g->sub_scene)
+				iplSceneRelease(&g->sub_scene);
+		} else {
+			for (auto &m : g->meshes) {
+				iplStaticMeshRemove(m, phonon_scene);
+				iplStaticMeshRelease(&m);
+			}
 		}
+		geometry_owner.free(g->self);
+		memdelete(g);
 	}
-	static_geometry.clear();
+	geometries.clear();
 
 	if (phonon_hrtf) {
 		iplHRTFRelease(&phonon_hrtf);
@@ -429,180 +518,111 @@ void SteamAudioServer::tick(float delta) {
 		return;
 	PROFILE_FUNCTION();
 
-	std::shared_lock lock(collections_mutex);
-
 	// ── STEP 1: Barrier ──────────────────────────────────────────────────────
 	// Wait for the previous tick's direct-sim job before touching any simulator,
 	// scene or output state. This should almost never actually block; if it does
 	// regularly, the job is overrunning a tick (watch get_direct_job_avg_duration_ms).
+	//
+	// IMPORTANT: this barrier runs BEFORE acquiring collections_mutex. The job
+	// holds a shared lock on collections_mutex while it runs; if we waited while
+	// also holding a shared lock, a mixing-thread apply_pending_ops() queued for
+	// the unique lock could block the job's shared re-acquisition (SRWLOCK does
+	// not guarantee reader barging past a queued writer) — a three-way deadlock.
+	// Waiting first guarantees the job has fully released its lock before we lock.
 	if (direct_job_pending) {
 		PROFILE_FUNCTION_NAMED("waiting_for_direct_job");
 		WorkerThreadPool::get_singleton()->wait_for_task_completion(direct_task_id);
 		direct_job_pending = false;
 	}
 
+	std::shared_lock lock(collections_mutex);
+
 	// ── STEP 2: Consume the previous job's results ───────────────────────────
 	// The direct-sim job has finished iplSimulatorRunDirect, so iplSourceGetOutputs
-	// is valid. Update per-source dB levels and listener sensor slots here, on the
-	// main thread, because this reads/writes Godot nodes and Resources.
-	for (auto &ld : listeners) {
-		if (!ld.simulator)
+	// is valid. Update per-source dB levels here, on the main thread. The sensor-slot
+	// maintenance itself now lives on the SteamAudioListener node, which pulls these.
+	for (auto *ld : listeners) {
+		if (!ld->simulator)
 			continue;
 
-		{
-			PROFILE_FUNCTION_NAMED("updating_source_db_levels");
-			static LocalVector<Ref<SteamAudioListenerSensorSlot>> temp_sensor_slots;
-			temp_sensor_slots.resize(ld.listener->get_num_source_db_sensor_slots());
-			for (int source_slot_index = 0; source_slot_index < ld.listener->get_num_source_db_sensor_slots(); ++source_slot_index) {
-				temp_sensor_slots[source_slot_index] = ld.listener->get_sensor_slot(source_slot_index);
-				// decay dB level
-				float current_db = temp_sensor_slots[source_slot_index]->get_db_level();
-				current_db -= delta * 30.0f; // decay by 30 dB per second
-				if (current_db < -60.0f) {
-					temp_sensor_slots[source_slot_index]->set_db_level(-500.0f);
-					temp_sensor_slots[source_slot_index]->set_steam_audio_source(nullptr);
-				} else {
-					temp_sensor_slots[source_slot_index]->set_db_level(current_db);
+		PROFILE_FUNCTION_NAMED("updating_source_db_levels");
+		ld->source_db_levels.clear();
+		for (auto *sd : sources) {
+			for (auto &sld : sd->listener_data) {
+				if (sld.listener != ld)
+					continue;
+				if ((sd->cfg.layers & ld->cfg.mask) == 0)
+					continue;
+				if (sld.out_of_range)
+					continue;
+				// No IPLSource yet (not created by the job, or creation failed) —
+				// nothing to read.
+				if (!sld.source)
+					continue;
+
+				// Simulation has now run at least once for this source/listener
+				// pair, so iplSourceGetOutputs data and cached coords are valid.
+				sld.direct_simulated_once = true;
+
+				IPLSimulationOutputs outputs{};
+				iplSourceGetOutputs(sld.source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+
+				ListenerSourceDBLevel source_db_level;
+				source_db_level.source = sd->self;
+				source_db_level.position = sd->has_transform ? sd->pending_transform.origin : sd->last_trf.origin;
+				source_db_level.db_level = sd->current_db_level;
+				IPLDirectEffectParams direct_params = outputs.direct;
+				float total_direct_factor = 1.0f;
+
+				if (sd->cfg.occlusion_enabled) {
+					float occlusion = direct_params.occlusion;
+					float transmission = 0.0f;
+					if (sd->cfg.transmission_enabled) {
+						transmission = (direct_params.transmission[0] + direct_params.transmission[1] + direct_params.transmission[2]) / 3.0f;
+					}
+					// Total direct sound = sound that goes around (occlusion) + sound that goes through (transmission)
+					// We assume transmission only applies to the occluded part.
+					total_direct_factor *= (occlusion + (1.0f - occlusion) * transmission);
 				}
-			}
-			// update source db levels
-			ld.source_db_levels.clear();
-			for (auto &sd : sources) {
-				for (auto &sld : sd.listener_data) {
-					if (sld.listener != ld.listener)
-						continue;
-					if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
-						continue;
-					if (sld.out_of_range)
-						continue;
-					// No IPLSource yet (not created by the job, or creation failed) —
-					// nothing to read.
-					if (!sld.source)
-						continue;
 
-					// Simulation has now run at least once for this source/listener
-					// pair, so iplSourceGetOutputs data and cached coords are valid.
-					sld.direct_simulated_once = true;
-
-					IPLSimulationOutputs outputs{};
-					iplSourceGetOutputs(sld.source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
-
-					ListenerSourceDBLevel source_db_level;
-					source_db_level.source = sd.source_node;
-					source_db_level.position = sd.source_node->get_global_position();
-					source_db_level.db_level = sd.current_db_level;
-					IPLDirectEffectParams direct_params = outputs.direct;
-					float total_direct_factor = 1.0f;
-
-					if (sd.source_node->get_occlusion_enabled()) {
-						float occlusion = direct_params.occlusion;
-						float transmission = 0.0f;
-						if (sd.source_node->get_transmission_enabled()) {
-							transmission = (direct_params.transmission[0] + direct_params.transmission[1] + direct_params.transmission[2]) / 3.0f;
-						}
-						// Total direct sound = sound that goes around (occlusion) + sound that goes through (transmission)
-						// We assume transmission only applies to the occluded part.
-						total_direct_factor *= (occlusion + (1.0f - occlusion) * transmission);
-					}
-
-					if (sd.source_node->get_air_absorption_enabled()) {
-						IPLAirAbsorptionModel airAbsorptionModel{};
-						airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
-						float air_absorption[3];
-						iplAirAbsorptionCalculate(phonon_context, sd.cached_coords.origin, ld.cached_coords.origin, &airAbsorptionModel, air_absorption);
-						float avg_air_absorption = (air_absorption[0] + air_absorption[1] + air_absorption[2]) / 3.0f;
-						total_direct_factor *= avg_air_absorption;
-					}
-
-					if (sd.source_node->get_distance_attenuation_enabled()) {
-						float dist = sld.dist_to_listener;
-						float min_dist = sd.source_node->get_distance_attenuation_min();
-						float max_dist = sd.source_node->get_distance_attenuation_max();
-						float attenuation = calculate_attenuation(dist, min_dist, max_dist);
-						total_direct_factor *= attenuation;
-					}
-
-					float final_db_level = source_db_level.db_level + 20.0f * Math::log(MAX(total_direct_factor, 1e-10f)) / Math::log(10.0f);
-					source_db_level.db_level = final_db_level;
-					ld.source_db_levels.push_back(source_db_level);
-
-					if (final_db_level < -60.0f || temp_sensor_slots.is_empty())
-						continue;
-
-					// the following will update the sensor slots on the SteamAudioListener!
-
-					// update/insert current source in sensor slots if it's loud enough
-					int num_slots = (int)temp_sensor_slots.size();
-
-					// first check if the source is already in a slot
-					int existing_slot_index = -1;
-					for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
-						if (temp_sensor_slots[slot_index]->get_steam_audio_source() == sd.source_node) {
-							existing_slot_index = slot_index;
-							break;
-						}
-					}
-
-					if (existing_slot_index != -1) {
-						// source already exists, update it if the new level is higher
-						if (final_db_level > temp_sensor_slots[existing_slot_index]->get_db_level()) {
-							temp_sensor_slots[existing_slot_index]->set_db_level(final_db_level);
-							temp_sensor_slots[existing_slot_index]->set_position(sd.source_node->get_global_position());
-
-							// check if it needs to move up (becoming louder)
-							int current_slot = existing_slot_index;
-							while (current_slot > 0 && temp_sensor_slots[current_slot]->get_db_level() > temp_sensor_slots[current_slot - 1]->get_db_level()) {
-								// swap values with the slot above it
-								SteamAudioSource *prev_source = temp_sensor_slots[current_slot - 1]->get_steam_audio_source();
-								Vector3 prev_position = temp_sensor_slots[current_slot - 1]->get_position();
-								float prev_db = temp_sensor_slots[current_slot - 1]->get_db_level();
-
-								temp_sensor_slots[current_slot - 1]->set_steam_audio_source(temp_sensor_slots[current_slot]->get_steam_audio_source());
-								temp_sensor_slots[current_slot - 1]->set_position(temp_sensor_slots[current_slot]->get_position());
-								temp_sensor_slots[current_slot - 1]->set_db_level(temp_sensor_slots[current_slot]->get_db_level());
-
-								temp_sensor_slots[current_slot]->set_steam_audio_source(prev_source);
-								temp_sensor_slots[current_slot]->set_position(prev_position);
-								temp_sensor_slots[current_slot]->set_db_level(prev_db);
-
-								current_slot--;
-							}
-						}
-					} else {
-						for (int slot_index = 0; slot_index < num_slots; ++slot_index) {
-							if (final_db_level > temp_sensor_slots[slot_index]->get_db_level()) {
-								// shift down remaining
-								for (int shift_index = num_slots - 1; shift_index > slot_index; --shift_index) {
-									temp_sensor_slots[shift_index]->set_steam_audio_source(temp_sensor_slots[shift_index - 1]->get_steam_audio_source());
-									temp_sensor_slots[shift_index]->set_position(temp_sensor_slots[shift_index - 1]->get_position());
-									temp_sensor_slots[shift_index]->set_db_level(temp_sensor_slots[shift_index - 1]->get_db_level());
-								}
-								temp_sensor_slots[slot_index]->set_steam_audio_source(sd.source_node);
-								temp_sensor_slots[slot_index]->set_position(sd.source_node->get_global_position());
-								temp_sensor_slots[slot_index]->set_db_level(final_db_level);
-								break;
-							}
-						}
-					}
-
+				if (sd->cfg.air_absorption_enabled) {
+					IPLAirAbsorptionModel airAbsorptionModel{};
+					airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+					float air_absorption[3];
+					iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld->cached_coords.origin, &airAbsorptionModel, air_absorption);
+					float avg_air_absorption = (air_absorption[0] + air_absorption[1] + air_absorption[2]) / 3.0f;
+					total_direct_factor *= avg_air_absorption;
 				}
+
+				if (sd->cfg.distance_attenuation_enabled) {
+					float dist = sld.dist_to_listener;
+					float min_dist = sd->cfg.distance_attenuation_min;
+					float max_dist = sd->cfg.distance_attenuation_max;
+					float attenuation = calculate_attenuation(dist, min_dist, max_dist);
+					total_direct_factor *= attenuation;
+				}
+
+				float final_db_level = source_db_level.db_level + 20.0f * Math::log(MAX(total_direct_factor, 1e-10f)) / Math::log(10.0f);
+				source_db_level.db_level = final_db_level;
+				ld->source_db_levels.push_back(source_db_level);
 			}
-			temp_sensor_slots.clear();
 		}
 	}
 
 	{
 		PROFILE_FUNCTION_NAMED("update_dynamic_geometry");
-		PROFILING_PLOT_NUMBER("NumSteamDynamicGeometries", (int64_t)dynamic_geometry.size());
+		PROFILING_PLOT_NUMBER("NumSteamGeometries", (int64_t)geometries.size());
 		// Update Dynamic Geometry (only mark dirty if transform changed)
-		for (auto &dg : dynamic_geometry) {
-			if (!dg.node || !dg.instanced_mesh)
+		for (auto *g : geometries) {
+			if (!g->dynamic || !g->instanced_mesh)
 				continue;
-			Transform3D trf = dg.node->get_global_transform();
-			if (!trf.is_equal_approx(dg.last_trf)) {
+			if (!g->has_transform)
+				continue;
+			Transform3D trf = g->pending_transform;
+			if (!trf.is_equal_approx(g->last_trf)) {
 				IPLMatrix4x4 m = ipl_mat4_from(trf);
-				iplInstancedMeshUpdateTransform(dg.instanced_mesh, phonon_scene, m);
-				dg.last_trf = trf;
+				iplInstancedMeshUpdateTransform(g->instanced_mesh, phonon_scene, m);
+				g->last_trf = trf;
 				scene_dirty = true;
 			}
 		}
@@ -610,50 +630,47 @@ void SteamAudioServer::tick(float delta) {
 
 	{
 		PROFILE_FUNCTION_NAMED("update_listeners");
-		for (auto &ld : listeners) {
-			if (!ld.listener)
-				continue;
-			if (!ld.simulator)
+		for (auto *ld : listeners) {
+			if (!ld->simulator)
 				continue;
 
 			float stress_mitigation_factor = 0.1f + 0.9f * (1.0f - stress_mitigation.load());
 
-			// Update listener transform from node directly
-			Transform3D trf = ld.listener->get_global_transform();
-			if (!trf.is_equal_approx(ld.last_trf)) {
-				ld.cached_coords = ipl_coords_from(trf);
+			// Update listener transform from pushed data
+			if (ld->has_transform) {
+				Transform3D trf = ld->pending_transform;
+				if (!trf.is_equal_approx(ld->last_trf)) {
+					ld->cached_coords = ipl_coords_from(trf);
 
-				IPLSimulationSharedInputs shared_inputs{};
-				shared_inputs.listener = ld.cached_coords;
-				shared_inputs.numRays = ld.listener->get_num_refl_rays();
-				shared_inputs.numBounces = ld.listener->get_num_refl_bounces();
-				shared_inputs.duration = ld.listener->get_refl_duration() * stress_mitigation_factor;
-				shared_inputs.order = ld.listener->get_refl_ambisonics_order();
-				shared_inputs.irradianceMinDistance = ld.listener->get_irradiance_min_dist();
+					IPLSimulationSharedInputs shared_inputs{};
+					shared_inputs.listener = ld->cached_coords;
+					shared_inputs.numRays = ld->cfg.num_refl_rays;
+					shared_inputs.numBounces = ld->cfg.num_refl_bounces;
+					shared_inputs.duration = ld->cfg.refl_duration * stress_mitigation_factor;
+					shared_inputs.order = ld->cfg.refl_ambisonics_order;
+					shared_inputs.irradianceMinDistance = ld->cfg.irradiance_min_dist;
 
-				IPLSimulationFlags flags = IPL_SIMULATIONFLAGS_DIRECT;
-				if (ld.listener->get_reflection_simulation_enabled()) {
-					flags = static_cast<IPLSimulationFlags>(flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
+					IPLSimulationFlags flags = IPL_SIMULATIONFLAGS_DIRECT;
+					if (ld->cfg.reflection_simulation_enabled) {
+						flags = static_cast<IPLSimulationFlags>(flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
+					}
+
+					iplSimulatorSetSharedInputs(ld->simulator, flags, &shared_inputs);
+					ld->last_trf = trf;
 				}
-
-				iplSimulatorSetSharedInputs(ld.simulator, flags, &shared_inputs);
-				ld.last_trf = trf;
 			}
 
 			// Update source transforms for this listener's simulator
-			for (auto &sd : sources) {
-				if (!sd.source_node)
-					continue;
+			for (auto *sd : sources) {
+				sd->volume_linear = UtilityFunctions::db_to_linear(sd->cfg.volume_db);
 
-				sd.volume_linear = UtilityFunctions::db_to_linear(sd.source_node->get_volume_db());
-
-				if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+				if ((sd->cfg.layers & ld->cfg.mask) == 0)
 					continue;
 
 				// Find the SourceListenerData for this listener/source pair
 				SourceListenerData *sld = nullptr;
-				for (auto &entry : sd.listener_data) {
-					if (entry.listener == ld.listener) {
+				for (auto &entry : sd->listener_data) {
+					if (entry.listener == ld) {
 						sld = &entry;
 						break;
 					}
@@ -664,14 +681,18 @@ void SteamAudioServer::tick(float delta) {
 				// IPLSource creation is deferred to the direct-sim job (see below) —
 				// it is allocation-heavy and should not run on the main thread.
 
-				Transform3D src_trf = sd.source_node->get_global_transform();
-				sd.cached_coords = ipl_coords_from(src_trf);
+				if (!sd->has_transform) {
+					// No transform pushed yet — nothing meaningful to simulate.
+					continue;
+				}
+				Transform3D src_trf = sd->pending_transform;
+				sd->cached_coords = ipl_coords_from(src_trf);
 
 				// Update dist_to_listener and doppler
 				float prev_dist_to_listener = sld->dist_to_listener;
-				sld->dist_to_listener = src_trf.origin.distance_to(ld.last_trf.origin);
+				sld->dist_to_listener = src_trf.origin.distance_to(ld->last_trf.origin);
 
-				float doppler_factor = sd.source_node->get_doppler_factor();
+				float doppler_factor = sd->cfg.doppler_factor;
 				// skip the very first update (dist is 0 and doppler_pitch is 1) so that we don't get
 				// enormous speeds
 				if (doppler_factor > 0.0f && prev_dist_to_listener != 0.0f) {
@@ -692,38 +713,38 @@ void SteamAudioServer::tick(float delta) {
 				}
 
 				// Range check with hysteresis
-				float listener_range = ld.listener->get_range();
+				float listener_range = ld->cfg.range;
 				// when the source doesn't have reflection enabled,
 				// we can also use the max distance of that
-				if (!sd.source_node->get_reflection_enabled())
-					listener_range = MIN(listener_range, sd.source_node->get_distance_attenuation_max());
+				if (!sd->cfg.reflection_enabled)
+					listener_range = MIN(listener_range, sd->cfg.distance_attenuation_max);
 				if (listener_range > 0.0f) {
 					if (!sld->out_of_range && sld->dist_to_listener > listener_range * 1.1f) {
 						sld->out_of_range = true;
 						if (sld->source) {
-							iplSourceRemove(sld->source, ld.simulator);
-							ld.dirty = true;
+							iplSourceRemove(sld->source, ld->simulator);
+							ld->dirty = true;
 						}
 						// this listener was a consumer, so we have to decrement the pending amount
-						sd.pending_consumers--;
+						sd->pending_consumers--;
 					} else if (sld->out_of_range && sld->dist_to_listener <= listener_range) {
 						sld->out_of_range = false;
 						if (sld->source) {
-							iplSourceAdd(sld->source, ld.simulator);
-							ld.dirty = true;
+							iplSourceAdd(sld->source, ld->simulator);
+							ld->dirty = true;
 						}
 					}
 				} else if (sld->out_of_range) {
 					// Range was disabled, bring back in range
 					sld->out_of_range = false;
 					if (sld->source) {
-						iplSourceAdd(sld->source, ld.simulator);
-						ld.dirty = true;
+						iplSourceAdd(sld->source, ld->simulator);
+						ld->dirty = true;
 					}
 				}
 
 				if (sld->out_of_range) {
-					sd.last_trf = src_trf;
+					sd->last_trf = src_trf;
 					continue;
 				}
 
@@ -734,48 +755,48 @@ void SteamAudioServer::tick(float delta) {
 					sld->pending_create = true;
 					sld->pending_source_settings = IPLSourceSettings{};
 					sld->pending_source_settings.flags = static_cast<IPLSimulationFlags>(
-							(sd.source_node->get_direct_enabled() ? IPL_SIMULATIONFLAGS_DIRECT : 0) |
-							(sd.source_node->get_reflection_enabled() ? IPL_SIMULATIONFLAGS_REFLECTIONS : 0));
-					ld.dirty = true;
+							(sd->cfg.direct_enabled ? IPL_SIMULATIONFLAGS_DIRECT : 0) |
+							(sd->cfg.reflection_enabled ? IPL_SIMULATIONFLAGS_REFLECTIONS : 0));
+					ld->dirty = true;
 				}
 
 				IPLSimulationInputs inputs{};
 				inputs.flags = static_cast<IPLSimulationFlags>(0);
-				if (sd.source_node->get_direct_enabled()) {
+				if (sd->cfg.direct_enabled) {
 					inputs.flags = static_cast<IPLSimulationFlags>(inputs.flags | IPL_SIMULATIONFLAGS_DIRECT);
 				}
-				if (sd.source_node->get_reflection_enabled()) {
+				if (sd->cfg.reflection_enabled) {
 					inputs.flags = static_cast<IPLSimulationFlags>(inputs.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
 				}
 
 				inputs.directFlags = static_cast<IPLDirectSimulationFlags>(0);
-				if (sd.source_node->get_direct_enabled()) {
-					if (sd.source_node->get_occlusion_enabled()) {
+				if (sd->cfg.direct_enabled) {
+					if (sd->cfg.occlusion_enabled) {
 						inputs.directFlags = static_cast<IPLDirectSimulationFlags>(inputs.directFlags | IPL_DIRECTSIMULATIONFLAGS_OCCLUSION);
 					}
-					if (sd.source_node->get_transmission_enabled()) {
+					if (sd->cfg.transmission_enabled) {
 						inputs.directFlags = static_cast<IPLDirectSimulationFlags>(inputs.directFlags | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
 					}
-					if (sd.source_node->get_distance_attenuation_enabled()) {
+					if (sd->cfg.distance_attenuation_enabled) {
 						inputs.directFlags = static_cast<IPLDirectSimulationFlags>(inputs.directFlags | IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION);
 					}
-					if (sd.source_node->get_air_absorption_enabled()) {
+					if (sd->cfg.air_absorption_enabled) {
 						inputs.directFlags = static_cast<IPLDirectSimulationFlags>(inputs.directFlags | IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
 					}
 				}
 
-				inputs.source = sd.cached_coords;
+				inputs.source = sd->cached_coords;
 				inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
 				inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_EXPONENTIAL;
 
-				inputs.occlusionType = static_cast<IPLOcclusionType>(sd.source_node->get_occlusion_type());
-				inputs.occlusionRadius = sd.source_node->get_occlusion_radius();
-				inputs.numOcclusionSamples = sd.source_node->get_occlusion_samples();
-				inputs.numTransmissionRays = sd.source_node->get_transmission_rays();
+				inputs.occlusionType = static_cast<IPLOcclusionType>(sd->cfg.occlusion_type);
+				inputs.occlusionRadius = sd->cfg.occlusion_radius;
+				inputs.numOcclusionSamples = sd->cfg.occlusion_samples;
+				inputs.numTransmissionRays = sd->cfg.transmission_rays;
 
 				for (int i = 0; i < IPL_NUM_BANDS; ++i)
 					inputs.reverbScale[i] = 1.0f;
-				inputs.hybridReverbTransitionTime = sd.source_node->get_reflection_hybrid_delay();
+				inputs.hybridReverbTransitionTime = sd->cfg.reflection_hybrid_delay;
 				inputs.hybridReverbOverlapPercent = 0.25f;
 				inputs.baked = IPL_FALSE;
 
@@ -786,7 +807,7 @@ void SteamAudioServer::tick(float delta) {
 					// them right after iplSourceCreate (first run is already correct).
 					sld->pending_inputs = inputs;
 				}
-				sd.last_trf = src_trf;
+				sd->last_trf = src_trf;
 			}
 		}
 	}
@@ -815,15 +836,15 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 	//    the main thread). Inputs were stashed by tick() so the first run is correct.
 	{
 		PROFILE_FUNCTION_NAMED("adding_ipl_source");
-		for (auto &ld : self->listeners) {
-			if (!ld.simulator)
+		for (auto *ld : self->listeners) {
+			if (!ld->simulator)
 				continue;
-			for (auto &sd : self->sources) {
-				for (auto &sld : sd.listener_data) {
-					if (sld.listener != ld.listener || !sld.pending_create)
+			for (auto *sd : self->sources) {
+				for (auto &sld : sd->listener_data) {
+					if (sld.listener != ld || !sld.pending_create)
 						continue;
-					if (handleErr(iplSourceCreate(ld.simulator, &sld.pending_source_settings, &sld.source), "SteamAudio: Failed to create source")) {
-						iplSourceAdd(sld.source, ld.simulator);
+					if (handleErr(iplSourceCreate(ld->simulator, &sld.pending_source_settings, &sld.source), "SteamAudio: Failed to create source")) {
+						iplSourceAdd(sld.source, ld->simulator);
 						iplSourceSetInputs(sld.source, sld.pending_inputs.flags, &sld.pending_inputs);
 					}
 					sld.pending_create = false;
@@ -839,8 +860,8 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 	//    commit) or blocked (safe to commit now).
 	bool need_commit = self->scene_dirty;
 	if (!need_commit) {
-		for (auto &ld : self->listeners) {
-			if (ld.dirty) {
+		for (auto *ld : self->listeners) {
+			if (ld->dirty) {
 				need_commit = true;
 				break;
 			}
@@ -855,10 +876,10 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 				iplSceneCommit(self->phonon_scene);
 				self->scene_dirty = false;
 			}
-			for (auto &ld : self->listeners) {
-				if (ld.dirty) {
-					iplSimulatorCommit(ld.simulator);
-					ld.dirty = false;
+			for (auto *ld : self->listeners) {
+				if (ld->dirty) {
+					iplSimulatorCommit(ld->simulator);
+					ld->dirty = false;
 				}
 			}
 			self->refl_thread_wait_for_commit.store(false);
@@ -870,10 +891,10 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 	// 3. Run the direct simulation for every simulator.
 	{
 		PROFILE_FUNCTION_NAMED("running_direct_simulation");
-		for (auto &ld : self->listeners) {
-			if (!ld.simulator)
+		for (auto *ld : self->listeners) {
+			if (!ld->simulator)
 				continue;
-			iplSimulatorRunDirect(ld.simulator);
+			iplSimulatorRunDirect(ld->simulator);
 		}
 	}
 
@@ -917,10 +938,10 @@ void SteamAudioServer::simulation_thread_func() {
 			simulators.clear();
 			{
 				std::shared_lock lock(collections_mutex);
-				for (auto &ld : listeners) {
-					if (!ld.simulator || !ld.simulator_reflection_enabled)
+				for (auto *ld : listeners) {
+					if (!ld->simulator || !ld->simulator_reflection_enabled)
 						continue;
-					simulators.push_back(iplSimulatorRetain(ld.simulator));
+					simulators.push_back(iplSimulatorRetain(ld->simulator));
 				}
 			}
 
@@ -996,9 +1017,10 @@ void SteamAudioServer::mixing_thread_func() {
 		stress_mitigation_skips_accumulator += STRESS_MITIGATION_SKIPS_PER_SECOND * stress_mitigation * stress_mitigation_check_duration.count();
 		if (stress_mitigation_skips_accumulator > 1) {
 			stress_mitigation_skips_accumulator -= 1;
-			for (int i = sources.size() - 1; i >= 0; --i) {
+			std::shared_lock lock(collections_mutex);
+			for (int i = (int)sources.size() - 1; i >= 0; --i) {
 				bool found = false;
-				for (auto& sld:sources[i].listener_data) {
+				for (auto &sld : sources[i]->listener_data) {
 					if (sld.skip_reflection_applies > 0 || !sld.reflection_effect)
 						continue;
 					// 200 is quite long, with normal settings this will result in
@@ -1013,6 +1035,55 @@ void SteamAudioServer::mixing_thread_func() {
 					break;
 			}
 		}
+	}
+}
+
+void SteamAudioServer::create_listener_ipl(ListenerData *ld) {
+	ld->simulator_reflection_enabled = ld->cfg.reflection_simulation_enabled;
+	ld->dirty = true;
+	ld->push_buffer.resize(cached_audio_settings.frameSize);
+
+	// Initialize Simulator for this listener
+	IPLSimulationSettings sim_cfg{};
+	sim_cfg.flags = IPL_SIMULATIONFLAGS_DIRECT;
+	if (ld->cfg.reflection_simulation_enabled) {
+		sim_cfg.flags = static_cast<IPLSimulationFlags>(sim_cfg.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
+	}
+	sim_cfg.sceneType = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+	sim_cfg.reflectionType = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
+	sim_cfg.maxNumOcclusionSamples = get_project_int("steamaudio/max_occlusion_samples", 64);
+	sim_cfg.maxNumRays = ld->cfg.num_refl_rays;
+	sim_cfg.numDiffuseSamples = 32;
+	sim_cfg.maxDuration = ld->cfg.refl_duration;
+	sim_cfg.maxOrder = ld->cfg.refl_ambisonics_order;
+	sim_cfg.maxNumSources = 256;
+	sim_cfg.numThreads = 2;
+	sim_cfg.samplingRate = cached_audio_settings.samplingRate;
+	sim_cfg.frameSize = cached_audio_settings.frameSize;
+
+	if (handleErr(iplSimulatorCreate(phonon_context, &sim_cfg, &ld->simulator), "SteamAudio: Failed to create simulator for listener")) {
+		iplSimulatorSetScene(ld->simulator, phonon_scene);
+		iplSimulatorCommit(ld->simulator);
+	}
+
+	if (ld->cfg.reflection_simulation_enabled && ld->cfg.refl_type == IPL_REFLECTIONEFFECTTYPE_CONVOLUTION) {
+		int max_order = ld->cfg.refl_ambisonics_order;
+		int num_channels = ambisonic_channels_from(max_order);
+
+		IPLReflectionEffectSettings refl_cfg{};
+		refl_cfg.type = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
+		refl_cfg.numChannels = num_channels;
+		refl_cfg.irSize = int(ld->cfg.refl_duration * cached_audio_settings.samplingRate);
+		handleErr(iplReflectionMixerCreate(phonon_context, &cached_audio_settings, &refl_cfg, &ld->reflection_mixer), "SteamAudio: Failed to create reflection mixer");
+
+		IPLAmbisonicsDecodeEffectSettings decode_cfg{};
+		decode_cfg.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
+		decode_cfg.hrtf = phonon_hrtf;
+		decode_cfg.maxOrder = max_order;
+		handleErr(iplAmbisonicsDecodeEffectCreate(phonon_context, &cached_audio_settings, &decode_cfg, &ld->ambisonics_decode_effect), "SteamAudio: Failed to create listener ambisonics decode effect");
+
+		iplAudioBufferAllocate(phonon_context, num_channels, cached_audio_settings.frameSize, &ld->mixed_ambisonics_buffer);
+		iplAudioBufferAllocate(phonon_context, 2, cached_audio_settings.frameSize, &ld->decode_output_buffer);
 	}
 }
 
@@ -1036,207 +1107,248 @@ void SteamAudioServer::apply_pending_ops() {
 			using T = std::decay_t<decltype(pending)>;
 
 			if constexpr (std::is_same_v<T, PendingAddSource>) {
+				SourceData *sd = source_owner.get_or_null(pending.source);
+				if (!sd)
+					return;
 				// Check for duplicates
-				for (const auto &sd : sources) {
-					if (sd.source_node == pending.source_node)
+				for (auto *existing : sources) {
+					if (existing == sd)
 						return;
 				}
 
-				SourceData &sd = pending.source_data;
-
 				// Create cross-references with all existing listeners
-				for (const auto &ld : listeners) {
+				for (auto *ld : listeners) {
 					SourceListenerData sld;
-					if (create_source_listener_data(sld, sd.source_node, ld.listener, phonon_context, &cached_audio_settings, phonon_hrtf)) {
-						sd.listener_data.push_back(sld);
+					if (create_source_listener_data(sld, sd, ld, phonon_context, &cached_audio_settings, phonon_hrtf)) {
+						sd->listener_data.push_back(sld);
 					}
 				}
 
-				sources.push_back(std::move(sd));
+				sources.push_back(sd);
 
 			} else if constexpr (std::is_same_v<T, PendingRemoveSource>) {
+				SourceData *sd = source_owner.get_or_null(pending.source);
+				if (!sd)
+					return;
 				for (uint32_t i = 0; i < sources.size(); ++i) {
-					if (sources[i].source_node == pending.source_node) {
-						SourceData &sd = sources[i];
-						for (auto &sld : sd.listener_data) {
-							// Adjust listener pending_contributors if this source was counted
-							// but hasn't contributed yet to the current generation.
- 						for (auto &ld : listeners) {
- 							if (sld.listener == ld.listener && !sld.out_of_range &&
- 									(sd.source_node->get_layers() & ld.listener->get_mask()) != 0 &&
- 									sld.last_contributed_generation != ld.generation &&
- 									ld.pending_contributors > 0) {
- 								ld.pending_contributors--;
- 							}
- 						}
-
- 						// Remove source from its simulator (reuse ld loop)
- 						for (auto &ld : listeners) {
-								if (ld.simulator && sld.source && sld.listener == ld.listener) {
-									iplSourceRemove(sld.source, ld.simulator);
-									ld.dirty = true;
-								}
+					if (sources[i] != sd)
+						continue;
+					for (auto &sld : sd->listener_data) {
+						// Adjust listener pending_contributors if this source was counted
+						// but hasn't contributed yet to the current generation.
+						for (auto *ld : listeners) {
+							if (sld.listener == ld && !sld.out_of_range &&
+									(sd->cfg.layers & ld->cfg.mask) != 0 &&
+									sld.last_contributed_generation != ld->generation &&
+									ld->pending_contributors > 0) {
+								ld->pending_contributors--;
 							}
-							cleanup_source_listener_data(sld, phonon_context);
 						}
-						sources.remove_at(i);
-						break;
+
+						// Remove source from its simulator (reuse ld loop)
+						for (auto *ld : listeners) {
+							if (ld->simulator && sld.source && sld.listener == ld) {
+								iplSourceRemove(sld.source, ld->simulator);
+								ld->dirty = true;
+							}
+						}
+						cleanup_source_listener_data(sld, phonon_context);
 					}
+					sources.remove_at(i);
+					break;
 				}
+				source_owner.free(sd->self);
+				memdelete(sd);
 
 			} else if constexpr (std::is_same_v<T, PendingAddListener>) {
-				ListenerData &ld = pending.listener_data;
+				ListenerData *ld = listener_owner.get_or_null(pending.listener);
+				if (!ld)
+					return;
+				for (auto *existing : listeners) {
+					if (existing == ld)
+						return;
+				}
+
+				// Build the IPL simulator and per-listener IPL objects from cfg.
+				create_listener_ipl(ld);
 
 				// Create per-listener state for all existing sources
-				for (auto &sd : sources) {
+				for (auto *sd : sources) {
 					SourceListenerData sld;
-					if (create_source_listener_data(sld, sd.source_node, ld.listener, phonon_context, &cached_audio_settings, phonon_hrtf)) {
-						sd.listener_data.push_back(sld);
+					if (create_source_listener_data(sld, sd, ld, phonon_context, &cached_audio_settings, phonon_hrtf)) {
+						sd->listener_data.push_back(sld);
 					}
 				}
 
 				// Initialize pending_contributors so Phase 3 can start immediately
-				ld.pending_contributors = 0;
-				for (auto &sd : sources) {
-					if (!sd.source_node)
+				ld->pending_contributors = 0;
+				for (auto *sd : sources) {
+					if ((sd->cfg.layers & ld->cfg.mask) == 0)
 						continue;
-					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
-						continue;
-					for (auto &sld : sd.listener_data) {
-						if (sld.listener == ld.listener && !sld.out_of_range) {
-							ld.pending_contributors++;
+					for (auto &sld : sd->listener_data) {
+						if (sld.listener == ld && !sld.out_of_range) {
+							ld->pending_contributors++;
 							break;
 						}
 					}
 				}
 
-				listeners.push_back(std::move(ld));
+				listeners.push_back(ld);
 
 			} else if constexpr (std::is_same_v<T, PendingRemoveListener>) {
-				SteamAudioListener *listener = pending.listener;
+				ListenerData *ld = listener_owner.get_or_null(pending.listener);
+				if (!ld)
+					return;
 
-				// Find the ListenerData for counter adjustments
-				ListenerData *removing_ld = nullptr;
-				for (auto &ld : listeners) {
-					if (ld.listener == listener) {
-						removing_ld = &ld;
+				// Clean up per-listener state in all sources
+				for (auto *sd : sources) {
+					for (uint32_t i = 0; i < sd->listener_data.size(); ++i) {
+						if (sd->listener_data[i].listener != ld)
+							continue;
+						SourceListenerData &sld = sd->listener_data[i];
+
+						if (!sld.out_of_range &&
+								(sd->cfg.layers & ld->cfg.mask) != 0 &&
+								sld.last_contributed_generation != ld->generation &&
+								ld->pending_contributors > 0) {
+							ld->pending_contributors--;
+						}
+						// Also release pending_consumers if this listener was counted
+						if (!sld.out_of_range &&
+								(sd->cfg.layers & ld->cfg.mask) != 0 &&
+								sd->mixed_frames_ready >= cached_audio_settings.frameSize &&
+								sd->pending_consumers > 0) {
+							sd->pending_consumers--;
+						}
+
+						// Remove source from simulator before releasing
+						if (ld->simulator && sld.source) {
+							iplSourceRemove(sld.source, ld->simulator);
+						}
+						cleanup_source_listener_data(sld, phonon_context);
+						sd->listener_data.remove_at(i);
 						break;
 					}
 				}
 
-				// Clean up per-listener state in all sources
-				for (auto &sd : sources) {
-					for (uint32_t i = 0; i < sd.listener_data.size(); ++i) {
-						if (sd.listener_data[i].listener == listener) {
-							SourceListenerData &sld = sd.listener_data[i];
+				for (uint32_t i = 0; i < listeners.size(); ++i) {
+					if (listeners[i] != ld)
+						continue;
+					if (ld->simulator) {
+						iplSimulatorRelease(&ld->simulator);
+					}
+					if (ld->reflection_mixer) {
+						iplReflectionMixerRelease(&ld->reflection_mixer);
+					}
+					if (ld->ambisonics_decode_effect) {
+						iplAmbisonicsDecodeEffectRelease(&ld->ambisonics_decode_effect);
+					}
+					iplAudioBufferFree(phonon_context, &ld->mixed_ambisonics_buffer);
+					iplAudioBufferFree(phonon_context, &ld->decode_output_buffer);
+					listeners.erase(listeners.begin() + i);
+					break;
+				}
+				listener_owner.free(ld->self);
+				memdelete(ld);
 
- 							if (removing_ld && !sld.out_of_range &&
-									(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
-									sld.last_contributed_generation != removing_ld->generation &&
-									removing_ld->pending_contributors > 0) {
-								removing_ld->pending_contributors--;
-							}
-							// Also release pending_consumers if this listener was counted
-							if (!sld.out_of_range &&
-									(sd.source_node->get_layers() & listener->get_mask()) != 0 &&
-									sd.mixed_frames_ready >= cached_audio_settings.frameSize &&
-									sd.pending_consumers > 0) {
-								sd.pending_consumers--;
-							}
+			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToSource>) {
+				SourceData *sd = source_owner.get_or_null(pending.source);
+				if (!sd)
+					return;
+				SourcePlaybackEntry entry;
+				entry.playback = pending.playback;
+				entry.volume_linear = pending.volume_linear;
+				entry.pitch_scale = pending.pitch_scale;
+				sd->playbacks.push_back(entry);
 
-							// Remove source from simulator before releasing
-							for (auto &ld_entry : listeners) {
-								if (ld_entry.listener == listener && ld_entry.simulator && sld.source) {
-									iplSourceRemove(sld.source, ld_entry.simulator);
-								}
+			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToListener>) {
+				ListenerData *ld = listener_owner.get_or_null(pending.listener);
+				if (!ld)
+					return;
+				bool was_empty;
+				{
+					std::lock_guard<std::mutex> pb_lock(*ld->playbacks_mutex);
+					was_empty = ld->playbacks.is_empty();
+					RID is_playback_of_source;
+					for (auto *sd : sources) {
+						for (const auto &spb : sd->playbacks) {
+							if (spb.playback == pending.playback) {
+								is_playback_of_source = sd->self;
+								break;
 							}
-							cleanup_source_listener_data(sld, phonon_context);
-							sd.listener_data.remove_at(i);
+						}
+						if (is_playback_of_source.is_valid()) {
 							break;
 						}
 					}
+					ld->playbacks.push_back({ pending.playback, 0, is_playback_of_source });
 				}
+				if (was_empty) {
+					// Listener was inactive — start a fresh cycle.
+					// Bump generation so stale last_contributed_generation won't match.
+					ld->generation++;
+					ld->pending_contributors = 0;
+					ld->pending_drains = 0;
 
-				for (auto it = listeners.begin(); it != listeners.end(); ++it) {
-					if (it->listener == listener) {
-						if (it->simulator) {
-							iplSimulatorRelease(&it->simulator);
-						}
-						if (it->reflection_mixer) {
-							iplReflectionMixerRelease(&it->reflection_mixer);
-						}
-						if (it->ambisonics_decode_effect) {
-							iplAmbisonicsDecodeEffectRelease(&it->ambisonics_decode_effect);
-						}
-						iplAudioBufferFree(phonon_context, &it->mixed_ambisonics_buffer);
-						iplAudioBufferFree(phonon_context, &it->decode_output_buffer);
-						listeners.erase(it);
-						break;
-					}
-				}
-
-			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToSource>) {
-				for (auto &sd : sources) {
-					if (sd.source_node == pending.source_node) {
-						SourcePlaybackEntry entry;
-						entry.playback = pending.playback;
-						entry.volume_linear = pending.volume_linear;
-						entry.pitch_scale = pending.pitch_scale;
-						sd.playbacks.push_back(entry);
-						return;
-					}
-				}
-
- 			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToListener>) {
-				for (auto &ld : listeners) {
-					if (ld.listener == pending.listener) {
-						bool was_empty;
-						{
-							std::lock_guard<std::mutex> pb_lock(*ld.playbacks_mutex);
-							was_empty = ld.playbacks.is_empty();
-							SteamAudioSource* is_playback_of_source = nullptr;
-							for (const auto& sd : sources) {
-								for (const auto& spb : sd.playbacks) {
-									if (spb.playback == pending.playback) {
-										is_playback_of_source = sd.source_node;
-										break;
-									}
+					const int frame_size = cached_audio_settings.frameSize;
+					for (auto *sd : sources) {
+						if ((sd->cfg.layers & ld->cfg.mask) == 0)
+							continue;
+						for (auto &sld : sd->listener_data) {
+							if (sld.listener == ld && !sld.out_of_range) {
+								ld->pending_contributors++;
+								// If source has a ready mix, increment pending_consumers
+								// so it waits for this listener to consume before resetting.
+								if (sd->mixed_frames_ready >= frame_size) {
+									sd->pending_consumers++;
 								}
-								if (is_playback_of_source) {
-									break;
-								}
-							}
-							ld.playbacks.push_back({ pending.playback, 0, is_playback_of_source });
-						}
-						if (was_empty) {
-							// Listener was inactive — start a fresh cycle.
-							// Bump generation so stale last_contributed_generation won't match.
-							ld.generation++;
-							ld.pending_contributors = 0;
-							ld.pending_drains = 0;
-
-							const int frame_size = cached_audio_settings.frameSize;
-							for (auto &sd : sources) {
-								if (!sd.source_node)
-									continue;
-								if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
-									continue;
-								for (auto &sld : sd.listener_data) {
-									if (sld.listener == ld.listener && !sld.out_of_range) {
-										ld.pending_contributors++;
-										// If source has a ready mix, increment pending_consumers
-										// so it waits for this listener to consume before resetting.
-										if (sd.mixed_frames_ready >= frame_size) {
-											sd.pending_consumers++;
-										}
-										break;
-									}
-								}
+								break;
 							}
 						}
-						return;
 					}
 				}
+
+			} else if constexpr (std::is_same_v<T, PendingAddGeometry>) {
+				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
+				if (!g)
+					return;
+				for (auto *existing : geometries) {
+					if (existing == g)
+						return;
+				}
+				geometries.push_back(g);
+				scene_dirty = true;
+
+			} else if constexpr (std::is_same_v<T, PendingRemoveGeometry>) {
+				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
+				if (!g)
+					return;
+				for (uint32_t i = 0; i < geometries.size(); ++i) {
+					if (geometries[i] != g)
+						continue;
+					if (g->dynamic) {
+						for (auto &m : g->meshes) {
+							iplStaticMeshRemove(m, g->sub_scene);
+							iplStaticMeshRelease(&m);
+						}
+						if (g->instanced_mesh) {
+							iplInstancedMeshRemove(g->instanced_mesh, phonon_scene);
+							iplInstancedMeshRelease(&g->instanced_mesh);
+						}
+						if (g->sub_scene)
+							iplSceneRelease(&g->sub_scene);
+					} else {
+						for (auto &m : g->meshes) {
+							iplStaticMeshRemove(m, phonon_scene);
+							iplStaticMeshRelease(&m);
+						}
+					}
+					geometries.remove_at(i);
+					scene_dirty = true;
+					break;
+				}
+				geometry_owner.free(g->self);
+				memdelete(g);
 			}
 		}, op);
 	}
@@ -1258,35 +1370,33 @@ void SteamAudioServer::process_audio() {
 		// Push ready push_buffers to playbacks. When fully drained, clear and
 		// recount pending_contributors for the next round.
 		// =========================================================================
-		for (auto &ld : listeners) {
-			if (!ld.listener)
-				continue;
-			if (ld.pending_drains <= 0)
+		for (auto *ld : listeners) {
+			if (ld->pending_drains <= 0)
 				continue;
 
 			PROFILE_FUNCTION_NAMED("Listener draining");
-			std::lock_guard pb_lock(*ld.playbacks_mutex);
+			std::lock_guard pb_lock(*ld->playbacks_mutex);
 
 			// Remove dead playbacks and push remaining data to active ones.
-			for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
-				if (!ld.playbacks[i].playback->is_playing()) {
-					if (ld.playbacks[i].remaining_from_push_buffer > 0) {
-						ld.pending_drains--;
+			for (int i = (int)ld->playbacks.size() - 1; i >= 0; --i) {
+				if (!ld->playbacks[i].playback->is_playing()) {
+					if (ld->playbacks[i].remaining_from_push_buffer > 0) {
+						ld->pending_drains--;
 					}
-					ld.playbacks.remove_at(i);
+					ld->playbacks.remove_at(i);
 					continue;
 				}
-				auto &pb = ld.playbacks[i];
+				auto &pb = ld->playbacks[i];
 				if (pb.remaining_from_push_buffer <= 0)
 					continue;
 				int free_available_in_buffer = pb.playback->get_free_buffer_size();
 				if (free_available_in_buffer == 0) {
-					if (pb.is_playback_of_source) {
+					if (pb.is_playback_of_source.is_valid()) {
 						// when this listener actually plays back via a source (e.g. walkie talkie),
 						// we have to check if that source is skipping mixing (leading to a full buffer)
-						for (const auto& sd : sources) {
-							if (sd.source_node == pb.is_playback_of_source) {
-								if (sd.is_skipping_mixing) {
+						for (auto *sd : sources) {
+							if (sd->self == pb.is_playback_of_source) {
+								if (sd->is_skipping_mixing) {
 									pb.remaining_from_push_buffer = 0;
 								}
 								break;
@@ -1295,38 +1405,36 @@ void SteamAudioServer::process_audio() {
 					}
 				}
 				else if (pb.remaining_from_push_buffer <= free_available_in_buffer) {
-					pb.playback->push_buffer(ld.push_buffer.slice(frame_size - pb.remaining_from_push_buffer));
+					pb.playback->push_buffer(ld->push_buffer.slice(frame_size - pb.remaining_from_push_buffer));
 					pb.remaining_from_push_buffer = 0;
 					pb.debug_times_drained++;
 				} else {
 					int num_to_push = MIN(pb.remaining_from_push_buffer, free_available_in_buffer);
 					if (num_to_push > 0) {
 						int start = frame_size - pb.remaining_from_push_buffer;
-						pb.playback->push_buffer(ld.push_buffer.slice(start, start + num_to_push));
+						pb.playback->push_buffer(ld->push_buffer.slice(start, start + num_to_push));
 						pb.remaining_from_push_buffer -= num_to_push;
 					}
 				}
 				if (pb.remaining_from_push_buffer <= 0)
-					ld.pending_drains--;
+					ld->pending_drains--;
 			}
 
 			// All playbacks drained — clear buffer and recount contributors.
-			if (ld.pending_drains <= 0) {
-				ld.debug_times_pushed += 1;
-				ld.pending_drains = 0;
-				ld.push_buffer.fill(Vector2(0, 0));
-				ld.generation++;
+			if (ld->pending_drains <= 0) {
+				ld->debug_times_pushed += 1;
+				ld->pending_drains = 0;
+				ld->push_buffer.fill(Vector2(0, 0));
+				ld->generation++;
 
 				// Count relevant in-range sources as contributors
-				ld.pending_contributors = 0;
-				for (auto &sd : sources) {
-					if (!sd.source_node)
+				ld->pending_contributors = 0;
+				for (auto *sd : sources) {
+					if ((sd->cfg.layers & ld->cfg.mask) == 0)
 						continue;
-					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
-						continue;
-					for (auto &sld : sd.listener_data) {
-						if (sld.listener == ld.listener && !sld.out_of_range) {
-							ld.pending_contributors++;
+					for (auto &sld : sd->listener_data) {
+						if (sld.listener == ld && !sld.out_of_range) {
+							ld->pending_contributors++;
 							break;
 						}
 					}
@@ -1341,38 +1449,54 @@ void SteamAudioServer::process_audio() {
 		// PHASE 2: Mix source playbacks into mixed_frames.
 		// For each source with no pending consumers, reset and pull new audio.
 		// =========================================================================
-		for (auto &sd : sources) {
-			if (!sd.source_node)
-				continue;
+		for (auto *sd : sources) {
 			PROFILE_FUNCTION_NAMED("Source Pre-mixing");
 
+			// A source with no currently-playing playbacks is silent. Force its
+			// level to the noise floor so sensor-only listeners / dB meters stop
+			// reading a stale level. current_db_level is otherwise only refreshed
+			// while the source is being mixed (which requires an output listener),
+			// so without this a stopped source stays pinned at its last level and
+			// the sensor-slot decay can never clear it.
+			{
+				bool any_playing = false;
+				for (auto &pb : sd->playbacks) {
+					if (pb.playback->is_playing()) {
+						any_playing = true;
+						break;
+					}
+				}
+				if (!any_playing)
+					sd->current_db_level = -200;
+			}
+
 			// Skip if listeners still need the previous mix.
-			if (sd.pending_consumers > 0)
+			if (sd->pending_consumers > 0)
 				continue;
 
 			// Reset completed+consumed mix
-			if (sd.mixed_frames_ready >= frame_size) {
-				sd.mixed_frames.fill(Vector2(0, 0));
-				sd.mixed_frames_ready = 0;
-				for (auto &pb : sd.playbacks) {
+			if (sd->mixed_frames_ready >= frame_size) {
+				sd->mixed_frames.fill(Vector2(0, 0));
+				sd->mixed_frames_ready = 0;
+				for (auto &pb : sd->playbacks) {
 					pb.num_mixed_in_current_mixed_frames = 0;
 				}
 
-				sd.debug_times_mixed += 1;
+				sd->debug_times_mixed += 1;
 			}
 
 			// Clean up finished playbacks
-			for (int i = (int)sd.playbacks.size() - 1; i >= 0; --i) {
-				if (!sd.playbacks[i].playback->is_playing()) {
-					sd.playbacks.remove_at(i);
+			for (int i = (int)sd->playbacks.size() - 1; i >= 0; --i) {
+				if (!sd->playbacks[i].playback->is_playing()) {
+					sd->playbacks.remove_at(i);
 				}
 			}
 
 			// quick check if there are any listeners that would actually
 			// consume the mixed data (skip mixing otherwise!)
-			sd.is_skipping_mixing = true;
-			for (auto &sld : sd.listener_data) {
-				if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
+			sd->is_skipping_mixing = true;
+			for (auto &sld : sd->listener_data) {
+				if ((sd->cfg.layers & sld.listener->cfg.mask) == 0)
 					continue;
 				if (sld.out_of_range)
 					continue;
@@ -1382,27 +1506,25 @@ void SteamAudioServer::process_audio() {
 				if (!sld.direct_simulated_once)
 					continue;
 				// Check if this listener has active (playing) playbacks
-				for (auto &ld : listeners) {
-					if (ld.listener == sld.listener) {
-						std::lock_guard pb_lock(*ld.playbacks_mutex);
-						for (auto &pb : ld.playbacks) {
-							if (pb.playback->is_playing()) {
-								sd.is_skipping_mixing = false;
-								break;
-							}
+				ListenerData *ld = sld.listener;
+				{
+					std::lock_guard pb_lock(*ld->playbacks_mutex);
+					for (auto &pb : ld->playbacks) {
+						if (pb.playback->is_playing()) {
+							sd->is_skipping_mixing = false;
+							break;
 						}
-						break;
 					}
 				}
-				if (!sd.is_skipping_mixing)
+				if (!sd->is_skipping_mixing)
 					break;
 			}
-			if (sd.is_skipping_mixing)
+			if (sd->is_skipping_mixing)
 				continue;
 
-			int prev_mixed_count = sd.mixed_frames_ready;
+			int prev_mixed_count = sd->mixed_frames_ready;
 			int min_frames_ready = frame_size;
-			for (auto &pb : sd.playbacks) {
+			for (auto &pb : sd->playbacks) {
 				if (pb.num_mixed_in_current_mixed_frames >= frame_size)
 					continue;
 				int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
@@ -1415,55 +1537,53 @@ void SteamAudioServer::process_audio() {
 				for (int frames_index = 0; frames_index < pulled; ++frames_index) {
 					if (mixed_index >= frame_size)
 						break; // precaution, but should really not happen...
-					sd.mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear * sd.volume_linear;
+					sd->mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear * sd->volume_linear;
 					++mixed_index;
 				}
 				min_frames_ready = MIN(min_frames_ready, mixed_index);
 				pb.num_mixed_in_current_mixed_frames = mixed_index;
 			}
-			sd.mixed_frames_ready = min_frames_ready;
+			sd->mixed_frames_ready = min_frames_ready;
 
-			if (!sd.effect_instances.is_empty()) {
+			if (!sd->effect_instances.is_empty()) {
 				PROFILE_FUNCTION_NAMED("Effect Stack Processing");
 				// Apply effect stack in-place on mixed frames
-				int num_newly_ready = sd.mixed_frames_ready - prev_mixed_count;
+				int num_newly_ready = sd->mixed_frames_ready - prev_mixed_count;
 				if (num_newly_ready > 0) {
-					PackedVector2Array new_frames(sd.mixed_frames.slice(prev_mixed_count, sd.mixed_frames_ready));
-					for (auto &inst : sd.effect_instances) {
+					PackedVector2Array new_frames(sd->mixed_frames.slice(prev_mixed_count, sd->mixed_frames_ready));
+					for (auto &inst : sd->effect_instances) {
 						new_frames = inst->process_audio(
 								new_frames,
 								frame_size);
 					}
 					int new_index = 0;
-					for (int mixed_index = prev_mixed_count; mixed_index < sd.mixed_frames_ready; ++mixed_index) {
-						sd.mixed_frames[mixed_index] = new_frames[new_index];
+					for (int mixed_index = prev_mixed_count; mixed_index < sd->mixed_frames_ready; ++mixed_index) {
+						sd->mixed_frames[mixed_index] = new_frames[new_index];
 						new_index++;
 					}
 				}
 			}
-			if (sd.mixed_frames_ready == frame_size) {
+			if (sd->mixed_frames_ready == frame_size) {
 				// Mix complete — count listeners with active playbacks as consumers.
-				sd.pending_consumers = 0;
-				for (auto &sld : sd.listener_data) {
-					if ((sd.source_node->get_layers() & sld.listener->get_mask()) == 0)
+				sd->pending_consumers = 0;
+				for (auto &sld : sd->listener_data) {
+					if ((sd->cfg.layers & sld.listener->cfg.mask) == 0)
 						continue;
 					if (sld.out_of_range)
 						continue;
 					// Check if this listener has active (playing) playbacks
-					for (auto &ld : listeners) {
-						if (ld.listener == sld.listener) {
-							std::lock_guard pb_lock(*ld.playbacks_mutex);
-							bool has_playing = false;
-							for (auto &pb : ld.playbacks) {
-								if (pb.playback->is_playing()) {
-									has_playing = true;
-									break;
-								}
+					ListenerData *ld = sld.listener;
+					{
+						std::lock_guard pb_lock(*ld->playbacks_mutex);
+						bool has_playing = false;
+						for (auto &pb : ld->playbacks) {
+							if (pb.playback->is_playing()) {
+								has_playing = true;
+								break;
 							}
-							if (has_playing) {
-								sd.pending_consumers++;
-							}
-							break;
+						}
+						if (has_playing) {
+							sd->pending_consumers++;
 						}
 					}
 				}
@@ -1471,14 +1591,14 @@ void SteamAudioServer::process_audio() {
 				// Calculate dB level for current mix
 				float sum_sq = 0.0f;
 				for (int i = 0; i < frame_size; ++i) {
-					sum_sq += sd.mixed_frames[i].x * sd.mixed_frames[i].x;
-					sum_sq += sd.mixed_frames[i].y * sd.mixed_frames[i].y;
+					sum_sq += sd->mixed_frames[i].x * sd->mixed_frames[i].x;
+					sum_sq += sd->mixed_frames[i].y * sd->mixed_frames[i].y;
 				}
 				float rms = sqrtf(sum_sq / (frame_size * 2));
 				if (rms > 0.000001f) {
-					sd.current_db_level = 20.0f * log10f(rms);
+					sd->current_db_level = 20.0f * log10f(rms);
 				} else {
-					sd.current_db_level = -200; // Silenced/Noise floor
+					sd->current_db_level = -200; // Silenced/Noise floor
 				}
 			}
 		}
@@ -1491,83 +1611,73 @@ void SteamAudioServer::process_audio() {
 		// For each listener awaiting contributions, apply SteamAudio effects
 		// from ready sources and accumulate into push_buffer.
 		// =========================================================================
-		for (auto &ld : listeners) {
-			if (!ld.listener)
-				continue;
-
+		for (auto *ld : listeners) {
 			// Skip listeners without active playbacks — they would cycle through
 			// generations instantly, consuming source mixes before real listeners can.
 			bool has_active_playbacks;
 			{
-				std::lock_guard pb_lock(*ld.playbacks_mutex);
+				std::lock_guard pb_lock(*ld->playbacks_mutex);
 				// Remove dead playbacks
-				for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
-					if (!ld.playbacks[i].playback->is_playing()) {
-						ld.playbacks.remove_at(i);
+				for (int i = (int)ld->playbacks.size() - 1; i >= 0; --i) {
+					if (!ld->playbacks[i].playback->is_playing()) {
+						ld->playbacks.remove_at(i);
 					}
 				}
-				has_active_playbacks = !ld.playbacks.is_empty();
+				has_active_playbacks = !ld->playbacks.is_empty();
 			}
 
 			if (!has_active_playbacks) {
 				// No playbacks — release pending_consumers to prevent stalls.
-				if (ld.pending_contributors > 0) {
-					for (auto &sd : sources) {
-						if (!sd.source_node)
+				if (ld->pending_contributors > 0) {
+					for (auto *sd : sources) {
+						if ((sd->cfg.layers & ld->cfg.mask) == 0)
 							continue;
-						if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+						if (sd->mixed_frames_ready < frame_size)
 							continue;
-						if (sd.mixed_frames_ready < frame_size)
-							continue;
-						for (auto &entry : sd.listener_data) {
-							if (entry.listener == ld.listener && !entry.out_of_range &&
-									entry.last_contributed_generation != ld.generation) {
-								if (sd.pending_consumers > 0)
-									sd.pending_consumers--;
-								entry.last_contributed_generation = ld.generation;
+						for (auto &entry : sd->listener_data) {
+							if (entry.listener == ld && !entry.out_of_range &&
+									entry.last_contributed_generation != ld->generation) {
+								if (sd->pending_consumers > 0)
+									sd->pending_consumers--;
+								entry.last_contributed_generation = ld->generation;
 								break;
 							}
 						}
 					}
 				}
-				ld.pending_contributors = 0;
-				ld.pending_drains = 0;
+				ld->pending_contributors = 0;
+				ld->pending_drains = 0;
 				continue;
 			}
 
-			if (ld.pending_contributors <= 0 && ld.pending_drains <= 0) {
-				ld.push_buffer.fill(Vector2(0, 0));
-				ld.generation++;
-				ld.pending_contributors = 0;
-				for (auto &sd : sources) {
-					if (!sd.source_node)
+			if (ld->pending_contributors <= 0 && ld->pending_drains <= 0) {
+				ld->push_buffer.fill(Vector2(0, 0));
+				ld->generation++;
+				ld->pending_contributors = 0;
+				for (auto *sd : sources) {
+					if ((sd->cfg.layers & ld->cfg.mask) == 0)
 						continue;
-					if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
-						continue;
-					for (auto &sld : sd.listener_data) {
-						if (sld.listener == ld.listener && !sld.out_of_range) {
-							ld.pending_contributors++;
+					for (auto &sld : sd->listener_data) {
+						if (sld.listener == ld && !sld.out_of_range) {
+							ld->pending_contributors++;
 							break;
 						}
 					}
 				}
 			}
 
-			if (ld.pending_contributors <= 0)
+			if (ld->pending_contributors <= 0)
 				continue;
 
 			PROFILE_FUNCTION_NAMED("Listener mixing");
 
-			for (auto &sd : sources) {
-				if (!sd.source_node)
-					continue;
-
-				if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
+			for (auto *sd : sources) {
+				if ((sd->cfg.layers & ld->cfg.mask) == 0)
 					continue;
 
 				SourceListenerData *sld = nullptr;
-				for (auto &entry : sd.listener_data) {
-					if (entry.listener == ld.listener) {
+				for (auto &entry : sd->listener_data) {
+					if (entry.listener == ld) {
 						sld = &entry;
 						break;
 					}
@@ -1577,7 +1687,7 @@ void SteamAudioServer::process_audio() {
 					continue;
 
 				// Already contributed to this generation?
-				if (sld->last_contributed_generation == ld.generation)
+				if (sld->last_contributed_generation == ld->generation)
 					continue;
 
 				// Not simulated yet: this source was counted as a contributor
@@ -1585,46 +1695,46 @@ void SteamAudioServer::process_audio() {
 				// so the listener is NOT blocked, then skip. Phase 2 also withholds
 				// its mixing, so no audio is consumed in the meantime.
 				if (!sld->direct_simulated_once) {
-					sld->last_contributed_generation = ld.generation;
+					sld->last_contributed_generation = ld->generation;
 					if (!sld->out_of_range) {
-						if (ld.pending_contributors > 0)
-							ld.pending_contributors--;
-						if (sd.pending_consumers > 0)
-							sd.pending_consumers--;
+						if (ld->pending_contributors > 0)
+							ld->pending_contributors--;
+						if (sd->pending_consumers > 0)
+							sd->pending_consumers--;
 					}
 					continue;
 				}
 
-				if (sd.mixed_frames_ready < frame_size) {
+				if (sd->mixed_frames_ready < frame_size) {
 					// Source not ready yet
 					continue;
 				}
 
 				// Mark contributed even when out of range
-				sld->last_contributed_generation = ld.generation;
+				sld->last_contributed_generation = ld->generation;
 
 				// Out of range — decrement contributors, but skip processing.
 				if (sld->out_of_range) {
-					if (ld.pending_contributors > 0)
-						ld.pending_contributors--;
+					if (ld->pending_contributors > 0)
+						ld->pending_contributors--;
 					continue;
 				}
 
 				// Copy pre-mixed source audio into SteamAudio input buffer
 				for (int s = 0; s < frame_size; ++s) {
-					Vector2 f = sd.mixed_frames[s];
+					Vector2 f = sd->mixed_frames[s];
 					sld->input_buffer.data[0][s] = (f.x + f.y) * 0.5f;
 				}
 
 				sld->debug_times_contributed += 1;
 
-				if (ld.pending_contributors > 0)
-					ld.pending_contributors--;
-				if (sd.pending_consumers > 0)
-					sd.pending_consumers--;
+				if (ld->pending_contributors > 0)
+					ld->pending_contributors--;
+				if (sd->pending_consumers > 0)
+					sd->pending_consumers--;
 
 				// Direct effects
-				if (sd.source_node->get_direct_enabled() && sld->source && sld->direct_effect) {
+				if (sd->cfg.direct_enabled && sld->source && sld->direct_effect) {
 					PROFILE_FUNCTION_NAMED("direct effect processing")
 					IPLSimulationOutputs outputs{};
 					iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
@@ -1632,30 +1742,30 @@ void SteamAudioServer::process_audio() {
 					IPLDirectEffectParams direct_params = outputs.direct;
 					direct_params.flags = static_cast<IPLDirectEffectFlags>(0);
 
-					if (sd.source_node->get_occlusion_enabled()) {
+					if (sd->cfg.occlusion_enabled) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
 					}
 
-					if (sd.source_node->get_transmission_enabled()) {
+					if (sd->cfg.transmission_enabled) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
-						direct_params.transmissionType = static_cast<IPLTransmissionType>(sd.source_node->get_transmission_type());
+						direct_params.transmissionType = static_cast<IPLTransmissionType>(sd->cfg.transmission_type);
 					}
 
-					if (sd.source_node->get_air_absorption_enabled()) {
+					if (sd->cfg.air_absorption_enabled) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
 
 						IPLAirAbsorptionModel airAbsorptionModel{};
 						airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
 
-						iplAirAbsorptionCalculate(phonon_context, sd.cached_coords.origin, ld.cached_coords.origin, &airAbsorptionModel, direct_params.airAbsorption);
+						iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld->cached_coords.origin, &airAbsorptionModel, direct_params.airAbsorption);
 					}
 
-					if (sd.source_node->get_distance_attenuation_enabled()) {
+					if (sd->cfg.distance_attenuation_enabled) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
 
 						float dist = sld->dist_to_listener;
-						float min_dist = sd.source_node->get_distance_attenuation_min();
-						float max_dist = sd.source_node->get_distance_attenuation_max();
+						float min_dist = sd->cfg.distance_attenuation_min;
+						float max_dist = sd->cfg.distance_attenuation_max;
 
 						float attenuation = calculate_attenuation(dist, min_dist, max_dist);
 						direct_params.distanceAttenuation = attenuation;
@@ -1666,16 +1776,16 @@ void SteamAudioServer::process_audio() {
 					iplDirectEffectApply(sld->direct_effect, &direct_params, &sld->input_buffer, &sld->input_buffer);
 
 					// Binaural spatialization
-					if (sd.source_node->get_binaural_enabled()) {
+					if (sd->cfg.binaural_enabled) {
 						IPLBinauralEffectParams params{};
 
 						params.direction = iplCalculateRelativeDirection(phonon_context,
-								sd.cached_coords.origin,
-								ld.cached_coords.origin,
-								ld.cached_coords.ahead,
-								ld.cached_coords.up);
-						params.interpolation = static_cast<IPLHRTFInterpolation>(sd.source_node->get_binaural_interpolation());
-						params.spatialBlend = sd.source_node->get_binaural_spatial_blend();
+								sd->cached_coords.origin,
+								ld->cached_coords.origin,
+								ld->cached_coords.ahead,
+								ld->cached_coords.up);
+						params.interpolation = static_cast<IPLHRTFInterpolation>(sd->cfg.binaural_interpolation);
+						params.spatialBlend = sd->cfg.binaural_spatial_blend;
 						params.hrtf = phonon_hrtf;
 
 						if (phonon_hrtf) {
@@ -1688,26 +1798,26 @@ void SteamAudioServer::process_audio() {
 						}
 
 						for (int s = 0; s < frame_size; ++s) {
-							ld.push_buffer[s].x += sld->output_buffer.data[0][s];
-							ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+							ld->push_buffer[s].x += sld->output_buffer.data[0][s];
+							ld->push_buffer[s].y += sld->output_buffer.data[1][s];
 						}
 					} else {
 						for (int s = 0; s < frame_size; ++s) {
-							ld.push_buffer[s].x += sld->input_buffer.data[0][s];
-							ld.push_buffer[s].y += sld->input_buffer.data[0][s];
+							ld->push_buffer[s].x += sld->input_buffer.data[0][s];
+							ld->push_buffer[s].y += sld->input_buffer.data[0][s];
 						}
 					}
 				}
 
 				// Reflections
-				if (sd.source_node->get_reflection_enabled() && sld->source && sld->reflection_effect) {
+				if (sd->cfg.reflection_enabled && sld->source && sld->reflection_effect) {
 					PROFILE_FUNCTION_NAMED("Reflection Effect Processing");
 					IPLSimulationOutputs outputs{};
 					iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
 
 					IPLReflectionEffectParams refl_params = outputs.reflections;
-					refl_params.type = static_cast<IPLReflectionEffectType>(ld.listener->get_refl_type());
-					refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
+					refl_params.type = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
+					refl_params.numChannels = ambisonic_channels_from(ld->cfg.refl_ambisonics_order);
 					// changing the irSize here doesn't seem to do anything, unfortunately
 					float stress_irsize_factor = 0.2f + 0.8f * (1.0f - stress_mitigation.load());
 					refl_params.irSize = static_cast<int>(static_cast<float>(refl_params.irSize) * stress_irsize_factor);
@@ -1719,19 +1829,19 @@ void SteamAudioServer::process_audio() {
 						if (sld->skip_reflection_applies > 0)
 							sld->skip_reflection_applies--;
 						else {
-							iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, ld.reflection_mixer);
-							if (!ld.reflection_mixer && sld->ambisonics_decode_effect) {
+							iplReflectionEffectApply(sld->reflection_effect, &refl_params, &sld->input_buffer, &sld->ambisonics_buffer, ld->reflection_mixer);
+							if (!ld->reflection_mixer && sld->ambisonics_decode_effect) {
 								IPLAmbisonicsDecodeEffectParams decode_params{};
-								decode_params.order = ld.listener->get_refl_ambisonics_order();
+								decode_params.order = ld->cfg.refl_ambisonics_order;
 								decode_params.hrtf = phonon_hrtf;
-								decode_params.orientation = ld.cached_coords;
+								decode_params.orientation = ld->cached_coords;
 								decode_params.binaural = IPL_TRUE;
 
 								iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
 
 								for (int s = 0; s < frame_size; ++s) {
-									ld.push_buffer[s].x += sld->output_buffer.data[0][s];
-									ld.push_buffer[s].y += sld->output_buffer.data[1][s];
+									ld->push_buffer[s].x += sld->output_buffer.data[0][s];
+									ld->push_buffer[s].y += sld->output_buffer.data[1][s];
 								}
 							}
 						}
@@ -1740,75 +1850,73 @@ void SteamAudioServer::process_audio() {
 			}
 
 			// If all contributors are done for this listener, finish reflections processing
-			if (ld.pending_contributors <= 0 && ld.reflection_mixer && ld.ambisonics_decode_effect) {
+			if (ld->pending_contributors <= 0 && ld->reflection_mixer && ld->ambisonics_decode_effect) {
 				PROFILE_FUNCTION_NAMED("Reflection Mixer Processing");
 				IPLReflectionEffectParams apply_refl_params{};
-				apply_refl_params.type = static_cast<IPLReflectionEffectType>(ld.listener->get_refl_type());
-				apply_refl_params.numChannels = ambisonic_channels_from(ld.listener->get_refl_ambisonics_order());
+				apply_refl_params.type = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
+				apply_refl_params.numChannels = ambisonic_channels_from(ld->cfg.refl_ambisonics_order);
 
-				iplReflectionMixerApply(ld.reflection_mixer, &apply_refl_params, &ld.mixed_ambisonics_buffer);
+				iplReflectionMixerApply(ld->reflection_mixer, &apply_refl_params, &ld->mixed_ambisonics_buffer);
 
 				IPLAmbisonicsDecodeEffectParams decode_params{};
-				decode_params.order = ld.listener->get_refl_ambisonics_order();
+				decode_params.order = ld->cfg.refl_ambisonics_order;
 				decode_params.hrtf = phonon_hrtf;
-				decode_params.orientation = ld.cached_coords;
+				decode_params.orientation = ld->cached_coords;
 				decode_params.binaural = IPL_TRUE;
 
-				iplAmbisonicsDecodeEffectApply(ld.ambisonics_decode_effect, &decode_params, &ld.mixed_ambisonics_buffer, &ld.decode_output_buffer);
+				iplAmbisonicsDecodeEffectApply(ld->ambisonics_decode_effect, &decode_params, &ld->mixed_ambisonics_buffer, &ld->decode_output_buffer);
 
 				for (int s = 0; s < frame_size; ++s) {
-					ld.push_buffer[s].x += ld.decode_output_buffer.data[0][s];
-					ld.push_buffer[s].y += ld.decode_output_buffer.data[1][s];
+					ld->push_buffer[s].x += ld->decode_output_buffer.data[0][s];
+					ld->push_buffer[s].y += ld->decode_output_buffer.data[1][s];
 				}
 			}
 
 			// All contributors done — start draining push_buffer to playbacks
-			if (ld.pending_contributors <= 0) {
-				ld.pending_contributors = 0;
-				std::lock_guard pb_lock(*ld.playbacks_mutex);
+			if (ld->pending_contributors <= 0) {
+				ld->pending_contributors = 0;
+				std::lock_guard pb_lock(*ld->playbacks_mutex);
 
-				for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
-					if (!ld.playbacks[i].playback->is_playing()) {
-						ld.playbacks.remove_at(i);
+				for (int i = (int)ld->playbacks.size() - 1; i >= 0; --i) {
+					if (!ld->playbacks[i].playback->is_playing()) {
+						ld->playbacks.remove_at(i);
 					}
 				}
 
-				ld.pending_drains = 0;
-				for (int i = (int)ld.playbacks.size() - 1; i >= 0; --i) {
-					auto &pb = ld.playbacks[i];
+				ld->pending_drains = 0;
+				for (int i = (int)ld->playbacks.size() - 1; i >= 0; --i) {
+					auto &pb = ld->playbacks[i];
 					pb.remaining_from_push_buffer = frame_size;
-					ld.pending_drains++;
+					ld->pending_drains++;
 					int free_available_in_buffer = pb.playback->get_free_buffer_size();
 					if (frame_size <= free_available_in_buffer) {
-						pb.playback->push_buffer(ld.push_buffer);
+						pb.playback->push_buffer(ld->push_buffer);
 						pb.remaining_from_push_buffer = 0;
-						ld.pending_drains--;
+						ld->pending_drains--;
 						pb.debug_times_drained += 1;
 					} else {
 						int num_to_push = MIN(frame_size, free_available_in_buffer);
 						if (num_to_push > 0) {
-							pb.playback->push_buffer(ld.push_buffer.slice(0, num_to_push));
+							pb.playback->push_buffer(ld->push_buffer.slice(0, num_to_push));
 							pb.remaining_from_push_buffer -= num_to_push;
 						}
 					}
 				}
 
 				// All playbacks consumed immediately — clear and recount contributors
-				if (ld.pending_drains <= 0) {
-					ld.debug_times_pushed += 1;
-					ld.pending_drains = 0;
-					ld.push_buffer.fill(Vector2(0, 0));
-					ld.generation++;
+				if (ld->pending_drains <= 0) {
+					ld->debug_times_pushed += 1;
+					ld->pending_drains = 0;
+					ld->push_buffer.fill(Vector2(0, 0));
+					ld->generation++;
 
-					ld.pending_contributors = 0;
-					for (auto &sd : sources) {
-						if (!sd.source_node)
+					ld->pending_contributors = 0;
+					for (auto *sd : sources) {
+						if ((sd->cfg.layers & ld->cfg.mask) == 0)
 							continue;
-						if ((sd.source_node->get_layers() & ld.listener->get_mask()) == 0)
-							continue;
-						for (auto &sld : sd.listener_data) {
-							if (sld.listener == ld.listener && !sld.out_of_range) {
-								ld.pending_contributors++;
+						for (auto &sld : sd->listener_data) {
+							if (sld.listener == ld && !sld.out_of_range) {
+								ld->pending_contributors++;
 								break;
 							}
 						}
@@ -1819,119 +1927,244 @@ void SteamAudioServer::process_audio() {
 	}
 }
 
-void SteamAudioServer::add_listener(SteamAudioListener *listener) {
-	PROFILE_FUNCTION();
+// ─────────────────────────────────────────────────────────────────────────────
+// Listener RID API
+// ─────────────────────────────────────────────────────────────────────────────
 
-	// Pre-build ListenerData outside any lock
-	ListenerData ld;
-	ld.listener = listener;
-	ld.simulator_reflection_enabled = listener->get_reflection_simulation_enabled();
-	ld.dirty = true;
-	ld.push_buffer.resize(cached_audio_settings.frameSize);
-
-	// Initialize Simulator for this listener
-	IPLSimulationSettings sim_cfg{};
-	sim_cfg.flags = IPL_SIMULATIONFLAGS_DIRECT;
-	if (listener->get_reflection_simulation_enabled()) {
-		sim_cfg.flags = static_cast<IPLSimulationFlags>(sim_cfg.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
-	}
-	sim_cfg.sceneType = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
-	sim_cfg.reflectionType = static_cast<IPLReflectionEffectType>(listener->get_refl_type());
-	sim_cfg.maxNumOcclusionSamples = get_project_int("steamaudio/max_occlusion_samples", 64);
-	sim_cfg.maxNumRays = listener->get_num_refl_rays();
-	sim_cfg.numDiffuseSamples = 32;
-	sim_cfg.maxDuration = listener->get_refl_duration();
-	sim_cfg.maxOrder = listener->get_refl_ambisonics_order();
-	sim_cfg.maxNumSources = 256;
-	sim_cfg.numThreads = 2;
-	sim_cfg.samplingRate = cached_audio_settings.samplingRate;
-	sim_cfg.frameSize = cached_audio_settings.frameSize;
-
-	if (handleErr(iplSimulatorCreate(phonon_context, &sim_cfg, &ld.simulator), "SteamAudio: Failed to create simulator for listener")) {
-		iplSimulatorSetScene(ld.simulator, phonon_scene);
-		iplSimulatorCommit(ld.simulator);
-	}
-
-	if (listener->get_reflection_simulation_enabled() && listener->get_refl_type() == IPL_REFLECTIONEFFECTTYPE_CONVOLUTION) {
-		int max_order = listener->get_refl_ambisonics_order();
-		int num_channels = ambisonic_channels_from(max_order);
-
-		IPLReflectionEffectSettings refl_cfg{};
-		refl_cfg.type = static_cast<IPLReflectionEffectType>(listener->get_refl_type());
-		refl_cfg.numChannels = num_channels;
-		refl_cfg.irSize = int(listener->get_refl_duration() * cached_audio_settings.samplingRate);
-		handleErr(iplReflectionMixerCreate(phonon_context, &cached_audio_settings, &refl_cfg, &ld.reflection_mixer), "SteamAudio: Failed to create reflection mixer");
-
-		IPLAmbisonicsDecodeEffectSettings decode_cfg{};
-		decode_cfg.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
-		decode_cfg.hrtf = phonon_hrtf;
-		decode_cfg.maxOrder = max_order;
-		handleErr(iplAmbisonicsDecodeEffectCreate(phonon_context, &cached_audio_settings, &decode_cfg, &ld.ambisonics_decode_effect), "SteamAudio: Failed to create listener ambisonics decode effect");
-
-		iplAudioBufferAllocate(phonon_context, num_channels, cached_audio_settings.frameSize, &ld.mixed_ambisonics_buffer);
-		iplAudioBufferAllocate(phonon_context, 2, cached_audio_settings.frameSize, &ld.decode_output_buffer);
-	}
-
-	// Enqueue — cross-references with sources will be created when applied
+RID SteamAudioServer::listener_create() {
+	ListenerData *ld = memnew(ListenerData);
+	RID rid = listener_owner.make_rid(ld);
+	ld->self = rid;
+	ld->debug_name = "listener_" + String::num_uint64(rid.get_id());
 	{
 		std::lock_guard lock(pending_ops_mutex);
-		pending_ops.push_back(PendingAddListener{ listener, std::move(ld) });
+		pending_ops.push_back(PendingAddListener{ rid });
 	}
+	return rid;
 }
 
-void SteamAudioServer::add_playback_to_listener(SteamAudioListener *listener, godot::Ref<AudioStreamSteamAudioListenerPlayback> playback) {
-	PROFILE_FUNCTION();
-	std::lock_guard lock(pending_ops_mutex);
-	pending_ops.push_back(PendingAddPlaybackToListener{ listener, playback });
-}
-
-void SteamAudioServer::remove_listener(SteamAudioListener *listener) {
-	PROFILE_FUNCTION();
+void SteamAudioServer::listener_free(RID listener) {
 	std::lock_guard lock(pending_ops_mutex);
 	pending_ops.push_back(PendingRemoveListener{ listener });
 }
 
-const LocalVector<ListenerSourceDBLevel>& SteamAudioServer::get_source_db_levels_for_listener(SteamAudioListener *listener) {
-	for (const auto& ld : listeners) {
-		if ( ld.listener == listener )
-			return ld.source_db_levels;
+void SteamAudioServer::listener_set_transform(RID listener, const Transform3D &xform) {
+	// No collections_mutex: these per-RID scalar setters are called every frame
+	// from the owning node (main thread). The shared lock never excluded the
+	// (also-shared-locking) readers anyway; it only blocked apply_pending_ops's
+	// unique lock, starving it under per-frame setter traffic. get_or_null is
+	// internally thread-safe and the owner won't free a struct its node still uses.
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return;
+	ld->pending_transform = xform;
+	ld->has_transform = true;
+}
+
+void SteamAudioServer::listener_set_mask(RID listener, uint32_t mask) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return;
+	ld->cfg.mask = mask;
+}
+
+void SteamAudioServer::listener_set_range(RID listener, float range) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return;
+	ld->cfg.range = range;
+}
+
+void SteamAudioServer::listener_set_reflection(RID listener, bool enabled, int rays, int bounces, float duration, int ambisonics_order, int type, float irradiance_min_dist) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return;
+	ld->cfg.reflection_simulation_enabled = enabled;
+	ld->cfg.num_refl_rays = rays;
+	ld->cfg.num_refl_bounces = bounces;
+	ld->cfg.refl_duration = duration;
+	ld->cfg.refl_ambisonics_order = ambisonics_order;
+	ld->cfg.refl_type = type;
+	ld->cfg.irradiance_min_dist = irradiance_min_dist;
+}
+
+void SteamAudioServer::listener_set_debug_name(RID listener, const String &name) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return;
+	ld->debug_name = name;
+}
+
+void SteamAudioServer::listener_add_playback(RID listener, Ref<AudioStreamSteamAudioListenerPlayback> playback) {
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingAddPlaybackToListener{ listener, playback });
+}
+
+Array SteamAudioServer::listener_get_source_db_levels(RID listener) {
+	std::shared_lock lock(collections_mutex);
+	Array result;
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return result;
+	for (const auto &lvl : ld->source_db_levels) {
+		Dictionary d;
+		d["source"] = lvl.source;
+		d["position"] = lvl.position;
+		d["db_level"] = lvl.db_level;
+		result.push_back(d);
 	}
+	return result;
+}
+
+const LocalVector<ListenerSourceDBLevel> &SteamAudioServer::listener_get_source_db_levels_ref(RID listener) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (ld)
+		return ld->source_db_levels;
 	static LocalVector<ListenerSourceDBLevel> empty;
+	empty.clear();
 	return empty;
 }
 
-void SteamAudioServer::add_source(SteamAudioSource *source_node) {
-	PROFILE_FUNCTION();
+// ─────────────────────────────────────────────────────────────────────────────
+// Source RID API
+// ─────────────────────────────────────────────────────────────────────────────
 
-	// Pre-build SourceData outside any lock
-	SourceData sd;
-	sd.source_node = source_node;
-	sd.volume_linear = UtilityFunctions::db_to_linear(source_node->get_volume_db());
-	sd.mixed_frames.resize(cached_audio_settings.frameSize);
-	sd.mixed_frames.fill(Vector2(0,0));
-
+RID SteamAudioServer::source_create() {
+	SourceData *sd = memnew(SourceData);
+	RID rid = source_owner.make_rid(sd);
+	sd->self = rid;
+	sd->debug_name = "source_" + String::num_uint64(rid.get_id());
+	sd->mixed_frames.resize(cached_audio_settings.frameSize);
+	sd->mixed_frames.fill(Vector2(0, 0));
+	sd->volume_linear = UtilityFunctions::db_to_linear(sd->cfg.volume_db);
 	{
-		PROFILE_FUNCTION_NAMED("instantiate_AudioEffects");
-		TypedArray<AudioEffect> effects = source_node->get_effect_stack();
-		for (int i = 0; i < effects.size(); ++i) {
-			Ref<AudioEffect> effect = effects[i];
-			if (effect.is_valid()) {
-				Ref<AudioEffectInstance> inst = effect->instantiate();
-				if (inst.is_valid()) {
-					sd.effect_instances.push_back(inst);
-				}
+		std::lock_guard lock(pending_ops_mutex);
+		pending_ops.push_back(PendingAddSource{ rid });
+	}
+	return rid;
+}
+
+void SteamAudioServer::source_free(RID source) {
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingRemoveSource{ source });
+}
+
+void SteamAudioServer::source_set_transform(RID source, const Transform3D &xform) {
+	// No collections_mutex — see listener_set_transform for the rationale.
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->pending_transform = xform;
+	sd->has_transform = true;
+}
+
+void SteamAudioServer::source_set_layers(RID source, uint32_t layers) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.layers = layers;
+}
+
+void SteamAudioServer::source_set_volume_db(RID source, float volume_db) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.volume_db = volume_db;
+	sd->volume_linear = UtilityFunctions::db_to_linear(volume_db);
+}
+
+void SteamAudioServer::source_set_doppler_factor(RID source, float factor) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.doppler_factor = factor;
+}
+
+void SteamAudioServer::source_set_direct_enabled(RID source, bool enabled) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.direct_enabled = enabled;
+}
+
+void SteamAudioServer::source_set_binaural(RID source, bool enabled, int interpolation, float spatial_blend) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.binaural_enabled = enabled;
+	sd->cfg.binaural_interpolation = interpolation;
+	sd->cfg.binaural_spatial_blend = spatial_blend;
+}
+
+void SteamAudioServer::source_set_distance_attenuation(RID source, bool enabled, float min, float max) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.distance_attenuation_enabled = enabled;
+	sd->cfg.distance_attenuation_min = min;
+	sd->cfg.distance_attenuation_max = max;
+}
+
+void SteamAudioServer::source_set_air_absorption(RID source, bool enabled) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.air_absorption_enabled = enabled;
+}
+
+void SteamAudioServer::source_set_occlusion(RID source, bool enabled, int type, float radius, int samples) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.occlusion_enabled = enabled;
+	sd->cfg.occlusion_type = type;
+	sd->cfg.occlusion_radius = radius;
+	sd->cfg.occlusion_samples = samples;
+}
+
+void SteamAudioServer::source_set_transmission(RID source, bool enabled, int type, int rays) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.transmission_enabled = enabled;
+	sd->cfg.transmission_type = type;
+	sd->cfg.transmission_rays = rays;
+}
+
+void SteamAudioServer::source_set_reflection(RID source, bool enabled, float duration, float hybrid_delay) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->cfg.reflection_enabled = enabled;
+	sd->cfg.reflection_duration = duration;
+	sd->cfg.reflection_hybrid_delay = hybrid_delay;
+}
+
+void SteamAudioServer::source_set_effect_stack(RID source, const TypedArray<AudioEffect> &stack) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	PROFILE_FUNCTION_NAMED("instantiate_AudioEffects");
+	sd->effect_instances.clear();
+	for (int i = 0; i < stack.size(); ++i) {
+		Ref<AudioEffect> effect = stack[i];
+		if (effect.is_valid()) {
+			Ref<AudioEffectInstance> inst = effect->instantiate();
+			if (inst.is_valid()) {
+				sd->effect_instances.push_back(inst);
 			}
 		}
 	}
-
-	// Enqueue — cross-references with listeners will be created when applied
-	{
-		std::lock_guard lock(pending_ops_mutex);
-		pending_ops.push_back(PendingAddSource{ source_node, std::move(sd) });
-	}
 }
 
-void SteamAudioServer::add_playback_to_source(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> playback, float p_volume_db, float p_pitch_scale) {
+void SteamAudioServer::source_set_debug_name(RID source, const String &name) {
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	sd->debug_name = name;
+}
+
+void SteamAudioServer::source_add_playback(RID source, Ref<AudioStreamPlayback> playback, float p_volume_db, float p_pitch_scale) {
 	if (playback.is_null())
 		return;
 
@@ -1939,159 +2172,134 @@ void SteamAudioServer::add_playback_to_source(const SteamAudioSource *source_nod
 	playback->start();
 
 	std::lock_guard lock(pending_ops_mutex);
-	pending_ops.push_back(PendingAddPlaybackToSource{ source_node, playback, volume_linear, p_pitch_scale });
+	pending_ops.push_back(PendingAddPlaybackToSource{ source, playback, volume_linear, p_pitch_scale });
 }
 
-void SteamAudioServer::set_source_playback_volume(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> p_playback, float p_volume_db) {
+void SteamAudioServer::source_set_playback_volume(RID source, Ref<AudioStreamPlayback> p_playback, float p_volume_db) {
 	std::shared_lock lock(collections_mutex);
-	for (auto &sd : sources) {
-		if (sd.source_node == source_node) {
-			for (auto &entry : sd.playbacks) {
-				if (entry.playback == p_playback) {
-					entry.volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
-					return;
-				}
-			}
-			// playback not found!
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	for (auto &entry : sd->playbacks) {
+		if (entry.playback == p_playback) {
+			entry.volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
 			return;
 		}
 	}
 }
 
-void SteamAudioServer::set_source_playback_pitch(const SteamAudioSource *source_node, Ref<AudioStreamPlayback> p_playback, float p_pitch_scale) {
+void SteamAudioServer::source_set_playback_pitch(RID source, Ref<AudioStreamPlayback> p_playback, float p_pitch_scale) {
 	std::shared_lock lock(collections_mutex);
-	for (auto &sd : sources) {
-		if (sd.source_node == source_node) {
-			for (auto &entry : sd.playbacks) {
-				if (entry.playback == p_playback) {
-					entry.pitch_scale = p_pitch_scale;
-					return;
-				}
-			}
-			// playback not found!
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return;
+	for (auto &entry : sd->playbacks) {
+		if (entry.playback == p_playback) {
+			entry.pitch_scale = p_pitch_scale;
 			return;
 		}
 	}
 }
 
-int SteamAudioServer::source_get_num_active_playbacks(const SteamAudioSource *source_node) {
+int SteamAudioServer::source_get_num_active_playbacks(RID source) {
 	std::shared_lock lock(collections_mutex);
-	for (auto &sd : sources) {
-		if (sd.source_node == source_node)
-			return sd.playbacks.size();
+	SourceData *sd = source_owner.get_or_null(source);
+	if (!sd)
+		return 0;
+	// Count only playing playbacks. Finished playbacks linger in the list until a
+	// process_audio phase cleans them up; if that cleanup is delayed/skipped, a
+	// stale count here would keep a dynamic-registration source registered forever
+	// (it never times out), leaking sources over time.
+	int n = 0;
+	for (auto &pb : sd->playbacks) {
+		if (pb.playback.is_valid() && pb.playback->is_playing())
+			n++;
 	}
-	return 0;
+	return n;
 }
 
-void SteamAudioServer::remove_source(SteamAudioSource *source_node) {
-	PROFILE_FUNCTION();
+// ─────────────────────────────────────────────────────────────────────────────
+// Geometry RID API
+// ─────────────────────────────────────────────────────────────────────────────
+
+RID SteamAudioServer::geometry_create_internal(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedFloat32Array &material, bool dynamic) {
+	if (!phonon_scene || !phonon_context) {
+		UtilityFunctions::push_error("SteamAudio: scene is not initialized");
+		return RID();
+	}
+
+	IPLMaterial mat = ipl_material_from_floats(material);
+
+	GeometryData *g = memnew(GeometryData);
+	g->dynamic = dynamic;
+
+	if (dynamic) {
+		IPLSceneSettings sub_scene_cfg{};
+		sub_scene_cfg.radeonRaysDevice = nullptr;
+		sub_scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+		if (sub_scene_cfg.type == IPL_SCENETYPE_EMBREE) {
+			if (embree_dev == nullptr) {
+				memdelete(g);
+				ERR_FAIL_V_MSG(RID(), "SteamAudio: geometry_create_dynamic with scene_type EMBREE and uninitialized embree device.");
+			}
+			sub_scene_cfg.embreeDevice = embree_dev;
+		}
+		if (!handleErr(iplSceneCreate(phonon_context, &sub_scene_cfg, &g->sub_scene), "SteamAudio: Failed to create sub-scene")) {
+			memdelete(g);
+			return RID();
+		}
+
+		IPLStaticMesh m = create_ipl_mesh_from_raw(g->sub_scene, verts, tris, mat);
+		if (m) {
+			g->meshes.push_back(m);
+			iplStaticMeshAdd(m, g->sub_scene);
+		}
+		iplSceneCommit(g->sub_scene);
+
+		IPLInstancedMeshSettings inst_cfg{};
+		inst_cfg.subScene = g->sub_scene;
+		inst_cfg.transform = ipl_mat4_from(Transform3D());
+		handleErr(iplInstancedMeshCreate(phonon_scene, &inst_cfg, &g->instanced_mesh), "SteamAudio: Failed to create instanced mesh");
+		iplInstancedMeshAdd(g->instanced_mesh, phonon_scene);
+	} else {
+		IPLStaticMesh m = create_ipl_mesh_from_raw(phonon_scene, verts, tris, mat);
+		if (m) {
+			g->meshes.push_back(m);
+			iplStaticMeshAdd(m, phonon_scene);
+		}
+		if (g->meshes.empty()) {
+			memdelete(g);
+			return RID();
+		}
+	}
+
+	RID rid = geometry_owner.make_rid(g);
+	g->self = rid;
+
+	{
+		std::lock_guard lock(pending_ops_mutex);
+		pending_ops.push_back(PendingAddGeometry{ rid });
+	}
+	return rid;
+}
+
+RID SteamAudioServer::geometry_create_static(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedFloat32Array &material) {
+	return geometry_create_internal(verts, tris, material, false);
+}
+
+RID SteamAudioServer::geometry_create_dynamic(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedFloat32Array &material) {
+	return geometry_create_internal(verts, tris, material, true);
+}
+
+void SteamAudioServer::geometry_set_transform(RID geometry, const Transform3D &xform) {
+	GeometryData *g = geometry_owner.get_or_null(geometry);
+	if (!g)
+		return;
+	g->pending_transform = xform;
+	g->has_transform = true;
+}
+
+void SteamAudioServer::geometry_free(RID geometry) {
 	std::lock_guard lock(pending_ops_mutex);
-	pending_ops.push_back(PendingRemoveSource{ source_node });
-}
-
-void SteamAudioServer::add_static_geometry(Node *p_node, Ref<SteamAudioMaterial> p_material) {
-	PROFILE_FUNCTION();
-	if (!phonon_scene) {
-		UtilityFunctions::push_error("Phonon scene is not initialized");
-		return;
-	}
-
-	std::vector<IPLStaticMesh> meshes;
-	if (auto *mi = Object::cast_to<MeshInstance3D>(p_node)) {
-		meshes = create_meshes_from_mesh_inst_3d(mi, phonon_scene, p_material);
-	} else if (auto *cs = Object::cast_to<CollisionShape3D>(p_node)) {
-		meshes = create_meshes_from_coll_inst_3d(cs, phonon_scene, p_material);
-	}
-
-	for (auto m : meshes) {
-		iplStaticMeshAdd(m, phonon_scene);
-	}
-
-	if (!meshes.empty()) {
-		StaticGeometryData sg;
-		sg.node = p_node;
-		sg.meshes = meshes;
-		static_geometry.push_back(sg);
-		scene_dirty = true;
-	}
-}
-
-void SteamAudioServer::remove_static_geometry(Node *p_node) {
-	PROFILE_FUNCTION();
-	for (uint32_t i = 0; i < static_geometry.size(); ++i) {
-		if (static_geometry[i].node == p_node) {
-			for (auto &m : static_geometry[i].meshes) {
-				iplStaticMeshRemove(m, phonon_scene);
-				iplStaticMeshRelease(&m);
-			}
-			static_geometry.remove_at(i);
-			scene_dirty = true;
-			break;
-		}
-	}
-}
-
-void SteamAudioServer::add_dynamic_geometry(Node *p_node, Ref<SteamAudioMaterial> p_material) {
-	PROFILE_FUNCTION();
-	if (!phonon_scene || !phonon_context)
-		return;
-
-	Node3D *node3d = Object::cast_to<Node3D>(p_node);
-	if (!node3d)
-		return;
-
-	DynamicGeometryData dg;
-	dg.node = node3d;
-
-	IPLSceneSettings sub_scene_cfg{};
-	sub_scene_cfg.radeonRaysDevice = nullptr;
-	sub_scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
-	if (sub_scene_cfg.type == IPL_SCENETYPE_EMBREE) {
-		ERR_FAIL_COND_MSG(embree_dev == nullptr, "ERROR: steam audio add_dynamic_geometry with scene_type IPL_SCENETYPE_EMBREE and uninitialized embree device.");
-		sub_scene_cfg.embreeDevice = embree_dev;
-	}
-	if (!handleErr(iplSceneCreate(phonon_context, &sub_scene_cfg, &dg.sub_scene), "SteamAudio: Failed to create sub-scene")) {
-		return;
-	}
-
-	if (auto *mi = Object::cast_to<MeshInstance3D>(p_node)) {
-		dg.meshes = create_meshes_from_mesh_inst_3d(mi, dg.sub_scene, p_material, true);
-	} else if (auto *cs = Object::cast_to<CollisionShape3D>(p_node)) {
-		dg.meshes = create_meshes_from_coll_inst_3d(cs, dg.sub_scene, p_material, true);
-	}
-
-	for (auto m : dg.meshes) {
-		iplStaticMeshAdd(m, dg.sub_scene);
-	}
-	iplSceneCommit(dg.sub_scene);
-
-	IPLInstancedMeshSettings inst_cfg{};
-	inst_cfg.subScene = dg.sub_scene;
-	inst_cfg.transform = ipl_mat4_from(node3d->get_global_transform());
-
-	handleErr(iplInstancedMeshCreate(phonon_scene, &inst_cfg, &dg.instanced_mesh), "SteamAudio: Failed to create instanced mesh");
-	iplInstancedMeshAdd(dg.instanced_mesh, phonon_scene);
-
-	scene_dirty = true;
-
-	dynamic_geometry.push_back(dg);
-}
-
-void SteamAudioServer::remove_dynamic_geometry(Node *p_node) {
-	PROFILE_FUNCTION();
-	for (uint32_t i = 0; i < dynamic_geometry.size(); ++i) {
-		if (dynamic_geometry[i].node == p_node) {
-			for (auto &m : dynamic_geometry[i].meshes) {
-				iplStaticMeshRemove(m, dynamic_geometry[i].sub_scene);
-				iplStaticMeshRelease(&m);
-			}
-			iplInstancedMeshRemove(dynamic_geometry[i].instanced_mesh, phonon_scene);
-			iplInstancedMeshRelease(&dynamic_geometry[i].instanced_mesh);
-			iplSceneRelease(&dynamic_geometry[i].sub_scene);
-
-			dynamic_geometry.remove_at(i);
-			scene_dirty = true;
-			break;
-		}
-	}
+	pending_ops.push_back(PendingRemoveGeometry{ geometry });
 }

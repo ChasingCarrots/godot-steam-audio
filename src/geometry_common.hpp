@@ -15,96 +15,63 @@
 #include "godot_cpp/classes/mesh_instance3d.hpp"
 #include "godot_cpp/classes/sphere_mesh.hpp"
 #include "godot_cpp/classes/sphere_shape3d.hpp"
-#include "material.hpp"
-#include "phonon.h"
+#include "godot_cpp/variant/packed_int32_array.hpp"
+#include "godot_cpp/variant/packed_vector3_array.hpp"
 #include "steam_audio.hpp"
-#include <vector>
 
-inline IPLStaticMesh godot_mesh_to_ipl_mesh(godot::Ref<godot::Mesh> mesh, IPLScene scene, IPLMaterial material, godot::Transform3D trf, int surface_idx) {
-	godot::Array dat = mesh->surface_get_arrays(surface_idx);
-	godot::Array verts = dat[godot::Mesh::ARRAY_VERTEX];
-	godot::Array tris = dat[godot::Mesh::ARRAY_INDEX];
+// Raw triangle payload extracted from a Godot node, ready to be handed to
+// SteamAudioServer::geometry_create_*(). Vertices are pre-transformed (unless
+// the caller asked to ignore the transform, e.g. for dynamic geometry where the
+// transform is pushed separately); triangles use Godot CW winding (the server
+// flips them to IPL CCW).
+struct RawGeometry {
+	godot::PackedVector3Array verts;
+	godot::PackedInt32Array tris;
 
-	int numTris = int(tris.size()) / 3;
+	bool is_empty() const { return verts.is_empty() || tris.is_empty(); }
+};
 
-	std::vector<IPLVector3> ipl_verts(verts.size());
-	std::vector<IPLTriangle> ipl_tris(numTris);
-	std::vector<IPLint32> ipl_mat_indices(numTris);
+// Append all surfaces of a Godot Mesh into the raw payload, applying trf to the
+// vertices and offsetting indices so multiple surfaces can share one buffer.
+inline void append_mesh_surfaces(RawGeometry &out, godot::Ref<godot::Mesh> mesh, const godot::Transform3D &trf) {
+	if (mesh.is_null())
+		return;
+	for (int s = 0; s < mesh->get_surface_count(); s++) {
+		godot::Array dat = mesh->surface_get_arrays(s);
+		godot::PackedVector3Array verts = dat[godot::Mesh::ARRAY_VERTEX];
+		godot::PackedInt32Array idx = dat[godot::Mesh::ARRAY_INDEX];
 
-	for (int j = 0; j < verts.size(); j++) {
-		godot::Vector3 vert = verts[j];
-		vert = trf.basis.xform(vert);
-		vert += trf.origin;
-		ipl_verts[j] = ipl_vec3_from(vert);
+		int base = (int)out.verts.size();
+		for (int i = 0; i < verts.size(); i++) {
+			out.verts.push_back(trf.xform(verts[i]));
+		}
+
+		if (idx.size() == 0) {
+			// No index array: vertices form sequential triangles.
+			for (int i = 0; i < verts.size(); i++) {
+				out.tris.push_back(base + i);
+			}
+		} else {
+			for (int i = 0; i < idx.size(); i++) {
+				out.tris.push_back(base + idx[i]);
+			}
+		}
 	}
-
-	for (int j = 0; j < numTris * 3; j += 3) {
-		// godot tris are cw, ipl tris are ccw
-		ipl_tris[j / 3].indices[0] = tris[j];
-		ipl_tris[j / 3].indices[1] = tris[j + 2];
-		ipl_tris[j / 3].indices[2] = tris[j + 1];
-		ipl_mat_indices[j / 3] = 0;
-	}
-
-	IPLMaterial mats[1] = { material };
-	IPLStaticMeshSettings static_mesh_cfg{};
-	static_mesh_cfg.numVertices = int(verts.size());
-	static_mesh_cfg.numTriangles = numTris;
-	static_mesh_cfg.numMaterials = 1;
-	static_mesh_cfg.vertices = ipl_verts.data();
-	static_mesh_cfg.triangles = ipl_tris.data();
-	static_mesh_cfg.materialIndices = ipl_mat_indices.data();
-	static_mesh_cfg.materials = mats;
-
-	IPLStaticMesh ipl_mesh = nullptr;
-	handleErr(iplStaticMeshCreate(scene, &static_mesh_cfg, &ipl_mesh), "Failed to create static mesh");
-
-	return ipl_mesh;
 }
 
-inline std::vector<IPLStaticMesh> create_meshes_from_mesh_inst_3d(godot::MeshInstance3D *mesh_inst, IPLScene scene, godot::Ref<SteamAudioMaterial> mat, bool ignore_trf = false) {
-	std::vector<IPLStaticMesh> p_meshes;
+inline RawGeometry extract_mesh_inst_3d(godot::MeshInstance3D *mesh_inst, bool ignore_trf) {
+	RawGeometry out;
 	godot::Ref<godot::Mesh> mesh = mesh_inst->get_mesh();
-
-	godot::Transform3D trf;
-	if (ignore_trf) {
-		trf = godot::Transform3D(godot::Vector3(1, 0, 0), godot::Vector3(0, 1, 0), godot::Vector3(0, 0, 1), godot::Vector3(0, 0, 0));
-	} else {
-		trf = mesh_inst->get_global_transform();
-	}
-
-	IPLMaterial material;
-	if (mat == nullptr) {
-		material = IPLMaterial{ { 0.f, 0.f, 0.f }, 0.f, { 0.f, 0.f, 0.f } };
-	} else {
-		material = mat->get_material();
-	}
-
-	for (int i = 0; i < mesh->get_surface_count(); i++) {
-		auto ipl_mesh = godot_mesh_to_ipl_mesh(mesh, scene, material, trf, i);
-		if (ipl_mesh) p_meshes.push_back(ipl_mesh);
-	}
-
-	return p_meshes;
+	godot::Transform3D trf = ignore_trf ? godot::Transform3D() : mesh_inst->get_global_transform();
+	append_mesh_surfaces(out, mesh, trf);
+	return out;
 }
 
-inline std::vector<IPLStaticMesh> create_meshes_from_coll_inst_3d(godot::CollisionShape3D *coll_inst, IPLScene scene, godot::Ref<SteamAudioMaterial> mat, bool ignore_trf = false) {
-	std::vector<IPLStaticMesh> p_meshes;
-	godot::Transform3D trf;
-	if (ignore_trf) {
-		trf = godot::Transform3D(godot::Vector3(1, 0, 0), godot::Vector3(0, 1, 0), godot::Vector3(0, 0, 1), godot::Vector3(0, 0, 0));
-	} else {
-		trf = coll_inst->get_global_transform();
-	}
+inline RawGeometry extract_coll_inst_3d(godot::CollisionShape3D *coll_inst, bool ignore_trf) {
+	RawGeometry out;
+	godot::Transform3D trf = ignore_trf ? godot::Transform3D() : coll_inst->get_global_transform();
 
 	godot::Ref<godot::Mesh> mesh;
-
-	IPLMaterial material;
-	if (mat == nullptr) {
-		material = IPLMaterial{ { 0.f, 0.f, 0.f }, 0.f, { 0.f, 0.f, 0.f } };
-	} else {
-		material = mat->get_material();
-	}
 
 	if (godot::Object::cast_to<godot::BoxShape3D>(coll_inst->get_shape().ptr())) {
 		godot::Ref<godot::BoxShape3D> shape = coll_inst->get_shape();
@@ -188,19 +155,11 @@ inline std::vector<IPLStaticMesh> create_meshes_from_coll_inst_3d(godot::Collisi
 		mesh = arr_mesh;
 	} else {
 		SteamAudio::log(SteamAudio::log_error, "SteamAudioGeometry supports sphere, box, cylinder, capsule, concave polygon and convex polygon shapes. Something else was provided, so this geometry will not do anything.");
-		return p_meshes;
+		return out;
 	}
 
-
-	for (int i = 0; i < mesh->get_surface_count(); i++) {
-		auto ipl_mesh = godot_mesh_to_ipl_mesh(mesh, scene, material, trf, i);
-		if (ipl_mesh)
-			p_meshes.push_back(ipl_mesh);
-		else
-			godot::UtilityFunctions::print("Godot mesh to ipl mesh failed");
-	}
-	mesh.unref();
-	return p_meshes;
+	append_mesh_surfaces(out, mesh, trf);
+	return out;
 }
 
 #endif // STEAM_AUDIO_GEOMETRY_COMMON_H

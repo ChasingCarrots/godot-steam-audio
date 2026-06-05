@@ -3,6 +3,7 @@
 
 #include "godot_cpp/classes/wrapped.hpp"
 #include "godot_cpp/variant/packed_string_array.hpp"
+#include "godot_cpp/variant/rid.hpp"
 #include <phonon.h>
 #include <godot_cpp/classes/audio_stream_generator.hpp>
 #include <godot_cpp/classes/audio_stream_generator_playback.hpp>
@@ -10,8 +11,6 @@
 #include <vector>
 
 #include "AudioStreamSteamAudioListener.h"
-#include "lib/steamaudio/core/src/core/array.h"
-#include "lib/steamaudio/core/src/core/vector.h"
 
 class SteamAudioSource;
 
@@ -20,11 +19,13 @@ class SteamAudioListenerSensorSlot : public godot::RefCounted {
 protected:
 	static void _bind_methods();
 
-	SteamAudioSource *source_node;
+	godot::RID source;
 	godot::Vector3 position;
 	float db_level;
 public:
-	void set_steam_audio_source(SteamAudioSource *p_source_node);
+	void set_source_rid(const godot::RID &p_source);
+	godot::RID get_source_rid() const;
+	// Resolves the source RID back to its SteamAudioSource node (or null).
 	SteamAudioSource *get_steam_audio_source();
 	void set_position(const godot::Vector3 &p_position);
 	godot::Vector3 get_position();
@@ -38,6 +39,9 @@ protected:
 	static void _bind_methods();
 
 private:
+	// Server-side handle. Invalid when the listener is not currently registered.
+	godot::RID rid;
+
 	bool reflection_simulation_enabled = true;
 	int num_refl_rays = 4096;
 	int num_refl_bounces = 16;
@@ -50,11 +54,17 @@ private:
 	godot::Ref<AudioStreamSteamAudioListener> generator;
 
 	void ready_internal();
+	void push_config();
+	// Pulls per-source dB levels from the server and updates the sensor slots.
+	void update_sensor_slots(float delta);
+
 public:
 	SteamAudioListener();
 	~SteamAudioListener();
 
 	void _notification(int p_what);
+
+	godot::RID get_rid() const { return rid; }
 
 	int get_num_refl_rays();
 	void set_num_refl_rays(int p_num_refl_rays);
@@ -70,13 +80,13 @@ public:
 	void set_refl_type(int p_refl_type);
 
 	uint32_t get_mask() const { return mask; }
-	void set_mask(uint32_t p_mask) { mask = p_mask; }
+	void set_mask(uint32_t p_mask);
 
 	float get_range() const { return range; }
-	void set_range(float p_range) { range = p_range; }
+	void set_range(float p_range);
 
 	bool get_reflection_simulation_enabled() { return reflection_simulation_enabled; }
-	void set_reflection_simulation_enabled(bool p_enabled) { reflection_simulation_enabled = p_enabled; }
+	void set_reflection_simulation_enabled(bool p_enabled);
 
 	void set_num_source_db_sensor_slots(int p_num_source_db_sensor_slots);
 	int get_num_source_db_sensor_slots();

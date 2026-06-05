@@ -7,7 +7,11 @@
 
 using namespace godot;
 
+HashMap<int64_t, SteamAudioSource *> SteamAudioSource::rid_to_node;
+
 void SteamAudioSource::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_rid"), &SteamAudioSource::get_rid);
+
 	ClassDB::bind_method(D_METHOD("play_stream", "stream", "volume_db", "pitch_scale"), &SteamAudioSource::play_stream, DEFVAL(0.0f), DEFVAL(1.0f));
 	ClassDB::bind_method(D_METHOD("set_stream_volume", "stream_playback", "volume_db"), &SteamAudioSource::set_stream_volume);
 	ClassDB::bind_method(D_METHOD("set_stream_pitch", "stream_playback", "pitch_scale"), &SteamAudioSource::set_stream_pitch);
@@ -116,38 +120,90 @@ SteamAudioSource::SteamAudioSource() {}
 
 SteamAudioSource::~SteamAudioSource() {}
 
+SteamAudioSource *SteamAudioSource::for_rid(RID p_rid) {
+	if (!p_rid.is_valid())
+		return nullptr;
+	HashMap<int64_t, SteamAudioSource *>::Iterator it = rid_to_node.find(p_rid.get_id());
+	if (it == rid_to_node.end())
+		return nullptr;
+	return it->value;
+}
+
+void SteamAudioSource::push_config() {
+	if (!rid.is_valid())
+		return;
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (!srv)
+		return;
+	srv->source_set_layers(rid, layers);
+	srv->source_set_volume_db(rid, volume_db);
+	srv->source_set_doppler_factor(rid, doppler_factor);
+	srv->source_set_direct_enabled(rid, direct_enabled);
+	srv->source_set_binaural(rid, binaural_enabled, binaural_interpolation, binaural_spatial_blend);
+	srv->source_set_distance_attenuation(rid, distance_attenuation_enabled, distance_attenuation_min, distance_attenuation_max);
+	srv->source_set_air_absorption(rid, air_absorption_enabled);
+	srv->source_set_occlusion(rid, occlusion_enabled, occlusion_type, occlusion_radius, occlusion_samples);
+	srv->source_set_transmission(rid, transmission_enabled, transmission_type, transmission_rays);
+	srv->source_set_reflection(rid, reflection_enabled, reflection_duration, reflection_hybrid_delay);
+}
+
+void SteamAudioSource::register_on_server() {
+	if (rid.is_valid())
+		return;
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (!srv)
+		return;
+	rid = srv->source_create();
+	rid_to_node[rid.get_id()] = this;
+	srv->source_set_debug_name(rid, get_name());
+	push_config();
+	srv->source_set_effect_stack(rid, effect_stack);
+	srv->source_set_transform(rid, get_global_transform());
+}
+
+void SteamAudioSource::unregister_from_server() {
+	if (!rid.is_valid())
+		return;
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (srv)
+		srv->source_free(rid);
+	rid_to_node.erase(rid.get_id());
+	rid = RID();
+}
+
 void SteamAudioSource::_notification(int p_what) {
 	if (Engine::get_singleton()->is_editor_hint())
 		return;
 
 	switch (p_what) {
 		case NOTIFICATION_ENTER_TREE:
-			if (Engine::get_singleton()->is_editor_hint())
-				return;
+			set_notify_transform(true);
 			if (!dynamic_registration) {
-				SteamAudioServer::get_singleton()->add_source(this);
-				is_registered = true;
+				register_on_server();
 			}
 			set_process(dynamic_registration);
 			break;
 		case NOTIFICATION_EXIT_TREE:
-			if (Engine::get_singleton()->is_editor_hint())
-				return;
-			if (is_registered) {
-				SteamAudioServer::get_singleton()->remove_source(this);
-				is_registered = false;
-			}
+			set_notify_transform(false);
+			unregister_from_server();
 			break;
-		case NOTIFICATION_PROCESS: {
-			if (!dynamic_registration || !is_registered)
+		case NOTIFICATION_TRANSFORM_CHANGED: {
+			if (!rid.is_valid())
 				break;
-			int num_active_playbacks = SteamAudioServer::get_singleton()->source_get_num_active_playbacks(this);
+			SteamAudioServer *srv = SteamAudioServer::get_singleton();
+			if (srv)
+				srv->source_set_transform(rid, get_global_transform());
+			break;
+		}
+		case NOTIFICATION_PROCESS: {
+			if (!dynamic_registration || !rid.is_valid())
+				break;
+			int num_active_playbacks = SteamAudioServer::get_singleton()->source_get_num_active_playbacks(rid);
 			if (num_active_playbacks != 0) {
 				timeout_registration_at = Time::get_singleton()->get_ticks_msec() + 1000;
 			}
 			else if (Time::get_singleton()->get_ticks_msec() > timeout_registration_at) {
-				SteamAudioServer::get_singleton()->remove_source(this);
-				is_registered = false;
+				unregister_from_server();
 				emit_signal("removed_from_simulation");
 			}
 			break;
@@ -155,18 +211,27 @@ void SteamAudioSource::_notification(int p_what) {
 	}
 }
 
+void SteamAudioSource::set_effect_stack(const TypedArray<AudioEffect> &p_stack) {
+	effect_stack = p_stack;
+	if (rid.is_valid()) {
+		SteamAudioServer *srv = SteamAudioServer::get_singleton();
+		if (srv)
+			srv->source_set_effect_stack(rid, effect_stack);
+	}
+}
+
 void SteamAudioSource::set_stream_volume(Ref<AudioStreamPlayback> p_playback, float p_volume_db) {
-	if (p_playback.is_null())
+	if (p_playback.is_null() || !rid.is_valid())
 		return;
 
-	SteamAudioServer::get_singleton()->set_source_playback_volume(this, p_playback, p_volume_db);
+	SteamAudioServer::get_singleton()->source_set_playback_volume(rid, p_playback, p_volume_db);
 }
 
 void SteamAudioSource::set_stream_pitch(Ref<AudioStreamPlayback> p_playback, float p_pitch_scale) {
-	if (p_playback.is_null())
+	if (p_playback.is_null() || !rid.is_valid())
 		return;
 
-	SteamAudioServer::get_singleton()->set_source_playback_pitch(this, p_playback, p_pitch_scale);
+	SteamAudioServer::get_singleton()->source_set_playback_pitch(rid, p_playback, p_pitch_scale);
 }
 
 Ref<AudioStreamPlayback> SteamAudioSource::play_stream(Ref<AudioStream> p_stream, float p_volume_db, float p_pitch_scale) {
@@ -175,11 +240,10 @@ Ref<AudioStreamPlayback> SteamAudioSource::play_stream(Ref<AudioStream> p_stream
 
 	Ref<AudioStreamPlayback> playback = p_stream->instantiate_playback();
 	if (playback.is_valid()) {
-		if (dynamic_registration && !is_registered) {
-			SteamAudioServer::get_singleton()->add_source(this);
-			is_registered = true;
+		if (dynamic_registration && !rid.is_valid()) {
+			register_on_server();
 		}
-		SteamAudioServer::get_singleton()->add_playback_to_source(this, playback, p_volume_db, p_pitch_scale);
+		SteamAudioServer::get_singleton()->source_add_playback(rid, playback, p_volume_db, p_pitch_scale);
 		timeout_registration_at = Time::get_singleton()->get_ticks_msec() + 1000;
 	}
 	return playback;
