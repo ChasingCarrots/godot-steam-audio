@@ -10,6 +10,7 @@
 #include "godot_cpp/variant/dictionary.hpp"
 #include "godot_cpp/variant/utility_functions.hpp"
 #include <phonon.h>
+#include <climits>
 
 #include "profiling.h"
 #include "steam_audio.hpp"
@@ -1824,6 +1825,25 @@ void SteamAudioServer::process_audio() {
 						}
 					}
 				}
+			}
+
+			// Deadline override: a source that can't complete a full frame_size mix (e.g. a
+			// momentarily starved VoIP playback) would otherwise keep any_contributor_pending
+			// set forever and freeze this listener's output. Once the most-drained playback's
+			// ring buffer is down to ~one callback (frame_size) of runway, push what we have
+			// rather than underrun. The starved source is skipped (not stamped, partial mix
+			// kept) so it contributes in a later round once full.
+			if (any_contributor_pending) {
+				int min_avail = INT_MAX;
+				{
+					std::lock_guard pb_lock(*ld->playbacks_mutex);
+					for (const auto &pb : ld->playbacks) {
+						if (pb.playback->is_playing())
+							min_avail = MIN(min_avail, pb.playback->get_available_buffer_size());
+					}
+				}
+				if (min_avail != INT_MAX && min_avail <= frame_size)
+					any_contributor_pending = false;
 			}
 
 			// If all contributors are done for this listener, finish reflections processing
