@@ -540,6 +540,16 @@ void SteamAudioServer::tick(float delta) {
 	// not guarantee reader barging past a queued writer) — a three-way deadlock.
 	// Waiting first guarantees the job has fully released its lock before we lock.
 	if (direct_job_pending) {
+		// During heavy loading the WorkerThreadPool can be saturated and our
+		// direct-sim task may not even have started. Direct/reflection sim results
+		// don't matter on the loading screen, so rather than blocking the main
+		// thread until the pool catches up, skip this whole tick when the job
+		// isn't done: don't consume results, don't submit a new job. We re-check
+		// next tick. The task is still waited on (below) once it completes, so the
+		// pool can clean it up.
+		if (!WorkerThreadPool::get_singleton()->is_task_completed(direct_task_id)) {
+			return;
+		}
 		PROFILE_FUNCTION_NAMED("waiting_for_direct_job");
 		WorkerThreadPool::get_singleton()->wait_for_task_completion(direct_task_id);
 		direct_job_pending = false;
