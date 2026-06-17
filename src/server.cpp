@@ -891,6 +891,12 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 		}
 	}
 	if (need_commit) {
+		// Decide-and-commit under refl_mux so this is mutually exclusive with the
+		// reflection thread's transition into a pass (simulation_thread_func takes
+		// the same lock to set is_refl_thread_processing). While we hold the lock the
+		// reflection thread cannot start a pass, so observing
+		// is_refl_thread_processing == false guarantees it stays idle until we commit.
+		std::unique_lock<std::mutex> lock_refl(self->refl_mux);
 		// Hold off the reflection thread from starting a new pass until committed.
 		self->refl_thread_wait_for_commit.store(true);
 		if (!self->is_refl_thread_processing.load()) {
@@ -921,12 +927,14 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 		}
 	}
 
-	// 4. Inputs are committed/ready — wake the reflection thread.
-	self->new_inputs_set.store(true);
-	if (!self->is_refl_thread_processing.load()) {
+	// 4. Inputs are committed/ready — wake the reflection thread. Set the flag under
+	//    refl_mux so the store cannot interleave with the reflection thread's wait
+	//    predicate evaluation and lose the wake-up.
+	{
 		std::unique_lock<std::mutex> lock_refl(self->refl_mux);
-		self->refl_cv.notify_one();
+		self->new_inputs_set.store(true);
 	}
+	self->refl_cv.notify_one();
 
 	auto job_end = std::chrono::steady_clock::now();
 	float dur_ms = std::chrono::duration<float, std::milli>(job_end - job_start).count();
@@ -938,7 +946,13 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 void SteamAudioServer::simulation_thread_func() {
 	LocalVector<IPLSimulator> simulators;
 	while (is_running.load()) {
-		if (refl_thread_wait_for_commit.load() || !new_inputs_set.load()) {
+		// Wait for ready inputs and transition to "processing" atomically under
+		// refl_mux. run_direct_job() takes the same lock to decide whether it may
+		// commit (see the commit block there): because that decision and this
+		// transition share refl_mux, a commit and a reflection pass can never run
+		// concurrently on the same simulator. The long iplSimulatorRunReflections
+		// calls below run with NO lock held, preserving the non-blocking design.
+		{
 			std::unique_lock<std::mutex> lock_refl(refl_mux);
 			refl_cv.wait(lock_refl, [&] {
 				return (!refl_thread_wait_for_commit.load() && new_inputs_set.load()) || !is_running.load();
@@ -946,12 +960,12 @@ void SteamAudioServer::simulation_thread_func() {
 
 			if (!is_running.load())
 				break;
+
+			is_refl_thread_processing.store(true);
+			new_inputs_set.store(false);
 		}
 
 		{
-			is_refl_thread_processing.store(true);
-			new_inputs_set.store(false);
-
 			auto sim_start = std::chrono::steady_clock::now();
 
 			PROFILE_FUNCTION_NAMED("refl_sim");
@@ -983,7 +997,13 @@ void SteamAudioServer::simulation_thread_func() {
 			float prev = sim_thread_avg_duration_ms.load(std::memory_order_relaxed);
 			sim_thread_avg_duration_ms.store(prev * 0.9f + dur_ms * 0.1f, std::memory_order_relaxed);
 
-			is_refl_thread_processing.store(false);
+			// Clear "processing" under refl_mux so a direct job blocked on the lock
+			// observes the cleared flag and may commit on its next pass.
+			{
+				std::unique_lock<std::mutex> lock_refl(refl_mux);
+				is_refl_thread_processing.store(false);
+			}
+			refl_cv.notify_all();
 		}
 	}
 }
