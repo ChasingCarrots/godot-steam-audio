@@ -190,7 +190,9 @@ struct SourceData {
 	SourceConfig cfg;
 	godot::String debug_name;
 
+	// Multiple playbacks per source, protected by playbacks_mutex
 	godot::LocalVector<SourcePlaybackEntry> playbacks;
+	std::unique_ptr<std::mutex> playbacks_mutex = std::make_unique<std::mutex>();
 
 	godot::LocalVector<SourceListenerData> listener_data;
 

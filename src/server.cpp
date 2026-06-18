@@ -311,14 +311,17 @@ String SteamAudioServer::get_source_debug_string(int index) {
 	s += "mix_generation: " + String::num_int64((int64_t)sd->mix_generation) + "\n";
 	s += "debug_times_mixed: " + String::num_int64(sd->debug_times_mixed) + "\n";
 	s += "is_skipping_mixing: " + String(sd->is_skipping_mixing ? "yes\n" : "no\n");
-	s += "playbacks: " + String::num_int64((int)sd->playbacks.size()) + "\n";
-	for (uint32_t i = 0; i < sd->playbacks.size(); ++i) {
-		auto &pb = sd->playbacks[i];
-		s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
-		s += " vol=" + String::num(pb.volume_linear, 3);
-		s += " pitch=" + String::num(pb.pitch_scale, 3);
-		s += " num_mixed=" + String::num_int64(pb.debug_num_mixed);
-		s += " mixed_in_mixed_frames=" + String::num_int64(pb.num_mixed_in_current_mixed_frames) + "\n";
+	{
+		std::lock_guard pb_lock(*sd->playbacks_mutex);
+		s += "playbacks: " + String::num_int64((int)sd->playbacks.size()) + "\n";
+		for (uint32_t i = 0; i < sd->playbacks.size(); ++i) {
+			auto &pb = sd->playbacks[i];
+			s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
+			s += " vol=" + String::num(pb.volume_linear, 3);
+			s += " pitch=" + String::num(pb.pitch_scale, 3);
+			s += " num_mixed=" + String::num_int64(pb.debug_num_mixed);
+			s += " mixed_in_mixed_frames=" + String::num_int64(pb.num_mixed_in_current_mixed_frames) + "\n";
+		}
 	}
 	s += "effect_instances: " + String::num_int64((int)sd->effect_instances.size()) + "\n";
 	s += "listener_data: " + String::num_int64((int)sd->listener_data.size()) + "\n";
@@ -1466,6 +1469,15 @@ void SteamAudioServer::process_audio(double dt) {
 		for (auto *sd : sources) {
 			PROFILE_FUNCTION_NAMED("Source Pre-mixing");
 
+			// Held for the whole per-source body: every sd->playbacks access below
+			// (the any_playing scan, mix-reset clear, finished-playback cleanup and
+			// the mix-pull loop) runs under only a shared collections_mutex lock, so
+			// the main thread's source_get_num_active_playbacks / set_playback_*
+			// could otherwise read/mutate this vector concurrently. Locked outside the
+			// listener_data scan so the nesting stays source-playbacks then
+			// ld->playbacks_mutex (the only order used anywhere under a shared lock).
+			std::lock_guard pb_lock(*sd->playbacks_mutex);
+
 			// A source with no currently-playing playbacks is silent. Force its
 			// level to the noise floor so sensor-only listeners / dB meters stop
 			// reading a stale level. current_db_level is otherwise only refreshed
@@ -2228,6 +2240,7 @@ void SteamAudioServer::source_set_playback_volume(RID source, Ref<AudioStreamPla
 	SourceData *sd = source_owner.get_or_null(source);
 	if (!sd)
 		return;
+	std::lock_guard pb_lock(*sd->playbacks_mutex);
 	for (auto &entry : sd->playbacks) {
 		if (entry.playback == p_playback) {
 			entry.volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
@@ -2241,6 +2254,7 @@ void SteamAudioServer::source_set_playback_pitch(RID source, Ref<AudioStreamPlay
 	SourceData *sd = source_owner.get_or_null(source);
 	if (!sd)
 		return;
+	std::lock_guard pb_lock(*sd->playbacks_mutex);
 	for (auto &entry : sd->playbacks) {
 		if (entry.playback == p_playback) {
 			entry.pitch_scale = p_pitch_scale;
@@ -2259,6 +2273,7 @@ int SteamAudioServer::source_get_num_active_playbacks(RID source) {
 	// stale count here would keep a dynamic-registration source registered forever
 	// (it never times out), leaking sources over time.
 	int n = 0;
+	std::lock_guard pb_lock(*sd->playbacks_mutex);
 	for (auto &pb : sd->playbacks) {
 		if (pb.playback.is_valid() && pb.playback->is_playing())
 			n++;
