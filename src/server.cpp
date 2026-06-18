@@ -210,6 +210,7 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("listener_set_transform", "listener", "xform"), &SteamAudioServer::listener_set_transform);
 	ClassDB::bind_method(D_METHOD("listener_set_mask", "listener", "mask"), &SteamAudioServer::listener_set_mask);
 	ClassDB::bind_method(D_METHOD("listener_set_range", "listener", "range"), &SteamAudioServer::listener_set_range);
+	ClassDB::bind_method(D_METHOD("listener_set_sensor", "listener", "enabled"), &SteamAudioServer::listener_set_sensor);
 	ClassDB::bind_method(D_METHOD("listener_set_reflection", "listener", "enabled", "rays", "bounces", "duration", "ambisonics_order", "type", "irradiance_min_dist"), &SteamAudioServer::listener_set_reflection);
 	ClassDB::bind_method(D_METHOD("listener_set_debug_name", "listener", "name"), &SteamAudioServer::listener_set_debug_name);
 	ClassDB::bind_method(D_METHOD("listener_get_source_db_levels", "listener"), &SteamAudioServer::listener_get_source_db_levels);
@@ -1020,9 +1021,12 @@ void SteamAudioServer::mixing_thread_func() {
 		1
 	);
 	auto spin_threshold = std::chrono::microseconds(500);
+	auto prev_start = clock::now();
 	while (is_running.load()) {
 		auto start = clock::now();
-		process_audio();
+		double dt = dseconds(start - prev_start).count();
+		prev_start = start;
+		process_audio(dt);
 		auto work_end = clock::now();
 
 		// hybrid spin sleep (try to reduce CPU usage while still being responsive)
@@ -1364,7 +1368,7 @@ void SteamAudioServer::apply_pending_ops() {
 	}
 }
 
-void SteamAudioServer::process_audio() {
+void SteamAudioServer::process_audio(double dt) {
 	PROFILE_FUNCTION();
 	const int frame_size = cached_audio_settings.frameSize;
 
@@ -1480,6 +1484,65 @@ void SteamAudioServer::process_audio() {
 					sd->current_db_level = -200;
 			}
 
+			// Determine who needs this source mixed this cycle.
+			//   - has_output_consumer: an in-range, mask-matching, already-simulated
+			//     listener with a playing playback. It consumes spatialized audio and its
+			//     ring buffer provides realtime backpressure.
+			//   - has_sensor_consumer: an in-range, mask-matching, already-simulated sensor
+			//     listener (no playback). It does NOT consume audio, but it needs the source
+			//     mixed so current_db_level stays fresh for its sensor slots. It provides no
+			//     backpressure, so a source mixed solely for sensors must be paced (below).
+			// The direct_simulated_once gate matters here too: until simulation has run once
+			// for a pair, mixing would use invalid (zero-initialised) outputs.
+			bool has_output_consumer = false;
+			bool has_sensor_consumer = false;
+			for (auto &sld : sd->listener_data) {
+				if ((sd->cfg.layers & sld.listener->cfg.mask) == 0)
+					continue;
+				if (sld.out_of_range)
+					continue;
+				if (!sld.direct_simulated_once)
+					continue;
+				ListenerData *ld = sld.listener;
+				if (ld->cfg.is_sensor)
+					has_sensor_consumer = true;
+				{
+					std::lock_guard pb_lock(*ld->playbacks_mutex);
+					for (auto &pb : ld->playbacks) {
+						if (pb.playback->is_playing()) {
+							has_output_consumer = true;
+							break;
+						}
+					}
+				}
+				// An output consumer is sufficient and bypasses sensor pacing, so we can
+				// stop scanning as soon as we find one.
+				if (has_output_consumer)
+					break;
+			}
+			sd->is_skipping_mixing = !(has_output_consumer || has_sensor_consumer);
+			if (sd->is_skipping_mixing) {
+				// Reset pacing so an idle source doesn't accumulate a catch-up burst.
+				sd->sensor_pacing_accumulator = 0.0;
+				continue;
+			}
+
+			// Pacing gate: when a source is mixed only for sensor listeners there is no
+			// audio-device backpressure, so the mixing thread (spins ~1 ms) would race
+			// through the playback far faster than realtime and short bursts would be
+			// consumed before the per-frame tick() reader samples them. Throttle re-mixing
+			// to ~realtime here. (Skipped entirely when an output consumer exists — its
+			// ring-buffer backpressure already paces the source.)
+			if (!has_output_consumer) {
+				sd->sensor_pacing_accumulator += dt * cached_audio_settings.samplingRate;
+				if (sd->sensor_pacing_accumulator < frame_size)
+					continue; // not time for another frame yet — hold the current level
+				// Cap so a stall (e.g. a long process_audio gap) doesn't burst-catch-up.
+				if (sd->sensor_pacing_accumulator > 2.0 * frame_size)
+					sd->sensor_pacing_accumulator = 2.0 * frame_size;
+				sd->sensor_pacing_accumulator -= frame_size;
+			}
+
 			// Mix-reset gate (derived): if a completed mix is still owed to any
 			// active consumer, don't reset/re-mix yet. A consumer is "active" when
 			// its mask matches, it is in range, and the listener has a playing
@@ -1527,36 +1590,6 @@ void SteamAudioServer::process_audio() {
 					sd->playbacks.remove_at(i);
 				}
 			}
-
-			// quick check if there are any listeners that would actually
-			// consume the mixed data (skip mixing otherwise!)
-			sd->is_skipping_mixing = true;
-			for (auto &sld : sd->listener_data) {
-				if ((sd->cfg.layers & sld.listener->cfg.mask) == 0)
-					continue;
-				if (sld.out_of_range)
-					continue;
-				// Don't consume audio until simulation has run at least once for
-				// this pair — otherwise the start would be mixed with invalid
-				// (zero-initialised) simulation outputs and effectively lost.
-				if (!sld.direct_simulated_once)
-					continue;
-				// Check if this listener has active (playing) playbacks
-				ListenerData *ld = sld.listener;
-				{
-					std::lock_guard pb_lock(*ld->playbacks_mutex);
-					for (auto &pb : ld->playbacks) {
-						if (pb.playback->is_playing()) {
-							sd->is_skipping_mixing = false;
-							break;
-						}
-					}
-				}
-				if (!sd->is_skipping_mixing)
-					break;
-			}
-			if (sd->is_skipping_mixing)
-				continue;
 
 			int prev_mixed_count = sd->mixed_frames_ready;
 			int min_frames_ready = frame_size;
@@ -1981,6 +2014,13 @@ void SteamAudioServer::listener_set_range(RID listener, float range) {
 	if (!ld)
 		return;
 	ld->cfg.range = range;
+}
+
+void SteamAudioServer::listener_set_sensor(RID listener, bool enabled) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return;
+	ld->cfg.is_sensor = enabled;
 }
 
 void SteamAudioServer::listener_set_reflection(RID listener, bool enabled, int rays, int bounces, float duration, int ambisonics_order, int type, float irradiance_min_dist) {

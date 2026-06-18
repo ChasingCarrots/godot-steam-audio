@@ -81,6 +81,7 @@ void SteamAudioListener::push_config() {
 		return;
 	srv->listener_set_mask(rid, mask);
 	srv->listener_set_range(rid, range);
+	srv->listener_set_sensor(rid, !sensor_slots.empty());
 	srv->listener_set_reflection(rid, reflection_simulation_enabled, num_refl_rays, num_refl_bounces, refl_duration, refl_ambisonics_order, refl_type, irradiance_min_dist);
 }
 
@@ -284,6 +285,16 @@ void SteamAudioListener::set_num_source_db_sensor_slots(int p_num_source_db_sens
 			slot.instantiate();
 			sensor_slots.push_back(slot);
 		}
+	}
+
+	// Keep the server's sensor flag in sync so sources get mixed (and their dB level
+	// kept fresh) for this listener even without a nearby output listener. If the rid
+	// doesn't exist yet (slots set before the node entered the tree), push_config()
+	// applies the flag once ready_internal() creates it.
+	if (rid.is_valid()) {
+		SteamAudioServer *srv = SteamAudioServer::get_singleton();
+		if (srv)
+			srv->listener_set_sensor(rid, !sensor_slots.empty());
 	}
 }
 

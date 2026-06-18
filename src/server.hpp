@@ -54,6 +54,11 @@ struct ListenerSourceDBLevel {
 struct ListenerConfig {
 	uint32_t mask = 1;
 	float range = 0.0f;
+	// A sensor listener reads per-source dB levels but never plays audio out (no
+	// playbacks). It still needs sources to be mixed so their current_db_level stays
+	// fresh — otherwise the level is only refreshed as a side-effect of mixing for a
+	// real output listener that happens to be nearby.
+	bool is_sensor = false;
 	bool reflection_simulation_enabled = true;
 	int num_refl_rays = 4096;
 	int num_refl_bounces = 16;
@@ -199,6 +204,11 @@ struct SourceData {
 	// each active listener's last_consumed_mix against this value.
 	uint64_t mix_generation = 0;
 	bool is_skipping_mixing = false;
+
+	// Realtime pacing for sensor-only mixing. When a source is mixed solely for sensor
+	// listeners (no output listener consuming it) there is no audio-device backpressure,
+	// so we throttle re-mixing to ~realtime using this wall-clock sample accumulator.
+	double sensor_pacing_accumulator = 0.0;
 
 	float current_db_level = 0;
 	float volume_linear = 1.0f;
@@ -381,6 +391,7 @@ public:
 	void listener_set_transform(godot::RID listener, const godot::Transform3D &xform);
 	void listener_set_mask(godot::RID listener, uint32_t mask);
 	void listener_set_range(godot::RID listener, float range);
+	void listener_set_sensor(godot::RID listener, bool enabled);
 	void listener_set_reflection(godot::RID listener, bool enabled, int rays, int bounces, float duration, int ambisonics_order, int type, float irradiance_min_dist);
 	void listener_set_debug_name(godot::RID listener, const godot::String &name);
 	void listener_add_playback(godot::RID listener, godot::Ref<AudioStreamSteamAudioListenerPlayback> playback);
@@ -418,8 +429,9 @@ public:
 	void geometry_set_transform(godot::RID geometry, const godot::Transform3D &xform);
 	void geometry_free(godot::RID geometry);
 
-	// Audio pulling and effect application
-	void process_audio();
+	// Audio pulling and effect application. dt is the wall-clock time (seconds) since
+	// the previous process_audio cycle, used to pace sensor-only source mixing.
+	void process_audio(double dt);
 
 	int get_frame_size() const { return cached_audio_settings.frameSize; }
 	int get_sampling_rate() const { return cached_audio_settings.samplingRate; }
