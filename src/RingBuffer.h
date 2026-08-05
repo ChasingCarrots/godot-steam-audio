@@ -30,34 +30,43 @@
 
 #pragma once
 
+// Single-producer/single-consumer variant of the engine's ring_buffer.h — DO NOT
+// RE-SYNC BLINDLY. write()/space_left() are producer-side, read()/advance_read()/
+// clear() consumer-side; copy()/find()/data_left() are conservative snapshots usable
+// from either. resize() is setup-only and NOT concurrency-safe.
+
 #include "godot_cpp/templates/local_vector.hpp"
+
+#include <atomic>
 
 namespace godot
 {
     template <typename T>
     class RingBuffer {
         LocalVector<T> data;
-        int read_pos = 0;
-        int write_pos = 0;
-        int size_mask;
+        std::atomic<int> read_pos = 0;
+        std::atomic<int> write_pos = 0;
+        int size_mask = 0;
 
-        inline int inc(int &p_var, int p_size) const {
-            int ret = p_var;
-            p_var += p_size;
-            p_var = p_var & size_mask;
-            return ret;
+        inline int mask(int p_pos) const {
+            return p_pos & size_mask;
         }
 
     public:
+        // ── Consumer side ────────────────────────────────────────────────────
         T read() {
-            ERR_FAIL_COND_V(space_left() < 1, T());
-            return data.ptr()[inc(read_pos, 1)];
+            ERR_FAIL_COND_V(data_left() < 1, T());
+            int pos = read_pos.load(std::memory_order_relaxed);
+            T ret = data.ptr()[pos];
+            read_pos.store(mask(pos + 1), std::memory_order_release);
+            return ret;
         }
 
         int read(T *p_buf, int p_size, bool p_advance = true) {
             int left = data_left();
             p_size = MIN(left, p_size);
-            int pos = read_pos;
+            int start = read_pos.load(std::memory_order_relaxed);
+            int pos = start;
             int to_read = p_size;
             int dst = 0;
             while (to_read) {
@@ -72,11 +81,64 @@ namespace godot
                 pos = 0;
             }
             if (p_advance) {
-                inc(read_pos, p_size);
+                read_pos.store(mask(start + p_size), std::memory_order_release);
             }
             return p_size;
         }
 
+        inline int advance_read(int p_n) {
+            p_n = MIN(p_n, data_left());
+            int pos = read_pos.load(std::memory_order_relaxed);
+            read_pos.store(mask(pos + p_n), std::memory_order_release);
+            return p_n;
+        }
+
+        // Drops everything pending. Safe while the producer is writing.
+        inline void clear() {
+            read_pos.store(write_pos.load(std::memory_order_acquire), std::memory_order_release);
+        }
+
+        // ── Producer side ────────────────────────────────────────────────────
+        Error write(const T &p_v) {
+            ERR_FAIL_COND_V(space_left() < 1, FAILED);
+            int pos = write_pos.load(std::memory_order_relaxed);
+            data[pos] = p_v;
+            write_pos.store(mask(pos + 1), std::memory_order_release);
+            return OK;
+        }
+
+        int write(const T *p_buf, int p_size) {
+            int left = space_left();
+            p_size = MIN(left, p_size);
+
+            int start = write_pos.load(std::memory_order_relaxed);
+            int pos = start;
+            int to_write = p_size;
+            int src = 0;
+            while (to_write) {
+                int end = pos + to_write;
+                end = MIN(end, size());
+                int total = end - pos;
+
+                for (int i = 0; i < total; i++) {
+                    data[pos + i] = p_buf[src++];
+                }
+                to_write -= total;
+                pos = 0;
+            }
+
+            write_pos.store(mask(start + p_size), std::memory_order_release);
+            return p_size;
+        }
+
+        inline int decrease_write(int p_n) {
+            p_n = MIN(p_n, data_left());
+            int pos = write_pos.load(std::memory_order_relaxed);
+            write_pos.store(mask(pos + size_mask + 1 - p_n), std::memory_order_release);
+            return p_n;
+        }
+
+        // ── Read-only snapshots (safe from either side) ───────────────────────
         int copy(T *p_buf, int p_offset, int p_size) const {
             int left = data_left();
             if ((p_offset + p_size) > left) {
@@ -86,8 +148,7 @@ namespace godot
                 }
             }
             p_size = MIN(left, p_size);
-            int pos = read_pos;
-            inc(pos, p_offset);
+            int pos = mask(read_pos.load(std::memory_order_relaxed) + p_offset);
             int to_read = p_size;
             int dst = 0;
             while (to_read) {
@@ -112,8 +173,7 @@ namespace godot
                 }
             }
             p_max_size = MIN(left, p_max_size);
-            int pos = read_pos;
-            inc(pos, p_offset);
+            int pos = mask(read_pos.load(std::memory_order_relaxed) + p_offset);
             int to_read = p_max_size;
             while (to_read) {
                 int end = pos + to_read;
@@ -130,49 +190,8 @@ namespace godot
             return -1;
         }
 
-        inline int advance_read(int p_n) {
-            p_n = MIN(p_n, data_left());
-            inc(read_pos, p_n);
-            return p_n;
-        }
-
-        inline int decrease_write(int p_n) {
-            p_n = MIN(p_n, data_left());
-            inc(write_pos, size_mask + 1 - p_n);
-            return p_n;
-        }
-
-        Error write(const T &p_v) {
-            ERR_FAIL_COND_V(space_left() < 1, FAILED);
-            data[inc(write_pos, 1)] = p_v;
-            return OK;
-        }
-
-        int write(const T *p_buf, int p_size) {
-            int left = space_left();
-            p_size = MIN(left, p_size);
-
-            int pos = write_pos;
-            int to_write = p_size;
-            int src = 0;
-            while (to_write) {
-                int end = pos + to_write;
-                end = MIN(end, size());
-                int total = end - pos;
-
-                for (int i = 0; i < total; i++) {
-                    data[pos + i] = p_buf[src++];
-                }
-                to_write -= total;
-                pos = 0;
-            }
-
-            inc(write_pos, p_size);
-            return p_size;
-        }
-
         inline int space_left() const {
-            int left = read_pos - write_pos;
+            int left = read_pos.load(std::memory_order_acquire) - write_pos.load(std::memory_order_relaxed);
             if (left < 0) {
                 return size() + left - 1;
             }
@@ -181,35 +200,40 @@ namespace godot
             }
             return left - 1;
         }
+
         inline int data_left() const {
-            return size() - space_left() - 1;
+            int left = write_pos.load(std::memory_order_acquire) - read_pos.load(std::memory_order_relaxed);
+            if (left < 0) {
+                left += size();
+            }
+            return left;
         }
 
         inline int size() const {
             return data.size();
         }
 
-        inline void clear() {
-            read_pos = 0;
-            write_pos = 0;
-        }
-
+        // Setup only: reallocates, so must run before the ring is shared.
         void resize(int p_power) {
             int old_size = size();
             int new_size = 1 << p_power;
-            int mask = new_size - 1;
+            int new_mask = new_size - 1;
             data.resize(int64_t(1) << int64_t(p_power));
-            if (old_size < new_size && read_pos > write_pos) {
-                for (int i = 0; i < write_pos; i++) {
-                    data[(old_size + i) & mask] = data[i];
+            int r = read_pos.load(std::memory_order_relaxed);
+            int w = write_pos.load(std::memory_order_relaxed);
+            if (old_size < new_size && r > w) {
+                for (int i = 0; i < w; i++) {
+                    data[(old_size + i) & new_mask] = data[i];
                 }
-                write_pos = (old_size + write_pos) & mask;
+                w = (old_size + w) & new_mask;
             } else {
-                read_pos = read_pos & mask;
-                write_pos = write_pos & mask;
+                r = r & new_mask;
+                w = w & new_mask;
             }
 
-            size_mask = mask;
+            size_mask = new_mask;
+            read_pos.store(r, std::memory_order_relaxed);
+            write_pos.store(w, std::memory_order_relaxed);
         }
 
         RingBuffer(int p_power = 0) {

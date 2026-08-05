@@ -49,13 +49,23 @@ void init_ext(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<AudioStreamSteamAudioListener>();
 		ClassDB::register_class<AudioStreamSteamAudioListenerPlayback>();
 
+		// init() runs lazily on first use, see SteamAudioServer::ensure_initialized().
 	}
 }
 
 void uninit_ext(ModuleInitializationLevel p_level) {
+	// Stop the threads while the AudioStreamPlaybacks they hold Refs to are still
+	// registered. finish() is idempotent.
+	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
+		if (srv) {
+			srv->finish();
+		}
+	}
+
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
 		Engine::get_singleton()->unregister_singleton("SteamAudioServer");
 		memdelete(srv);
+		srv = nullptr;
 	}
 }
 

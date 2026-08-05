@@ -2,6 +2,7 @@
 #include "godot_cpp/classes/audio_effect.hpp"
 #include "godot_cpp/classes/engine.hpp"
 #include "godot_cpp/classes/os.hpp"
+#include "godot_cpp/classes/audio_server.hpp"
 #include "godot_cpp/classes/project_settings.hpp"
 #include "godot_cpp/core/class_db.hpp"
 #include "godot_cpp/core/memory.hpp"
@@ -166,6 +167,8 @@ static bool create_source_listener_data(SourceListenerData &sld, SourceData *sd,
 
 void SteamAudioServer::register_settings() {
 	auto ps = ProjectSettings::get_singleton();
+	// max_ambisonics_order / max_rays / num_bounces are never read; the
+	// SteamAudioListener reflection_simulation_* properties supersede them.
 	if (!ps->has_setting("steamaudio/max_ambisonics_order"))
 		ps->set_setting("steamaudio/max_ambisonics_order", 1);
 	if (!ps->has_setting("steamaudio/max_rays"))
@@ -176,6 +179,13 @@ void SteamAudioServer::register_settings() {
 		ps->set_setting("steamaudio/scene_type", IPL_SCENETYPE_EMBREE);
 	if (!ps->has_setting("steamaudio/max_occlusion_samples"))
 		ps->set_setting("steamaudio/max_occlusion_samples", 64);
+	// Simulation/mixing block size in frames, 0 = derive from output_latency. Halving
+	// it halves the source mix block latency and doubles the IPL effect call rate.
+	if (!ps->has_setting("steamaudio/frame_size"))
+		ps->set_setting("steamaudio/frame_size", 0);
+	// Listener output ring capacity in ms, 0 = derive from the block sizes.
+	if (!ps->has_setting("steamaudio/listener_ring_capacity_ms"))
+		ps->set_setting("steamaudio/listener_ring_capacity_ms", 0);
 }
 
 SteamAudioServer::SteamAudioServer() {
@@ -186,9 +196,8 @@ SteamAudioServer::SteamAudioServer() {
 	new_inputs_set.store(false);
 	register_settings();
 
-	if (!Engine::get_singleton()->is_editor_hint()) {
-		init();
-	}
+	// init() is deferred to ensure_initialized(): the constructor runs before Godot
+	// creates the AudioServer, so the driver's sampling rate is not knowable here.
 }
 
 SteamAudioServer::~SteamAudioServer() {
@@ -214,6 +223,13 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("listener_set_reflection", "listener", "enabled", "rays", "bounces", "duration", "ambisonics_order", "type", "irradiance_min_dist"), &SteamAudioServer::listener_set_reflection);
 	ClassDB::bind_method(D_METHOD("listener_set_debug_name", "listener", "name"), &SteamAudioServer::listener_set_debug_name);
 	ClassDB::bind_method(D_METHOD("listener_get_source_db_levels", "listener"), &SteamAudioServer::listener_get_source_db_levels);
+	ClassDB::bind_method(D_METHOD("listener_get_output_latency_frames", "listener"), &SteamAudioServer::listener_get_output_latency_frames);
+	ClassDB::bind_method(D_METHOD("listener_get_allocated_ring_capacity_frames", "listener"), &SteamAudioServer::listener_get_allocated_ring_capacity_frames);
+	ClassDB::bind_method(D_METHOD("get_frame_size"), &SteamAudioServer::get_frame_size);
+	ClassDB::bind_method(D_METHOD("set_frame_size", "frame_size"), &SteamAudioServer::set_frame_size);
+	ClassDB::bind_method(D_METHOD("get_is_initialized"), &SteamAudioServer::get_is_initialized);
+	ClassDB::bind_method(D_METHOD("get_sampling_rate"), &SteamAudioServer::get_sampling_rate);
+	ClassDB::bind_method(D_METHOD("get_listener_ring_capacity_frames"), &SteamAudioServer::get_listener_ring_capacity_frames);
 
 	// Source RID API
 	ClassDB::bind_method(D_METHOD("source_create"), &SteamAudioServer::source_create);
@@ -373,7 +389,11 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 			s += "  pb[" + String::num_int64(i) + "]: playing=" + String(pb.playback->is_playing() ? "yes" : "no");
 			s += " remaining=" + String::num_int64(pb.remaining_from_push_buffer);
 			s += " times_drained=" + String::num_int64(pb.debug_times_drained);
-			s += " avail=" + String::num_int64(pb.playback->get_free_buffer_size());
+			s += " free=" + String::num_int64(pb.playback->get_free_buffer_size());
+			int occupancy = pb.playback->get_available_buffer_size();
+			s += " latency=" + String::num_int64(occupancy) + "f/" +
+					String::num(occupancy * 1000.0f / cached_audio_settings.samplingRate, 1) + "ms";
+			s += " capacity=" + String::num_int64(pb.playback->get_capacity());
 			s += " underruns=" + String::num_int64(pb.playback->get_num_underrun_samples()) + "\n";
 		}
 	}
@@ -384,16 +404,87 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 }
 
 IPLAudioSettings SteamAudioServer::get_audio_settings() {
-	int mix_rate = get_project_int("audio/driver/mix_rate", 48000);
-	int out_latency_ms = get_project_int("audio/driver/output_latency", 15);
-	int frame_size = 1;
-	{
+	// The driver's rate, not the project setting: WASAPI's IAudioClient3 path takes the
+	// device's native rate and ignores audio/driver/mix_rate. HRTF design, IR lengths
+	// and air absorption all depend on it.
+	int mix_rate = 0;
+	if (AudioServer *audio_server = AudioServer::get_singleton())
+		mix_rate = int(audio_server->get_mix_rate());
+	if (mix_rate <= 0)
+		mix_rate = get_project_int("audio/driver/mix_rate", 48000);
+	int frame_size = get_project_int("steamaudio/frame_size", 0);
+	if (frame_size <= 0) {
+		// Next power of two covering one output-latency period. Pin
+		// steamaudio/frame_size to decouple the block size from output_latency.
+		int out_latency_ms = get_project_int("audio/driver/output_latency", 15);
 		int target = int((mix_rate * out_latency_ms) / 1000.0f);
 		frame_size = 1;
 		while (frame_size < target)
 			frame_size <<= 1;
+	} else {
+		// The IPL effects and everything sized off this assume a power of two.
+		int pow2 = 1;
+		while (pow2 < frame_size)
+			pow2 <<= 1;
+		frame_size = MAX(64, pow2);
 	}
 	return IPLAudioSettings{ mix_rate, frame_size };
+}
+
+void SteamAudioServer::set_frame_size(int p_frame_size) {
+	ERR_FAIL_COND_MSG(is_initialized,
+			"SteamAudioServer: frame size cannot be changed after the server has initialized "
+			"(the HRTF, effects and simulators are all built against it). Set it before the "
+			"first SteamAudioSource or SteamAudioListener enters the tree.");
+	ERR_FAIL_COND_MSG(p_frame_size < 0, "SteamAudioServer: frame size must be >= 0 (0 = derive it from audio/driver/output_latency).");
+	ProjectSettings::get_singleton()->set_setting("steamaudio/frame_size", p_frame_size);
+}
+
+int SteamAudioServer::get_listener_ring_capacity_frames() const {
+	// The listener's output latency (the ring runs full). Smaller is better until it
+	// underruns.
+	//
+	// HARD FLOOR: Godot's AudioServer mixes in fixed steps of buffer_size, hardcoded to
+	// 512 in AudioServer::init(), so _mix() is always asked for exactly that many
+	// frames. A ring that cannot serve one whole step underruns on every call — an
+	// audible continuous buzz. Only lowering buffer_size in the engine gets below this.
+	const int godot_mix_step = 512;
+
+	int out_latency_ms = get_project_int("audio/driver/output_latency", 15);
+	int device_frames = (cached_audio_settings.samplingRate * out_latency_ms) / 1000;
+	int frame_size = cached_audio_settings.frameSize;
+
+	// One device callback runs several mix steps back to back with no chance to refill.
+	int burst = MAX(godot_mix_step, device_frames);
+	// Plus jitter slack; Phase 3 tops the ring up every mixing-thread iteration.
+	int minimum = burst + MAX(godot_mix_step / 4, frame_size / 2);
+
+	int configured_ms = get_project_int("steamaudio/listener_ring_capacity_ms", 0);
+	if (configured_ms > 0) {
+		int configured = (cached_audio_settings.samplingRate * configured_ms) / 1000;
+		if (configured < minimum) {
+			WARN_PRINT(vformat(
+					"SteamAudio: steamaudio/listener_ring_capacity_ms (%d ms = %d frames) is below the "
+					"safe minimum of %d frames and would underrun continuously. Clamping. Lower "
+					"steamaudio/frame_size and audio/driver/output_latency instead.",
+					configured_ms, configured, minimum));
+			return minimum;
+		}
+		return configured;
+	}
+	return minimum;
+}
+
+void SteamAudioServer::ensure_initialized() {
+	if (is_initialized)
+		return;
+	if (Engine::get_singleton()->is_editor_hint())
+		return;
+
+	// Lazy because init() needs the AudioServer Engine singleton, which Godot only
+	// registers in register_server_singletons() — after the last GDExtension
+	// initialization level. First API use is the earliest point it exists.
+	init();
 }
 
 void SteamAudioServer::init() {
@@ -423,8 +514,14 @@ void SteamAudioServer::init() {
 		phonon_scene = nullptr;
 	}
 
-	// Cache audio settings once
+	// Fixed at startup: a runtime device switch to a different rate leaves the HRTF,
+	// simulators and effects below stale.
 	cached_audio_settings = get_audio_settings();
+	UtilityFunctions::print_verbose(
+			"SteamAudio: sampling rate ", cached_audio_settings.samplingRate,
+			" Hz (project setting says ", get_project_int("audio/driver/mix_rate", 48000),
+			"), frame size ", cached_audio_settings.frameSize,
+			" frames, listener ring capacity ", get_listener_ring_capacity_frames(), " frames");
 
 	IPLHRTFSettings hrtf_cfg{};
 	hrtf_cfg.type = IPL_HRTFTYPE_DEFAULT;
@@ -529,6 +626,7 @@ void SteamAudioServer::finish() {
 void SteamAudioServer::tick(float delta) {
 	if (Engine::get_singleton()->is_editor_hint())
 		return;
+	ensure_initialized();
 	if (!is_running.load())
 		return;
 	PROFILE_FUNCTION();
@@ -1985,6 +2083,8 @@ void SteamAudioServer::process_audio(double dt) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 RID SteamAudioServer::listener_create() {
+	ensure_initialized();
+	ERR_FAIL_COND_V_MSG(!is_running.load(), RID(), "SteamAudioServer: listener_create() failed, the server is not running.");
 	ListenerData *ld = memnew(ListenerData);
 	RID rid = listener_owner.make_rid(ld);
 	ld->self = rid;
@@ -2076,6 +2176,34 @@ Array SteamAudioServer::listener_get_source_db_levels(RID listener) {
 	return result;
 }
 
+int SteamAudioServer::listener_get_output_latency_frames(RID listener) {
+	std::shared_lock lock(collections_mutex);
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return 0;
+	std::lock_guard pb_lock(*ld->playbacks_mutex);
+	int worst = 0;
+	for (const auto &pb : ld->playbacks) {
+		if (pb.playback->is_playing())
+			worst = MAX(worst, pb.playback->get_available_buffer_size());
+	}
+	return worst;
+}
+
+int SteamAudioServer::listener_get_allocated_ring_capacity_frames(RID listener) {
+	std::shared_lock lock(collections_mutex);
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return 0;
+	std::lock_guard pb_lock(*ld->playbacks_mutex);
+	int worst = 0;
+	for (const auto &pb : ld->playbacks) {
+		if (pb.playback->is_playing())
+			worst = MAX(worst, pb.playback->get_capacity());
+	}
+	return worst;
+}
+
 const LocalVector<ListenerSourceDBLevel> &SteamAudioServer::listener_get_source_db_levels_ref(RID listener) {
 	ListenerData *ld = listener_owner.get_or_null(listener);
 	if (ld)
@@ -2090,6 +2218,8 @@ const LocalVector<ListenerSourceDBLevel> &SteamAudioServer::listener_get_source_
 // ─────────────────────────────────────────────────────────────────────────────
 
 RID SteamAudioServer::source_create() {
+	ensure_initialized();
+	ERR_FAIL_COND_V_MSG(!is_running.load(), RID(), "SteamAudioServer: source_create() failed, the server is not running.");
 	SourceData *sd = memnew(SourceData);
 	RID rid = source_owner.make_rid(sd);
 	sd->self = rid;
@@ -2286,6 +2416,7 @@ int SteamAudioServer::source_get_num_active_playbacks(RID source) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 RID SteamAudioServer::geometry_create_internal(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedFloat32Array &material, bool dynamic) {
+	ensure_initialized();
 	if (!phonon_scene || !phonon_context) {
 		UtilityFunctions::push_error("SteamAudio: scene is not initialized");
 		return RID();

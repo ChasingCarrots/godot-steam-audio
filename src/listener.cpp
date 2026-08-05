@@ -242,10 +242,10 @@ Ref<AudioStreamSteamAudioListenerPlayback> SteamAudioListener::play_on_audiostre
 		playback = audiostreamplayer.call("play_stream", generator);
 	}
 	if (playback.is_valid()) {
-		// the output buffer should just be 2 times the frame size (so it can essentially
-		// fit 2 rounds of steam simulation mixed audio)
-		playback->set_buffer_size(SteamAudioServer::get_singleton()->get_frame_size() * 2);
-		SteamAudioServer::get_singleton()->listener_add_playback(rid, playback);
+		SteamAudioServer *srv = SteamAudioServer::get_singleton();
+		// Capacity is the output latency; see AudioStreamSteamAudioListenerPlayback.
+		playback->set_buffer_size(srv->get_listener_ring_capacity_frames());
+		srv->listener_add_playback(rid, playback);
 	}
 	else {
 		ERR_PRINT("SteamAudioListener: play_on_audiostreamplayer failed.");

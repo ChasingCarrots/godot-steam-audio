@@ -383,6 +383,8 @@ public:
 	static SteamAudioServer *get_singleton();
 
 	void init();
+	// Runs init() on first use; no GDExtension init level is late enough.
+	void ensure_initialized();
 	void finish();
 
 	void tick(float delta);
@@ -436,7 +438,20 @@ public:
 	void process_audio(double dt);
 
 	int get_frame_size() const { return cached_audio_settings.frameSize; }
+	// Trades latency against CPU: halving it halves the source mix block latency and
+	// doubles the IPL effect call rate. Only settable before the server initializes
+	// (the HRTF, effects and simulators are built against it), so before the first
+	// SteamAudioSource/Listener enters the tree. Errors if it is already too late.
+	void set_frame_size(int p_frame_size);
+	bool get_is_initialized() const { return is_initialized; }
 	int get_sampling_rate() const { return cached_audio_settings.samplingRate; }
+	// Capacity of a listener's output ring, which is also its output latency in frames.
+	int get_listener_ring_capacity_frames() const;
+	// Occupancy of the listener's playbacks (max across them), in frames.
+	int listener_get_output_latency_frames(godot::RID listener);
+	// Allocated capacity, i.e. get_listener_ring_capacity_frames() rounded up to a
+	// power of two.
+	int listener_get_allocated_ring_capacity_frames(godot::RID listener);
 
 	// Debug functions
 	float get_mixing_thread_usage_pct() const;
