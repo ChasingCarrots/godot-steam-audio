@@ -96,6 +96,15 @@ struct ListenerData {
 	std::unique_ptr<std::mutex> playbacks_mutex = std::make_unique<std::mutex>();
 
 	godot::LocalVector<ListenerSourceDBLevel> source_db_levels;
+	// Bumped every time source_db_levels is actually rebuilt in tick(). tick() has
+	// early-outs (not running, direct-sim job still queued on a saturated
+	// WorkerThreadPool) that leave the previous snapshot in place, while
+	// SteamAudioListener::update_sensor_slots() keeps running every frame. Without a
+	// version to compare against, that stale snapshot gets re-applied each frame and
+	// always beats the just-decayed slot value, so the 30 dB/s decay can never win and
+	// the sensor reports the last sound at the last position for as long as the stall
+	// lasts. Consumers apply a snapshot at most once.
+	uint64_t source_db_levels_version = 0;
 
 	// Transform pushed by the owner (node or RID user); consumed on the main thread.
 	godot::Transform3D pending_transform;
@@ -403,7 +412,10 @@ public:
 	godot::Array listener_get_source_db_levels(godot::RID listener);
 	// C++-only hot-path accessor (not bound); returns a reference valid until the
 	// next tick(). Used by the SteamAudioListener node for its sensor slots.
-	const godot::LocalVector<ListenerSourceDBLevel> &listener_get_source_db_levels_ref(godot::RID listener);
+	// out_version receives ListenerData::source_db_levels_version so the caller can
+	// tell a freshly rebuilt snapshot from one a stalled tick left behind (0 when the
+	// listener is unknown).
+	const godot::LocalVector<ListenerSourceDBLevel> &listener_get_source_db_levels_ref(godot::RID listener, uint64_t *out_version = nullptr);
 
 	// ── Source RID API ───────────────────────────────────────────────────────
 	godot::RID source_create();

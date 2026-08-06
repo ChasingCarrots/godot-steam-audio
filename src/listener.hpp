@@ -21,7 +21,12 @@ protected:
 
 	godot::RID source;
 	godot::Vector3 position;
-	float db_level;
+	// Must start at the "cleared" sentinel used by update_sensor_slots(): an
+	// indeterminate value here can both fake an event (it passes the listener's
+	// dB threshold) and permanently wedge the slot (a large value never decays
+	// below -60 and never loses the `final_db_level > slot db` comparison, so no
+	// real source can ever claim the slot).
+	float db_level = -500.0f;
 public:
 	void set_source_rid(const godot::RID &p_source);
 	godot::RID get_source_rid() const;
@@ -52,6 +57,10 @@ private:
 	uint32_t mask = 1;
 	float range = 0.0f;
 	godot::Ref<AudioStreamSteamAudioListener> generator;
+
+	// Version of the server's per-source dB snapshot we last ingested, so a snapshot a
+	// stalled tick() left behind is never applied twice.
+	uint64_t last_applied_db_levels_version = 0;
 
 	void ready_internal();
 	void push_config();

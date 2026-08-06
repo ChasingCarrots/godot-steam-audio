@@ -70,7 +70,10 @@ void SteamAudioListener::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_sensor_slots"), &SteamAudioListener::get_sensor_slots);
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "num_source_db_sensor_slots"), "set_num_source_db_sensor_slots", "get_num_source_db_sensor_slots");
-	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "sensor_slots", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_READ_ONLY), "", "get_sensor_slots");
+	// Runtime state, not configuration: no setter, so anything stored in a scene is
+	// discarded on load. Keep PROPERTY_USAGE_STORAGE off it so it stops being written
+	// into .tscn files as misleading noise.
+	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "sensor_slots", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_READ_ONLY), "", "get_sensor_slots");
 }
 
 void SteamAudioListener::push_config() {
@@ -113,12 +116,24 @@ void SteamAudioListener::update_sensor_slots(float delta) {
 		if (current_db < -60.0f) {
 			slot->set_db_level(-500.0f);
 			slot->set_source_rid(RID());
+			// Drop the position too, so a cleared slot can't keep handing out the
+			// last place the (now silent, possibly freed) source was heard.
+			slot->set_position(Vector3());
 		} else {
 			slot->set_db_level(current_db);
 		}
 	}
 
-	const LocalVector<ListenerSourceDBLevel> &levels = srv->listener_get_source_db_levels_ref(rid);
+	uint64_t levels_version = 0;
+	const LocalVector<ListenerSourceDBLevel> &levels = srv->listener_get_source_db_levels_ref(rid, &levels_version);
+	// Apply each snapshot at most once. tick() can skip a rebuild entirely (see
+	// ListenerData::source_db_levels_version); re-applying the same levels every frame
+	// would always beat the value we just decayed above, pinning the slot to a sound
+	// that has long stopped. Decaying without ingesting is the correct behaviour there.
+	if (levels_version == last_applied_db_levels_version)
+		return;
+	last_applied_db_levels_version = levels_version;
+
 	for (const auto &lvl : levels) {
 		float final_db_level = lvl.db_level;
 		if (final_db_level < -60.0f)

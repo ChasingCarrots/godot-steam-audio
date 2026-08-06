@@ -665,11 +665,15 @@ void SteamAudioServer::tick(float delta) {
 	// is valid. Update per-source dB levels here, on the main thread. The sensor-slot
 	// maintenance itself now lives on the SteamAudioListener node, which pulls these.
 	for (auto *ld : listeners) {
+		// Clear + bump before the simulator check: a listener without a simulator has
+		// no levels to report, and leaving the previous snapshot in place would let
+		// SteamAudioListener::update_sensor_slots() keep re-applying it forever.
+		ld->source_db_levels.clear();
+		ld->source_db_levels_version++;
 		if (!ld->simulator)
 			continue;
 
 		PROFILE_FUNCTION_NAMED("updating_source_db_levels");
-		ld->source_db_levels.clear();
 		for (auto *sd : sources) {
 			for (auto &sld : sd->listener_data) {
 				if (sld.listener != ld)
@@ -2204,10 +2208,15 @@ int SteamAudioServer::listener_get_allocated_ring_capacity_frames(RID listener) 
 	return worst;
 }
 
-const LocalVector<ListenerSourceDBLevel> &SteamAudioServer::listener_get_source_db_levels_ref(RID listener) {
+const LocalVector<ListenerSourceDBLevel> &SteamAudioServer::listener_get_source_db_levels_ref(RID listener, uint64_t *out_version) {
 	ListenerData *ld = listener_owner.get_or_null(listener);
-	if (ld)
+	if (ld) {
+		if (out_version)
+			*out_version = ld->source_db_levels_version;
 		return ld->source_db_levels;
+	}
+	if (out_version)
+		*out_version = 0;
 	static LocalVector<ListenerSourceDBLevel> empty;
 	empty.clear();
 	return empty;
