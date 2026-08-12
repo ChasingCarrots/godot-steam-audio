@@ -2160,6 +2160,16 @@ void SteamAudioServer::listener_set_debug_name(RID listener, const String &name)
 }
 
 void SteamAudioServer::listener_add_playback(RID listener, Ref<AudioStreamSteamAudioListenerPlayback> playback) {
+	if (playback.is_null())
+		return;
+
+	// Prime the lazily-initialised `_is_playing` virtual before publishing the playback
+	// to the mixing thread — see the long explanation in source_add_playback. Listener
+	// playbacks are the ones that end up in two lists guarded by different mutexes when
+	// a listener is played back through a source (walkie talkie), so this is the site
+	// that actually crashed. Result intentionally unused — not dead code.
+	(void)playback->is_playing();
+
 	std::lock_guard lock(pending_ops_mutex);
 	pending_ops.push_back(PendingAddPlaybackToListener{ listener, playback });
 }
@@ -2369,6 +2379,18 @@ void SteamAudioServer::source_add_playback(RID source, Ref<AudioStreamPlayback> 
 
 	float volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
 	playback->start();
+
+	// Prime the lazily-initialised `_is_playing` virtual while this playback is still
+	// private to this thread. Godot caches that GDExtension function pointer per object,
+	// and the lazy init (Object::_gdvirtual_init_method_ptr) publishes a transient
+	// nullptr into the shared slot before filling it in. Two threads racing the *first*
+	// is_playing() on one object can therefore dispatch through null — an access
+	// violation executing 0x0. Once the pending op below is published, both the mixing
+	// thread and the main thread call is_playing() on this object (in the walkie-talkie
+	// case even under two different mutexes), so the init must already be done by then.
+	// The window only exists before the first completed init, so this one call closes it
+	// for the whole lifetime of the object. Result intentionally unused — not dead code.
+	(void)playback->is_playing();
 
 	std::lock_guard lock(pending_ops_mutex);
 	pending_ops.push_back(PendingAddPlaybackToSource{ source, playback, volume_linear, p_pitch_scale });
