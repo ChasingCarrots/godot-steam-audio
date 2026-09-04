@@ -2,7 +2,7 @@
 
 env = SConscript("src/lib/godot-cpp/SConstruct")
 
-env.Append(CPPPATH=["src/"])
+env.Append(CPPPATH=["src/", "src/lib/oboe/", "src/lib/oboe/resampler/"])
 
 if env.get("CC", "").lower() == "cl":
     # Building with MSVC
@@ -14,7 +14,7 @@ opts = Variables(None, ARGUMENTS)
 opts.Add(BoolVariable("profiling_enabled", "Build with profiling active", False))
 opts.Update(env)
 
-sources = Glob("src/*.cpp")
+sources = Glob("src/*.cpp") + Glob("src/lib/oboe/resampler/*.cpp")
 
 steam_audio_lib_path = env.get("STEAM_AUDIO_LIB_PATH", "src/lib/steamaudio/lib")
 tracy_lib_path = env.get("TRACY_LIB_PATH", 'src/lib/tracy')

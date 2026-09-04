@@ -1,13 +1,45 @@
 #include "AudioStreamSteamAudioListener.h"
+#include "resampler/MultiChannelResampler.h"
+#include "server.hpp"
 
 #include <cstring>
+#include <godot_cpp/core/class_db.hpp>
 
 // --- AudioStreamSteamAudioListenerPlayback ---
+
+void AudioStreamSteamAudioListenerPlayback::_bind_methods() {
+	godot::ClassDB::bind_method(godot::D_METHOD("set_rates", "steam_sampling_rate", "godot_mix_rate"), &AudioStreamSteamAudioListenerPlayback::set_rates);
+}
 
 AudioStreamSteamAudioListenerPlayback::AudioStreamSteamAudioListenerPlayback()
 {
     ring_buffer.resize( godot::nearest_shift( 1024 ) );
     ring_buffer.clear();
+}
+
+AudioStreamSteamAudioListenerPlayback::~AudioStreamSteamAudioListenerPlayback() = default;
+
+void AudioStreamSteamAudioListenerPlayback::set_rates( int p_steam_sampling_rate, int p_godot_mix_rate )
+{
+	if (steam_sampling_rate == p_steam_sampling_rate && godot_mix_rate == p_godot_mix_rate)
+		return;
+	steam_sampling_rate = p_steam_sampling_rate;
+	godot_mix_rate = p_godot_mix_rate;
+	init_resampler();
+}
+
+void AudioStreamSteamAudioListenerPlayback::init_resampler()
+{
+	if (steam_sampling_rate > 0 && godot_mix_rate > 0 && steam_sampling_rate != godot_mix_rate) {
+		resampler.reset(oboe::resampler::MultiChannelResampler::make(
+			2,
+			steam_sampling_rate,
+			godot_mix_rate,
+			oboe::resampler::MultiChannelResampler::Quality::High
+		));
+	} else {
+		resampler.reset();
+	}
 }
 
 void AudioStreamSteamAudioListenerPlayback::set_buffer_size( int p_frames )
@@ -73,13 +105,52 @@ int32_t AudioStreamSteamAudioListenerPlayback::_mix(
 	float p_rate_scale,
 	int32_t p_frames)
 {
+	if (resampler == nullptr && steam_sampling_rate == 0) {
+		if (SteamAudioServer *srv = SteamAudioServer::get_singleton()) {
+			set_rates(srv->get_sampling_rate(), srv->get_godot_mix_rate());
+		}
+	}
+
 	if (reset_requested.exchange( false, std::memory_order_acq_rel ))
 	{
 		ring_buffer.clear();
+		if (resampler) {
+			resampler->reset();
+		}
 	}
 
-	int available = ring_buffer.data_left();
-	int to_mix = godot::MIN(available, p_frames);
+	int to_mix = 0;
+	if (resampler == nullptr) {
+		int available = ring_buffer.data_left();
+		to_mix = godot::MIN(available, p_frames);
+		if (to_mix > 0) {
+			ring_buffer.read(p_buffer, to_mix);
+		}
+	} else {
+		int i = 0;
+		for (; i < p_frames; ++i) {
+			bool underrun = false;
+			while (resampler->isWriteNeeded()) {
+				if (ring_buffer.data_left() > 0) {
+					godot::AudioFrame in_frame;
+					ring_buffer.read(&in_frame, 1);
+					float in_data[2] = { in_frame.left, in_frame.right };
+					resampler->writeNextFrame(in_data);
+				} else {
+					underrun = true;
+					break;
+				}
+			}
+			if (underrun) {
+				break;
+			}
+			float out_data[2];
+			resampler->readNextFrame(out_data);
+			p_buffer[i].left = out_data[0];
+			p_buffer[i].right = out_data[1];
+		}
+		to_mix = i;
+	}
 
 	// ---- 1. Consume real audio ----
 	if (to_mix > 0)
@@ -91,8 +162,6 @@ int32_t AudioStreamSteamAudioListenerPlayback::_mix(
 			underrun_fade_pos = 0;
 			resume_fade_pos = 0;
 		}
-
-		ring_buffer.read(p_buffer, to_mix);
 
 		if (resume_fade_pos >= 0)
 		{

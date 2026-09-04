@@ -259,6 +259,7 @@ Ref<AudioStreamSteamAudioListenerPlayback> SteamAudioListener::play_on_audiostre
 	if (playback.is_valid()) {
 		SteamAudioServer *srv = SteamAudioServer::get_singleton();
 		// Capacity is the output latency; see AudioStreamSteamAudioListenerPlayback.
+		playback->set_rates(srv->get_sampling_rate(), srv->get_godot_mix_rate());
 		playback->set_buffer_size(srv->get_listener_ring_capacity_frames());
 		srv->listener_add_playback(rid, playback);
 	}

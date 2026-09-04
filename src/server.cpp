@@ -229,6 +229,7 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_frame_size", "frame_size"), &SteamAudioServer::set_frame_size);
 	ClassDB::bind_method(D_METHOD("get_is_initialized"), &SteamAudioServer::get_is_initialized);
 	ClassDB::bind_method(D_METHOD("get_sampling_rate"), &SteamAudioServer::get_sampling_rate);
+	ClassDB::bind_method(D_METHOD("get_godot_mix_rate"), &SteamAudioServer::get_godot_mix_rate);
 	ClassDB::bind_method(D_METHOD("get_listener_ring_capacity_frames"), &SteamAudioServer::get_listener_ring_capacity_frames);
 
 	// Source RID API
@@ -412,12 +413,23 @@ IPLAudioSettings SteamAudioServer::get_audio_settings() {
 		mix_rate = int(audio_server->get_mix_rate());
 	if (mix_rate <= 0)
 		mix_rate = get_project_int("audio/driver/mix_rate", 48000);
+	godot_mix_rate = mix_rate;
+
+	// Steam Audio built-in default HRTF supports only 44.1 kHz, 48 kHz, and 24 kHz.
+	// For standard rates (44.1 kHz and 48 kHz), run Steam Audio natively.
+	// For other rates (such as 96 kHz or 192 kHz sound cards), clamp Steam Audio's
+	// internal processing to 48 kHz and resample at the Godot/Steam Audio boundaries.
+	int steam_rate = 48000;
+	if (mix_rate == 44100 || mix_rate == 48000) {
+		steam_rate = mix_rate;
+	}
+
 	int frame_size = get_project_int("steamaudio/frame_size", 0);
 	if (frame_size <= 0) {
 		// Next power of two covering one output-latency period. Pin
 		// steamaudio/frame_size to decouple the block size from output_latency.
 		int out_latency_ms = get_project_int("audio/driver/output_latency", 15);
-		int target = int((mix_rate * out_latency_ms) / 1000.0f);
+		int target = int((steam_rate * out_latency_ms) / 1000.0f);
 		frame_size = 1;
 		while (frame_size < target)
 			frame_size <<= 1;
@@ -428,7 +440,7 @@ IPLAudioSettings SteamAudioServer::get_audio_settings() {
 			pow2 <<= 1;
 		frame_size = MAX(64, pow2);
 	}
-	return IPLAudioSettings{ mix_rate, frame_size };
+	return IPLAudioSettings{ steam_rate, frame_size };
 }
 
 void SteamAudioServer::set_frame_size(int p_frame_size) {
@@ -455,9 +467,13 @@ int SteamAudioServer::get_listener_ring_capacity_frames() const {
 	int frame_size = cached_audio_settings.frameSize;
 
 	// One device callback runs several mix steps back to back with no chance to refill.
-	int burst = MAX(godot_mix_step, device_frames);
+	int godot_mix_step_steam_frames = godot_mix_step;
+	if (godot_mix_rate > 0) {
+		godot_mix_step_steam_frames = int(std::ceil((double)godot_mix_step * cached_audio_settings.samplingRate / godot_mix_rate));
+	}
+	int burst = MAX(godot_mix_step_steam_frames, device_frames);
 	// Plus jitter slack; Phase 3 tops the ring up every mixing-thread iteration.
-	int minimum = burst + MAX(godot_mix_step / 4, frame_size / 2);
+	int minimum = burst + MAX(godot_mix_step_steam_frames / 4, frame_size / 2);
 
 	int configured_ms = get_project_int("steamaudio/listener_ring_capacity_ms", 0);
 	if (configured_ms > 0) {
@@ -1390,7 +1406,17 @@ void SteamAudioServer::apply_pending_ops() {
 				entry.playback = pending.playback;
 				entry.volume_linear = pending.volume_linear;
 				entry.pitch_scale = pending.pitch_scale;
-				sd->playbacks.push_back(entry);
+				if (godot_mix_rate != cached_audio_settings.samplingRate && godot_mix_rate > 0 && cached_audio_settings.samplingRate > 0) {
+					entry.resampler = std::shared_ptr<oboe::resampler::MultiChannelResampler>(
+						oboe::resampler::MultiChannelResampler::make(
+							2,
+							godot_mix_rate,
+							cached_audio_settings.samplingRate,
+							oboe::resampler::MultiChannelResampler::Quality::High
+						)
+					);
+				}
+				sd->playbacks.push_back(std::move(entry));
 
 			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToListener>) {
 				ListenerData *ld = listener_owner.get_or_null(pending.listener);
@@ -1710,8 +1736,50 @@ void SteamAudioServer::process_audio(double dt) {
 			for (auto &pb : sd->playbacks) {
 				if (pb.num_mixed_in_current_mixed_frames >= frame_size)
 					continue;
+
+				if (godot_mix_rate != cached_audio_settings.samplingRate && godot_mix_rate > 0 && cached_audio_settings.samplingRate > 0 && !pb.resampler) {
+					pb.resampler = std::shared_ptr<oboe::resampler::MultiChannelResampler>(
+						oboe::resampler::MultiChannelResampler::make(
+							2,
+							godot_mix_rate,
+							cached_audio_settings.samplingRate,
+							oboe::resampler::MultiChannelResampler::Quality::High
+						)
+					);
+				}
+
 				int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
-				const PackedVector2Array frames = pb.playback->mix_audio(pb.pitch_scale, to_pull);
+				PackedVector2Array frames;
+				if (!pb.resampler) {
+					frames = pb.playback->mix_audio(pb.pitch_scale, to_pull);
+				} else {
+					frames.resize(to_pull);
+					int produced = 0;
+					while (produced < to_pull) {
+						if (pb.resampler->isWriteNeeded()) {
+							if (pb.unconsumed_input_index >= pb.unconsumed_input_frames.size()) {
+								int needed_out = to_pull - produced;
+								int needed_in = int(std::ceil((double)needed_out * godot_mix_rate / cached_audio_settings.samplingRate)) + 16;
+								pb.unconsumed_input_frames = pb.playback->mix_audio(pb.pitch_scale, needed_in);
+								pb.unconsumed_input_index = 0;
+								if (pb.unconsumed_input_frames.is_empty()) {
+									break;
+								}
+							}
+							Vector2 in_frame = pb.unconsumed_input_frames[pb.unconsumed_input_index++];
+							float in_data[2] = { in_frame.x, in_frame.y };
+							pb.resampler->writeNextFrame(in_data);
+						} else {
+							float out_data[2];
+							pb.resampler->readNextFrame(out_data);
+							frames[produced++] = Vector2(out_data[0], out_data[1]);
+						}
+					}
+					if (produced < to_pull) {
+						frames.resize(produced);
+					}
+				}
+
 				pb.debug_num_mixed += frames.size();
 
 				int pulled = MIN((int)frames.size(), to_pull);

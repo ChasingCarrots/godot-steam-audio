@@ -9,6 +9,13 @@
 #include <godot_cpp/core/defs.hpp>
 
 #include <atomic>
+#include <memory>
+
+namespace oboe {
+namespace resampler {
+class MultiChannelResampler;
+}
+}
 
 // Output ring, filled by SteamAudioServer's mixing thread, drained by Godot's audio
 // thread.
@@ -24,7 +31,7 @@ class AudioStreamSteamAudioListenerPlayback : public godot::AudioStreamPlayback
     GDCLASS( AudioStreamSteamAudioListenerPlayback, godot::AudioStreamPlayback )
 
 protected:
-    static void _bind_methods() {}
+    static void _bind_methods();
 
     bool active = false;
     uint64_t mixed = 0;
@@ -44,11 +51,18 @@ protected:
 	// Blends from last_frame into the new samples after an underrun. -1 = inactive.
 	int resume_fade_pos = -1;
 
+	int steam_sampling_rate = 0;
+	int godot_mix_rate = 0;
+	std::unique_ptr<oboe::resampler::MultiChannelResampler> resampler;
+	void init_resampler();
+
 public:
     AudioStreamSteamAudioListenerPlayback();
+    ~AudioStreamSteamAudioListenerPlayback() override;
     // p_frames is the desired USABLE capacity, rounded up to a power of two.
     // Setup only: reallocates, so call before handing the playback to the server.
     void set_buffer_size( int p_frames );
+    void set_rates( int p_steam_sampling_rate, int p_godot_mix_rate );
     void push_frames( const godot::AudioFrame *p_frames, int p_count );
     bool push_buffer( const godot::PackedVector2Array& p_buffer );
     int get_free_buffer_size() const;

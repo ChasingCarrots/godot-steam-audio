@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "AudioStreamSteamAudioListener.h"
+#include "resampler/MultiChannelResampler.h"
 #include "godot_cpp/classes/audio_effect.hpp"
 #include "godot_cpp/classes/audio_stream_playback.hpp"
 
@@ -166,6 +167,10 @@ struct SourcePlaybackEntry {
 	float pitch_scale = 1.0f;
 
 	uint32_t debug_num_mixed = 0;
+
+	std::shared_ptr<oboe::resampler::MultiChannelResampler> resampler;
+	godot::PackedVector2Array unconsumed_input_frames;
+	int unconsumed_input_index = 0;
 };
 
 // All configuration a source pushes into the server. Plain data, read across
@@ -376,6 +381,7 @@ private:
 
 	// Cached audio settings, set once during init()
 	IPLAudioSettings cached_audio_settings{};
+	int godot_mix_rate = 0;
 
 	// Registration of Project Settings
 	void register_settings();
@@ -457,6 +463,7 @@ public:
 	void set_frame_size(int p_frame_size);
 	bool get_is_initialized() const { return is_initialized; }
 	int get_sampling_rate() const { return cached_audio_settings.samplingRate; }
+	int get_godot_mix_rate() const { return godot_mix_rate; }
 	// Capacity of a listener's output ring, which is also its output latency in frames.
 	int get_listener_ring_capacity_frames() const;
 	// Occupancy of the listener's playbacks (max across them), in frames.
