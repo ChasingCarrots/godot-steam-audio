@@ -449,6 +449,7 @@ public:
 	godot::RID geometry_create_static(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material);
 	godot::RID geometry_create_dynamic(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material);
 	void geometry_set_transform(godot::RID geometry, const godot::Transform3D &xform);
+	void geometry_set_material(godot::RID geometry, const godot::PackedFloat32Array &material);
 	void geometry_free(godot::RID geometry);
 
 	// Audio pulling and effect application. dt is the wall-clock time (seconds) since

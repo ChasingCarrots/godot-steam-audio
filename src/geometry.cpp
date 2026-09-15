@@ -36,6 +36,7 @@ void SteamAudioGeometry::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_root_path"), &SteamAudioGeometry::get_root_path);
 	ClassDB::bind_method(D_METHOD("set_root_path", "path"), &SteamAudioGeometry::set_root_path);
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "root_path"), "set_root_path", "get_root_path");
+	ClassDB::bind_method(D_METHOD("update_materials"), &SteamAudioGeometry::update_materials);
 }
 
 SteamAudioGeometry::SteamAudioGeometry() {}
@@ -90,6 +91,7 @@ void SteamAudioGeometry::find_and_register_geometry(Node *p_node) {
 					RID rid = srv->geometry_create_dynamic(raw.verts, raw.tris, mat_floats);
 					if (rid.is_valid()) {
 						geometry_rids.push_back(rid);
+						geometry_entries.push_back({ rid, group });
 						Node3D *n3d = Object::cast_to<Node3D>(p_node);
 						srv->geometry_set_transform(rid, n3d ? n3d->get_global_transform() : Transform3D());
 						dynamic_entries.push_back({ n3d, rid });
@@ -98,6 +100,7 @@ void SteamAudioGeometry::find_and_register_geometry(Node *p_node) {
 					RID rid = srv->geometry_create_static(raw.verts, raw.tris, mat_floats);
 					if (rid.is_valid())
 						geometry_rids.push_back(rid);
+						geometry_entries.push_back({ rid, group });
 				}
 			}
 			// One node can only be one geometry object for now to keep it simple.
@@ -118,10 +121,28 @@ void SteamAudioGeometry::unregister_all() {
 		}
 	}
 	geometry_rids.clear();
+	geometry_entries.clear();
 	dynamic_entries.clear();
 }
 
-void SteamAudioGeometry::set_materials(const Dictionary &p_materials) { materials = p_materials; }
+void SteamAudioGeometry::set_materials(const Dictionary &p_materials) {
+	materials = p_materials;
+	if (is_inside_tree()) {
+		update_materials();
+	}
+}
+
+void SteamAudioGeometry::update_materials() {
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (!srv)
+		return;
+	for (const auto &entry : geometry_entries) {
+		if (materials.has(entry.group)) {
+			Ref<SteamAudioMaterial> mat = materials[entry.group];
+			srv->geometry_set_material(entry.rid, material_to_floats(mat));
+		}
+	}
+}
 Dictionary SteamAudioGeometry::get_materials() const { return materials; }
 
 void SteamAudioGeometry::set_is_dynamic(bool p_dynamic) { is_dynamic = p_dynamic; }

@@ -257,6 +257,7 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("geometry_create_static", "verts", "tris", "material"), &SteamAudioServer::geometry_create_static);
 	ClassDB::bind_method(D_METHOD("geometry_create_dynamic", "verts", "tris", "material"), &SteamAudioServer::geometry_create_dynamic);
 	ClassDB::bind_method(D_METHOD("geometry_set_transform", "geometry", "xform"), &SteamAudioServer::geometry_set_transform);
+	ClassDB::bind_method(D_METHOD("geometry_set_material", "geometry", "material"), &SteamAudioServer::geometry_set_material);
 	ClassDB::bind_method(D_METHOD("geometry_free", "geometry"), &SteamAudioServer::geometry_free);
 
 	ClassDB::bind_method(D_METHOD("get_mixing_thread_usage_pct"), &SteamAudioServer::get_mixing_thread_usage_pct);
@@ -2469,11 +2470,22 @@ void SteamAudioServer::source_set_playback_volume(RID source, Ref<AudioStreamPla
 	SourceData *sd = source_owner.get_or_null(source);
 	if (!sd)
 		return;
-	std::lock_guard pb_lock(*sd->playbacks_mutex);
-	for (auto &entry : sd->playbacks) {
-		if (entry.playback == p_playback) {
-			entry.volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
-			return;
+	{
+		std::lock_guard pb_lock(*sd->playbacks_mutex);
+		for (auto &entry : sd->playbacks) {
+			if (entry.playback == p_playback) {
+				entry.volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
+				return;
+			}
+		}
+	}
+	std::lock_guard lock_pending(pending_ops_mutex);
+	for (auto &op : pending_ops) {
+		if (auto *pending = std::get_if<PendingAddPlaybackToSource>(&op)) {
+			if (pending->source == source && pending->playback == p_playback) {
+				pending->volume_linear = UtilityFunctions::db_to_linear(p_volume_db);
+				return;
+			}
 		}
 	}
 }
@@ -2483,11 +2495,22 @@ void SteamAudioServer::source_set_playback_pitch(RID source, Ref<AudioStreamPlay
 	SourceData *sd = source_owner.get_or_null(source);
 	if (!sd)
 		return;
-	std::lock_guard pb_lock(*sd->playbacks_mutex);
-	for (auto &entry : sd->playbacks) {
-		if (entry.playback == p_playback) {
-			entry.pitch_scale = p_pitch_scale;
-			return;
+	{
+		std::lock_guard pb_lock(*sd->playbacks_mutex);
+		for (auto &entry : sd->playbacks) {
+			if (entry.playback == p_playback) {
+				entry.pitch_scale = p_pitch_scale;
+				return;
+			}
+		}
+	}
+	std::lock_guard lock_pending(pending_ops_mutex);
+	for (auto &op : pending_ops) {
+		if (auto *pending = std::get_if<PendingAddPlaybackToSource>(&op)) {
+			if (pending->source == source && pending->playback == p_playback) {
+				pending->pitch_scale = p_pitch_scale;
+				return;
+			}
 		}
 	}
 }
@@ -2590,6 +2613,23 @@ void SteamAudioServer::geometry_set_transform(RID geometry, const Transform3D &x
 		return;
 	g->pending_transform = xform;
 	g->has_transform = true;
+}
+void SteamAudioServer::geometry_set_material(RID geometry, const PackedFloat32Array &material) {
+	std::unique_lock lock(collections_mutex);
+	GeometryData *g = geometry_owner.get_or_null(geometry);
+	if (!g)
+		return;
+	IPLMaterial mat = ipl_material_from_floats(material);
+	IPLScene target_scene = g->dynamic ? g->sub_scene : phonon_scene;
+	if (!target_scene)
+		return;
+	for (auto &m : g->meshes) {
+		iplStaticMeshSetMaterial(m, target_scene, &mat, 0);
+	}
+	if (g->dynamic) {
+		iplSceneCommit(g->sub_scene);
+	}
+	scene_dirty = true;
 }
 
 void SteamAudioServer::geometry_free(RID geometry) {

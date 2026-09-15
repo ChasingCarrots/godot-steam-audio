@@ -24,6 +24,11 @@ private:
 		godot::RID rid;
 	};
 	std::vector<DynamicEntry> dynamic_entries;
+	struct GeometryEntry {
+		godot::RID rid;
+		godot::String group;
+	};
+	std::vector<GeometryEntry> geometry_entries;
 
 	void find_and_register_geometry(godot::Node *p_node);
 	void unregister_all();
@@ -45,6 +50,7 @@ public:
 
 	void set_root_path(const godot::NodePath &p_path);
 	godot::NodePath get_root_path() const;
+	void update_materials();
 };
 
 #endif // STEAM_AUDIO_GEOMETRY_H
