@@ -12,6 +12,7 @@
 #include "godot_cpp/variant/utility_functions.hpp"
 #include <phonon.h>
 #include <climits>
+#include <thread>
 
 #include "profiling.h"
 #include "steam_audio.hpp"

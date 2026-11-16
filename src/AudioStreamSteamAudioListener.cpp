@@ -13,7 +13,7 @@ void AudioStreamSteamAudioListenerPlayback::_bind_methods() {
 
 AudioStreamSteamAudioListenerPlayback::AudioStreamSteamAudioListenerPlayback()
 {
-    ring_buffer.resize( godot::nearest_shift( 1024 ) );
+    ring_buffer.resize( godot::Math::nearest_shift( static_cast<uint32_t>( 1024 ) ) );
     ring_buffer.clear();
 }
 
@@ -46,7 +46,7 @@ void AudioStreamSteamAudioListenerPlayback::set_buffer_size( int p_frames )
 {
     // nearest_shift() yields the smallest power of two strictly greater than
     // p_frames, so usable (= size - 1) >= p_frames.
-    ring_buffer.resize( godot::nearest_shift( godot::MAX( 1, p_frames ) ) );
+    ring_buffer.resize( godot::Math::nearest_shift( static_cast<uint32_t>( godot::MAX( 1, p_frames ) ) ) );
     ring_buffer.clear();
 }
 

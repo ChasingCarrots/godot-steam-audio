@@ -2,10 +2,26 @@
 
 import os
 
-if "custom_api_file" not in ARGUMENTS and os.path.exists("gdextension/extension_api.json"):
-    ARGUMENTS["custom_api_file"] = os.path.abspath("gdextension/extension_api.json")
+custom_api_file = ARGUMENTS.get("custom_api_file", None)
+api_version = ARGUMENTS.get("api_version", None)
 
-env = SConscript("src/lib/godot-cpp/SConstruct")
+if not custom_api_file or not os.path.exists(custom_api_file):
+    if os.path.exists("gdextension/extension_api.json"):
+        custom_api_file = "gdextension/extension_api.json"
+        ARGUMENTS["custom_api_file"] = custom_api_file
+    elif os.path.exists("src/lib/godot-cpp/gdextension/extension_api.json"):
+        custom_api_file = "src/lib/godot-cpp/gdextension/extension_api.json"
+        ARGUMENTS["custom_api_file"] = custom_api_file
+    else:
+        if not api_version:
+            api_version = "4.8"
+            ARGUMENTS["api_version"] = api_version
+
+sconscript_exports = {}
+if api_version:
+    sconscript_exports["api_version"] = api_version
+
+env = SConscript("src/lib/godot-cpp/SConstruct", exports=sconscript_exports)
 
 env.Append(CPPPATH=["src/", "src/lib/oboe/", "src/lib/oboe/resampler/"])
 
