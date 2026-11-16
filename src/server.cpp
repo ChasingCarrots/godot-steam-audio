@@ -1749,47 +1749,60 @@ void SteamAudioServer::process_audio(double dt) {
 					);
 				}
 
+				auto ensure_buf = [](Ref<AudioBuffer> &buf, int32_t frames_needed) {
+					if (buf.is_null()) {
+						buf = AudioBuffer::create(frames_needed);
+					} else if (buf->get_frame_count() < frames_needed) {
+						buf->resize(frames_needed);
+					}
+				};
+
 				int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
-				PackedVector2Array frames;
+				const AudioFrame *frames_ptr = nullptr;
+				int pulled_count = 0;
 				if (!pb.resampler) {
-					frames = pb.playback->mix_audio(pb.pitch_scale, to_pull);
+					ensure_buf(mix_scratch_buffer, to_pull);
+					pulled_count = pb.playback->mix_audio_buffer(mix_scratch_buffer, pb.pitch_scale, to_pull);
+					frames_ptr = reinterpret_cast<const AudioFrame *>(mix_scratch_buffer->get_data_address());
 				} else {
-					frames.resize(to_pull);
+					ensure_buf(resampled_scratch_buffer, to_pull);
+					auto *out_ptr = reinterpret_cast<AudioFrame *>(resampled_scratch_buffer->get_data_address());
 					int produced = 0;
 					while (produced < to_pull) {
 						if (pb.resampler->isWriteNeeded()) {
-							if (pb.unconsumed_input_index >= pb.unconsumed_input_frames.size()) {
+							if (pb.unconsumed_input_index >= pb.unconsumed_input_count) {
 								int needed_out = to_pull - produced;
 								int needed_in = int(std::ceil((double)needed_out * godot_mix_rate / cached_audio_settings.samplingRate)) + 16;
-								pb.unconsumed_input_frames = pb.playback->mix_audio(pb.pitch_scale, needed_in);
+								ensure_buf(pb.unconsumed_input_buffer, needed_in);
+								pb.unconsumed_input_count = pb.playback->mix_audio_buffer(pb.unconsumed_input_buffer, pb.pitch_scale, needed_in);
 								pb.unconsumed_input_index = 0;
-								if (pb.unconsumed_input_frames.is_empty()) {
+								if (pb.unconsumed_input_count <= 0) {
 									break;
 								}
 							}
-							Vector2 in_frame = pb.unconsumed_input_frames[pb.unconsumed_input_index++];
-							float in_data[2] = { in_frame.x, in_frame.y };
+							const auto *in_ptr = reinterpret_cast<const AudioFrame *>(pb.unconsumed_input_buffer->get_data_address());
+							const AudioFrame &in_frame = in_ptr[pb.unconsumed_input_index++];
+							float in_data[2] = { in_frame.left, in_frame.right };
 							pb.resampler->writeNextFrame(in_data);
 						} else {
 							float out_data[2];
 							pb.resampler->readNextFrame(out_data);
-							frames[produced++] = Vector2(out_data[0], out_data[1]);
+							out_ptr[produced++] = AudioFrame{out_data[0], out_data[1]};
 						}
 					}
-					if (produced < to_pull) {
-						frames.resize(produced);
-					}
+					frames_ptr = out_ptr;
+					pulled_count = produced;
 				}
 
-				pb.debug_num_mixed += frames.size();
+				pb.debug_num_mixed += pulled_count;
 
-				int pulled = MIN((int)frames.size(), to_pull);
+				int pulled = MIN(pulled_count, to_pull);
 
 				int mixed_index = pb.num_mixed_in_current_mixed_frames;
 				for (int frames_index = 0; frames_index < pulled; ++frames_index) {
 					if (mixed_index >= frame_size)
 						break; // precaution, but should really not happen...
-					sd->mixed_frames[mixed_index] += frames[frames_index] * pb.volume_linear * sd->volume_linear;
+					sd->mixed_frames[mixed_index] += Vector2(frames_ptr[frames_index].left, frames_ptr[frames_index].right) * pb.volume_linear * sd->volume_linear;
 					++mixed_index;
 				}
 				min_frames_ready = MIN(min_frames_ready, mixed_index);
@@ -1802,16 +1815,28 @@ void SteamAudioServer::process_audio(double dt) {
 				// Apply effect stack in-place on mixed frames
 				int num_newly_ready = sd->mixed_frames_ready - prev_mixed_count;
 				if (num_newly_ready > 0) {
-					PackedVector2Array new_frames(sd->mixed_frames.slice(prev_mixed_count, sd->mixed_frames_ready));
-					for (auto &inst : sd->effect_instances) {
-						new_frames = inst->process_audio(
-								new_frames,
-								frame_size);
+					if (effect_src_buffer.is_null()) {
+						effect_src_buffer = AudioBuffer::create(num_newly_ready);
+					} else if (effect_src_buffer->get_frame_count() < num_newly_ready) {
+						effect_src_buffer->resize(num_newly_ready);
 					}
-					int new_index = 0;
-					for (int mixed_index = prev_mixed_count; mixed_index < sd->mixed_frames_ready; ++mixed_index) {
-						sd->mixed_frames[mixed_index] = new_frames[new_index];
-						new_index++;
+					if (effect_dst_buffer.is_null()) {
+						effect_dst_buffer = AudioBuffer::create(num_newly_ready);
+					} else if (effect_dst_buffer->get_frame_count() < num_newly_ready) {
+						effect_dst_buffer->resize(num_newly_ready);
+					}
+					auto *src_ptr = reinterpret_cast<AudioFrame *>(effect_src_buffer->get_data_address());
+					for (int i = 0; i < num_newly_ready; ++i) {
+						const Vector2 &v = sd->mixed_frames[prev_mixed_count + i];
+						src_ptr[i] = AudioFrame{v.x, v.y};
+					}
+					for (auto &inst : sd->effect_instances) {
+						inst->process_audio_buffer(effect_src_buffer, effect_dst_buffer, num_newly_ready);
+						std::swap(effect_src_buffer, effect_dst_buffer);
+					}
+					const auto *out_ptr = reinterpret_cast<const AudioFrame *>(effect_src_buffer->get_data_address());
+					for (int i = 0; i < num_newly_ready; ++i) {
+						sd->mixed_frames[prev_mixed_count + i] = Vector2(out_ptr[i].left, out_ptr[i].right);
 					}
 				}
 			}

@@ -1,5 +1,10 @@
 #!/usr/bin/env python
 
+import os
+
+if "custom_api_file" not in ARGUMENTS and os.path.exists("gdextension/extension_api.json"):
+    ARGUMENTS["custom_api_file"] = os.path.abspath("gdextension/extension_api.json")
+
 env = SConscript("src/lib/godot-cpp/SConstruct")
 
 env.Append(CPPPATH=["src/", "src/lib/oboe/", "src/lib/oboe/resampler/"])

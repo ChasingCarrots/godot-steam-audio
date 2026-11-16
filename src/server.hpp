@@ -1,6 +1,7 @@
 #ifndef STEAM_AUDIO_SERVER_H
 #define STEAM_AUDIO_SERVER_H
 
+#include "godot_cpp/classes/audio_buffer.hpp"
 #include "godot_cpp/classes/audio_effect_instance.hpp"
 #include "godot_cpp/classes/node3d.hpp"
 #include "godot_cpp/classes/object.hpp"
@@ -169,7 +170,8 @@ struct SourcePlaybackEntry {
 	uint32_t debug_num_mixed = 0;
 
 	std::shared_ptr<oboe::resampler::MultiChannelResampler> resampler;
-	godot::PackedVector2Array unconsumed_input_frames;
+	godot::Ref<godot::AudioBuffer> unconsumed_input_buffer;
+	int unconsumed_input_count = 0;
 	int unconsumed_input_index = 0;
 };
 
@@ -378,6 +380,11 @@ private:
 	std::condition_variable refl_cv;
 
 	bool scene_dirty = false;
+
+	godot::Ref<godot::AudioBuffer> mix_scratch_buffer;
+	godot::Ref<godot::AudioBuffer> resampled_scratch_buffer;
+	godot::Ref<godot::AudioBuffer> effect_src_buffer;
+	godot::Ref<godot::AudioBuffer> effect_dst_buffer;
 
 	// Cached audio settings, set once during init()
 	IPLAudioSettings cached_audio_settings{};
