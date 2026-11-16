@@ -1024,12 +1024,16 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 		self->refl_thread_wait_for_commit.store(true);
 		if (!self->is_refl_thread_processing.load()) {
 			PROFILE_FUNCTION_NAMED("committing_scene_and_simulators");
+			bool committed_scene = false;
 			if (self->scene_dirty) {
 				iplSceneCommit(self->phonon_scene);
 				self->scene_dirty = false;
+				committed_scene = true;
 			}
 			for (auto *ld : self->listeners) {
-				if (ld->dirty) {
+				if (!ld->simulator)
+					continue;
+				if (committed_scene || ld->dirty) {
 					iplSimulatorCommit(ld->simulator);
 					ld->dirty = false;
 				}
