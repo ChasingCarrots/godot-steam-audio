@@ -21,6 +21,15 @@ using namespace godot;
 
 SteamAudioServer *SteamAudioServer::self = nullptr;
 
+static IPLAirAbsorptionModel make_air_absorption_model(const SourceConfig &cfg) {
+	IPLAirAbsorptionModel model{};
+	model.type = IPL_AIRABSORPTIONTYPE_EXPONENTIAL;
+	model.coefficients[0] = MAX(0.0f, cfg.air_absorption_coefficients.x);
+	model.coefficients[1] = MAX(0.0f, cfg.air_absorption_coefficients.y);
+	model.coefficients[2] = MAX(0.0f, cfg.air_absorption_coefficients.z);
+	return model;
+}
+
 static float calculate_attenuation(float dist, float min_dist, float max_dist) {
 	if (dist <= min_dist) {
 		return 1.0f;
@@ -119,6 +128,7 @@ void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx) {
 	if (sld.ambisonics_decode_effect)
 		iplAmbisonicsDecodeEffectRelease(&sld.ambisonics_decode_effect);
 	iplAudioBufferFree(ctx, &sld.input_buffer);
+	iplAudioBufferFree(ctx, &sld.direct_buffer);
 	iplAudioBufferFree(ctx, &sld.output_buffer);
 	iplAudioBufferFree(ctx, &sld.ambisonics_buffer);
 }
@@ -139,6 +149,7 @@ static bool create_source_listener_data(SourceListenerData &sld, SourceData *sd,
 	handleErr(iplDirectEffectCreate(ctx, audio_settings, &direct_cfg, &sld.direct_effect), "SteamAudio: Failed to create direct effect");
 
 	iplAudioBufferAllocate(ctx, 1, audio_settings->frameSize, &sld.input_buffer);
+	iplAudioBufferAllocate(ctx, 1, audio_settings->frameSize, &sld.direct_buffer);
 	iplAudioBufferAllocate(ctx, 2, audio_settings->frameSize, &sld.output_buffer);
 
 	if (sd->cfg.reflection_enabled && ld->cfg.reflection_simulation_enabled) {
@@ -243,7 +254,7 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("source_set_direct_enabled", "source", "enabled"), &SteamAudioServer::source_set_direct_enabled);
 	ClassDB::bind_method(D_METHOD("source_set_binaural", "source", "enabled", "interpolation", "spatial_blend"), &SteamAudioServer::source_set_binaural);
 	ClassDB::bind_method(D_METHOD("source_set_distance_attenuation", "source", "enabled", "min", "max"), &SteamAudioServer::source_set_distance_attenuation);
-	ClassDB::bind_method(D_METHOD("source_set_air_absorption", "source", "enabled"), &SteamAudioServer::source_set_air_absorption);
+	ClassDB::bind_method(D_METHOD("source_set_air_absorption", "source", "enabled", "coefficients"), &SteamAudioServer::source_set_air_absorption, DEFVAL(Vector3(0.0002f, 0.0017f, 0.0182f)));
 	ClassDB::bind_method(D_METHOD("source_set_occlusion", "source", "enabled", "type", "radius", "samples"), &SteamAudioServer::source_set_occlusion);
 	ClassDB::bind_method(D_METHOD("source_set_transmission", "source", "enabled", "type", "rays"), &SteamAudioServer::source_set_transmission);
 	ClassDB::bind_method(D_METHOD("source_set_reflection", "source", "enabled", "duration", "hybrid_delay"), &SteamAudioServer::source_set_reflection);
@@ -731,8 +742,7 @@ void SteamAudioServer::tick(float delta) {
 				}
 
 				if (sd->cfg.air_absorption_enabled) {
-					IPLAirAbsorptionModel airAbsorptionModel{};
-					airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+					IPLAirAbsorptionModel airAbsorptionModel = make_air_absorption_model(sd->cfg);
 					float air_absorption[3];
 					iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld->cached_coords.origin, &airAbsorptionModel, air_absorption);
 					float avg_air_absorption = (air_absorption[0] + air_absorption[1] + air_absorption[2]) / 3.0f;
@@ -934,7 +944,7 @@ void SteamAudioServer::tick(float delta) {
 
 				inputs.source = sd->cached_coords;
 				inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
-				inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_EXPONENTIAL;
+				inputs.airAbsorptionModel = make_air_absorption_model(sd->cfg);
 
 				inputs.occlusionType = static_cast<IPLOcclusionType>(sd->cfg.occlusion_type);
 				inputs.occlusionRadius = sd->cfg.occlusion_radius;
@@ -1998,8 +2008,7 @@ void SteamAudioServer::process_audio(double dt) {
 					if (sd->cfg.air_absorption_enabled) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
 
-						IPLAirAbsorptionModel airAbsorptionModel{};
-						airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+						IPLAirAbsorptionModel airAbsorptionModel = make_air_absorption_model(sd->cfg);
 
 						iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld->cached_coords.origin, &airAbsorptionModel, direct_params.airAbsorption);
 					}
@@ -2017,7 +2026,7 @@ void SteamAudioServer::process_audio(double dt) {
 						direct_params.distanceAttenuation = 1.0f;
 					}
 
-					iplDirectEffectApply(sld->direct_effect, &direct_params, &sld->input_buffer, &sld->input_buffer);
+					iplDirectEffectApply(sld->direct_effect, &direct_params, &sld->input_buffer, &sld->direct_buffer);
 
 					// Binaural spatialization
 					if (sd->cfg.binaural_enabled) {
@@ -2033,11 +2042,11 @@ void SteamAudioServer::process_audio(double dt) {
 						params.hrtf = phonon_hrtf;
 
 						if (phonon_hrtf) {
-							iplBinauralEffectApply(sld->binaural_effect, &params, &sld->input_buffer, &sld->output_buffer);
+							iplBinauralEffectApply(sld->binaural_effect, &params, &sld->direct_buffer, &sld->output_buffer);
 						} else {
 							for (int s = 0; s < frame_size; ++s) {
-								sld->output_buffer.data[0][s] = sld->input_buffer.data[0][s];
-								sld->output_buffer.data[1][s] = sld->input_buffer.data[0][s];
+								sld->output_buffer.data[0][s] = sld->direct_buffer.data[0][s];
+								sld->output_buffer.data[1][s] = sld->direct_buffer.data[0][s];
 							}
 						}
 
@@ -2047,8 +2056,8 @@ void SteamAudioServer::process_audio(double dt) {
 						}
 					} else {
 						for (int s = 0; s < frame_size; ++s) {
-							ld->push_buffer[s].x += sld->input_buffer.data[0][s];
-							ld->push_buffer[s].y += sld->input_buffer.data[0][s];
+							ld->push_buffer[s].x += sld->direct_buffer.data[0][s];
+							ld->push_buffer[s].y += sld->direct_buffer.data[0][s];
 						}
 					}
 				}
@@ -2413,11 +2422,12 @@ void SteamAudioServer::source_set_distance_attenuation(RID source, bool enabled,
 	sd->cfg.distance_attenuation_max = max;
 }
 
-void SteamAudioServer::source_set_air_absorption(RID source, bool enabled) {
+void SteamAudioServer::source_set_air_absorption(RID source, bool enabled, const Vector3 &coefficients) {
 	SourceData *sd = source_owner.get_or_null(source);
 	if (!sd)
 		return;
 	sd->cfg.air_absorption_enabled = enabled;
+	sd->cfg.air_absorption_coefficients = coefficients;
 }
 
 void SteamAudioServer::source_set_occlusion(RID source, bool enabled, int type, float radius, int samples) {

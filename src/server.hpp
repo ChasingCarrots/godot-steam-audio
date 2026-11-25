@@ -146,6 +146,7 @@ struct SourceListenerData {
 	IPLReflectionEffect reflection_effect = nullptr;
 	IPLAmbisonicsDecodeEffect ambisonics_decode_effect = nullptr;
 	IPLAudioBuffer input_buffer{};
+	IPLAudioBuffer direct_buffer{};
 	IPLAudioBuffer output_buffer{};
 	IPLAudioBuffer ambisonics_buffer{};
 	uint8_t skip_reflection_applies = 0;
@@ -188,6 +189,7 @@ struct SourceConfig {
 	float distance_attenuation_min = 1.0f;
 	float distance_attenuation_max = 120.0f;
 	bool air_absorption_enabled = true;
+	godot::Vector3 air_absorption_coefficients = godot::Vector3(0.0002f, 0.0017f, 0.0182f);
 	bool occlusion_enabled = false;
 	int occlusion_type = IPL_OCCLUSIONTYPE_RAYCAST;
 	float occlusion_radius = 1.0f;
@@ -440,7 +442,7 @@ public:
 	void source_set_direct_enabled(godot::RID source, bool enabled);
 	void source_set_binaural(godot::RID source, bool enabled, int interpolation, float spatial_blend);
 	void source_set_distance_attenuation(godot::RID source, bool enabled, float min, float max);
-	void source_set_air_absorption(godot::RID source, bool enabled);
+	void source_set_air_absorption(godot::RID source, bool enabled, const godot::Vector3 &coefficients = godot::Vector3(0.0002f, 0.0017f, 0.0182f));
 	void source_set_occlusion(godot::RID source, bool enabled, int type, float radius, int samples);
 	void source_set_transmission(godot::RID source, bool enabled, int type, int rays);
 	void source_set_reflection(godot::RID source, bool enabled, float duration, float hybrid_delay);

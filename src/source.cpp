@@ -49,6 +49,8 @@ void SteamAudioSource::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_air_absorption_enabled"), &SteamAudioSource::get_air_absorption_enabled);
 	ClassDB::bind_method(D_METHOD("set_air_absorption_enabled", "enabled"), &SteamAudioSource::set_air_absorption_enabled);
+	ClassDB::bind_method(D_METHOD("get_air_absorption_coefficients"), &SteamAudioSource::get_air_absorption_coefficients);
+	ClassDB::bind_method(D_METHOD("set_air_absorption_coefficients", "coefficients"), &SteamAudioSource::set_air_absorption_coefficients);
 
 	ClassDB::bind_method(D_METHOD("get_distance_attenuation_enabled"), &SteamAudioSource::get_distance_attenuation_enabled);
 	ClassDB::bind_method(D_METHOD("set_distance_attenuation_enabled", "enabled"), &SteamAudioSource::set_distance_attenuation_enabled);
@@ -95,6 +97,7 @@ void SteamAudioSource::_bind_methods() {
 
 	ADD_GROUP("Air Absorption", "air_absorption_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "air_absorption_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_air_absorption_enabled", "get_air_absorption_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "air_absorption_coefficients"), "set_air_absorption_coefficients", "get_air_absorption_coefficients");
 
 	ADD_GROUP("Occlusion", "occlusion_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "occlusion_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_occlusion_enabled", "get_occlusion_enabled");
@@ -141,7 +144,7 @@ void SteamAudioSource::push_config() {
 	srv->source_set_direct_enabled(rid, direct_enabled);
 	srv->source_set_binaural(rid, binaural_enabled, binaural_interpolation, binaural_spatial_blend);
 	srv->source_set_distance_attenuation(rid, distance_attenuation_enabled, distance_attenuation_min, distance_attenuation_max);
-	srv->source_set_air_absorption(rid, air_absorption_enabled);
+	srv->source_set_air_absorption(rid, air_absorption_enabled, air_absorption_coefficients);
 	srv->source_set_occlusion(rid, occlusion_enabled, occlusion_type, occlusion_radius, occlusion_samples);
 	srv->source_set_transmission(rid, transmission_enabled, transmission_type, transmission_rays);
 	srv->source_set_reflection(rid, reflection_enabled, reflection_duration, reflection_hybrid_delay);

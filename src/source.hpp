@@ -12,6 +12,7 @@
 #include <godot_cpp/templates/local_vector.hpp>
 #include <godot_cpp/variant/rid.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
+#include <godot_cpp/variant/vector3.hpp>
 
 class SteamAudioSource : public godot::Node3D {
 	GDCLASS(SteamAudioSource, godot::Node3D);
@@ -35,6 +36,7 @@ private:
 	uint32_t layers = 1;
 
 	bool air_absorption_enabled = true;
+	godot::Vector3 air_absorption_coefficients = godot::Vector3(0.0002f, 0.0017f, 0.0182f);
 
 	bool occlusion_enabled = false;
 	int occlusion_type = IPL_OCCLUSIONTYPE_RAYCAST;
@@ -113,6 +115,8 @@ public:
 
 	bool get_air_absorption_enabled() const { return air_absorption_enabled; }
 	void set_air_absorption_enabled(bool p_enabled) { air_absorption_enabled = p_enabled; push_config(); }
+	godot::Vector3 get_air_absorption_coefficients() const { return air_absorption_coefficients; }
+	void set_air_absorption_coefficients(const godot::Vector3 &p_coefficients) { air_absorption_coefficients = p_coefficients; push_config(); }
 
 	bool get_distance_attenuation_enabled() const { return distance_attenuation_enabled; }
 	void set_distance_attenuation_enabled(bool p_enabled) { distance_attenuation_enabled = p_enabled; push_config(); }
