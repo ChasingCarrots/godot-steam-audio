@@ -116,8 +116,9 @@ static IPLMaterial ipl_material_from_floats(const PackedFloat32Array &m) {
 
 void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx) {
 	PROFILE_FUNCTION();
-	if (sld.source) {
-		iplSourceRelease(&sld.source);
+	IPLSource src = sld.source.exchange(nullptr, std::memory_order_acq_rel);
+	if (src) {
+		iplSourceRelease(&src);
 	}
 	if (sld.binaural_effect)
 		iplBinauralEffectRelease(&sld.binaural_effect);
@@ -136,7 +137,7 @@ void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx) {
 static bool create_source_listener_data(SourceListenerData &sld, SourceData *sd, ListenerData *ld, IPLContext ctx, IPLAudioSettings *audio_settings, IPLHRTF hrtf) {
 	PROFILE_FUNCTION();
 	sld.listener = ld;
-	sld.direct_simulated_once = false;
+	sld.direct_simulated_once.store(false, std::memory_order_relaxed);
 
 	IPLBinauralEffectSettings binaural_cfg{};
 	binaural_cfg.hrtf = hrtf;
@@ -159,7 +160,8 @@ static bool create_source_listener_data(SourceListenerData &sld, SourceData *sd,
 		IPLReflectionEffectSettings refl_cfg{};
 		refl_cfg.type = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
 		refl_cfg.numChannels = num_channels;
-		refl_cfg.irSize = int(sd->cfg.reflection_duration * audio_settings->samplingRate);
+		// Must match the simulator's maxDuration; OverlapSaveConvolutionEffect swaps buffers with SimulationData.
+		refl_cfg.irSize = int(ld->cfg.refl_duration * audio_settings->samplingRate);
 		handleErr(iplReflectionEffectCreate(ctx, audio_settings, &refl_cfg, &sld.reflection_effect), "SteamAudio: Failed to create reflection effect");
 
 		// hybrid reflection type doesn't support the reflection mixer, so we have to use
@@ -203,7 +205,6 @@ void SteamAudioServer::register_settings() {
 SteamAudioServer::SteamAudioServer() {
 	self = this;
 	is_running.store(false);
-	refl_thread_wait_for_commit.store(false);
 	is_refl_thread_processing.store(false);
 	new_inputs_set.store(false);
 	register_settings();
@@ -412,8 +413,10 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 		}
 	}
 	s += "source_db_levels: " + String::num_int64((int)ld->source_db_levels.size()) + "\n";
-	s += "has_simulator: " + String(ld->simulator ? "yes" : "no") + "\n";
+	s += "has_simulator: " + String(ld->simulator.load(std::memory_order_acquire) ? "yes" : "no") + "\n";
 	s += "dirty: " + String(ld->dirty ? "yes" : "no") + "\n";
+	s += "refl_thread_processing: " + String(is_refl_thread_processing.load() ? "yes" : "no") +
+			" new_inputs_set: " + String(new_inputs_set.load() ? "yes" : "no") + "\n";
 	return s;
 }
 
@@ -592,10 +595,34 @@ void SteamAudioServer::finish() {
 
 	// Drain any remaining pending ops now that threads are stopped
 	apply_pending_ops();
+	apply_pending_geom_ops();
+
+	{
+		std::lock_guard sim_lock(sim_ops_mutex);
+		for (auto &rem : pending_sim_source_removals) {
+			if (rem.simulator && rem.source) {
+				iplSourceRemove(rem.source, rem.simulator);
+			}
+			if (rem.source) {
+				iplSourceRelease(&rem.source);
+			}
+			if (rem.simulator) {
+				iplSimulatorRelease(&rem.simulator);
+			}
+		}
+		pending_sim_source_removals.clear();
+		for (auto &sim : pending_sim_releases) {
+			if (sim) {
+				iplSimulatorRelease(&sim);
+			}
+		}
+		pending_sim_releases.clear();
+	}
 
 	for (auto *ld : listeners) {
-		if (ld->simulator) {
-			iplSimulatorRelease(&ld->simulator);
+		IPLSimulator sim = ld->simulator.exchange(nullptr, std::memory_order_acq_rel);
+		if (sim) {
+			iplSimulatorRelease(&sim);
 		}
 		if (ld->reflection_mixer) {
 			iplReflectionMixerRelease(&ld->reflection_mixer);
@@ -621,10 +648,15 @@ void SteamAudioServer::finish() {
 
 	for (auto *g : geometries) {
 		if (g->dynamic) {
-			if (g->instanced_mesh)
+			if (g->instanced_mesh) {
+				iplInstancedMeshRemove(g->instanced_mesh, phonon_scene);
 				iplInstancedMeshRelease(&g->instanced_mesh);
-			for (auto &m : g->meshes)
+			}
+			for (auto &m : g->meshes) {
+				if (g->sub_scene)
+					iplStaticMeshRemove(m, g->sub_scene);
 				iplStaticMeshRelease(&m);
+			}
 			if (g->sub_scene)
 				iplSceneRelease(&g->sub_scene);
 		} else {
@@ -699,7 +731,7 @@ void SteamAudioServer::tick(float delta) {
 		// SteamAudioListener::update_sensor_slots() keep re-applying it forever.
 		ld->source_db_levels.clear();
 		ld->source_db_levels_version++;
-		if (!ld->simulator)
+		if (!ld->simulator.load(std::memory_order_acquire))
 			continue;
 
 		PROFILE_FUNCTION_NAMED("updating_source_db_levels");
@@ -711,17 +743,16 @@ void SteamAudioServer::tick(float delta) {
 					continue;
 				if (sld.out_of_range)
 					continue;
-				// No IPLSource yet (not created by the job, or creation failed) —
-				// nothing to read.
-				if (!sld.source)
+				IPLSource src = sld.source.load(std::memory_order_acquire);
+				if (!src)
 					continue;
 
 				// Simulation has now run at least once for this source/listener
 				// pair, so iplSourceGetOutputs data and cached coords are valid.
-				sld.direct_simulated_once = true;
+				sld.direct_simulated_once.store(true, std::memory_order_release);
 
 				IPLSimulationOutputs outputs{};
-				iplSourceGetOutputs(sld.source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+				iplSourceGetOutputs(src, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 
 				ListenerSourceDBLevel source_db_level;
 				source_db_level.source = sd->self;
@@ -765,28 +796,10 @@ void SteamAudioServer::tick(float delta) {
 	}
 
 	{
-		PROFILE_FUNCTION_NAMED("update_dynamic_geometry");
-		PROFILING_PLOT_NUMBER("NumSteamGeometries", (int64_t)geometries.size());
-		// Update Dynamic Geometry (only mark dirty if transform changed)
-		for (auto *g : geometries) {
-			if (!g->dynamic || !g->instanced_mesh)
-				continue;
-			if (!g->has_transform)
-				continue;
-			Transform3D trf = g->pending_transform;
-			if (!trf.is_equal_approx(g->last_trf)) {
-				IPLMatrix4x4 m = ipl_mat4_from(trf);
-				iplInstancedMeshUpdateTransform(g->instanced_mesh, phonon_scene, m);
-				g->last_trf = trf;
-				scene_dirty = true;
-			}
-		}
-	}
-
-	{
 		PROFILE_FUNCTION_NAMED("update_listeners");
 		for (auto *ld : listeners) {
-			if (!ld->simulator)
+			IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+			if (!sim && !ld->pending_simulator_create)
 				continue;
 
 			float stress_mitigation_factor = 0.1f + 0.9f * (1.0f - stress_mitigation.load());
@@ -794,7 +807,7 @@ void SteamAudioServer::tick(float delta) {
 			// Update listener transform from pushed data
 			if (ld->has_transform) {
 				Transform3D trf = ld->pending_transform;
-				if (!trf.is_equal_approx(ld->last_trf)) {
+				if (!ld->has_last_trf || !trf.is_equal_approx(ld->last_trf)) {
 					ld->cached_coords = ipl_coords_from(trf);
 
 					IPLSimulationSharedInputs shared_inputs{};
@@ -805,13 +818,18 @@ void SteamAudioServer::tick(float delta) {
 					shared_inputs.order = ld->cfg.refl_ambisonics_order;
 					shared_inputs.irradianceMinDistance = ld->cfg.irradiance_min_dist;
 
-					IPLSimulationFlags flags = IPL_SIMULATIONFLAGS_DIRECT;
-					if (ld->cfg.reflection_simulation_enabled) {
-						flags = static_cast<IPLSimulationFlags>(flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
+					if (sim) {
+						iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &shared_inputs);
+					} else {
+						ld->pending_direct_shared_inputs = shared_inputs;
+						ld->direct_shared_inputs_dirty = true;
 					}
-
-					iplSimulatorSetSharedInputs(ld->simulator, flags, &shared_inputs);
+					if (ld->cfg.reflection_simulation_enabled) {
+						ld->pending_refl_shared_inputs = shared_inputs;
+						ld->refl_shared_inputs_dirty = true;
+					}
 					ld->last_trf = trf;
+					ld->has_last_trf = true;
 				}
 			}
 
@@ -822,7 +840,6 @@ void SteamAudioServer::tick(float delta) {
 				if ((sd->cfg.layers & ld->cfg.mask) == 0)
 					continue;
 
-				// Find the SourceListenerData for this listener/source pair
 				SourceListenerData *sld = nullptr;
 				for (auto &entry : sd->listener_data) {
 					if (entry.listener == ld) {
@@ -833,23 +850,16 @@ void SteamAudioServer::tick(float delta) {
 				if (!sld)
 					continue;
 
-				// IPLSource creation is deferred to the direct-sim job (see below) —
-				// it is allocation-heavy and should not run on the main thread.
-
 				if (!sd->has_transform) {
-					// No transform pushed yet — nothing meaningful to simulate.
 					continue;
 				}
 				Transform3D src_trf = sd->pending_transform;
 				sd->cached_coords = ipl_coords_from(src_trf);
 
-				// Update dist_to_listener and doppler
 				float prev_dist_to_listener = sld->dist_to_listener;
 				sld->dist_to_listener = src_trf.origin.distance_to(ld->last_trf.origin);
 
 				float doppler_factor = sd->cfg.doppler_factor;
-				// skip the very first update (dist is 0 and doppler_pitch is 1) so that we don't get
-				// enormous speeds
 				if (doppler_factor > 0.0f && prev_dist_to_listener != 0.0f) {
 					if (delta > 0.0) {
 						float radial_speed = (sld->dist_to_listener - prev_dist_to_listener) / delta;
@@ -859,7 +869,7 @@ void SteamAudioServer::tick(float delta) {
 						if (denominator > 0.0f) {
 							sld->doppler_pitch = speed_of_sound / denominator;
 						} else {
-							sld->doppler_pitch = 4.0f; // cap when approaching/exceeding speed of sound
+							sld->doppler_pitch = 4.0f;
 						}
 						sld->doppler_pitch = CLAMP(sld->doppler_pitch, 0.25f, 4.0f);
 					}
@@ -869,33 +879,29 @@ void SteamAudioServer::tick(float delta) {
 
 				// Range check with hysteresis
 				float listener_range = ld->cfg.range;
-				// when the source doesn't have reflection enabled,
-				// we can also use the max distance of that
 				if (!sd->cfg.reflection_enabled)
 					listener_range = MIN(listener_range, sd->cfg.distance_attenuation_max);
+				IPLSource src = sld->source.load(std::memory_order_acquire);
 				if (listener_range > 0.0f) {
 					if (!sld->out_of_range && sld->dist_to_listener > listener_range * 1.1f) {
 						sld->out_of_range = true;
-						if (sld->source) {
-							iplSourceRemove(sld->source, ld->simulator);
+						if (src) {
+							sld->pending_sim_membership = SimMembershipOp::Remove;
 							ld->dirty = true;
+						} else {
+							sld->pending_create = false;
 						}
-						// No consumer bookkeeping needed: the mixing thread's mix-reset
-						// gate recomputes consumers each cycle and simply skips
-						// out_of_range pairs. (Previously this decremented
-						// sd->pending_consumers here — a cross-thread RMW race.)
 					} else if (sld->out_of_range && sld->dist_to_listener <= listener_range) {
 						sld->out_of_range = false;
-						if (sld->source) {
-							iplSourceAdd(sld->source, ld->simulator);
+						if (src) {
+							sld->pending_sim_membership = SimMembershipOp::Add;
 							ld->dirty = true;
 						}
 					}
 				} else if (sld->out_of_range) {
-					// Range was disabled, bring back in range
 					sld->out_of_range = false;
-					if (sld->source) {
-						iplSourceAdd(sld->source, ld->simulator);
+					if (src) {
+						sld->pending_sim_membership = SimMembershipOp::Add;
 						ld->dirty = true;
 					}
 				}
@@ -905,10 +911,7 @@ void SteamAudioServer::tick(float delta) {
 					continue;
 				}
 
-				// Record a deferred IPLSource creation for the direct-sim job. We
-				// only do this for in-range sources, so a source that spawns out of
-				// range never gets created until it actually comes into range.
-				if (!sld->source && !sld->pending_create) {
+				if (!src && !sld->pending_create) {
 					sld->pending_create = true;
 					sld->pending_source_settings = IPLSourceSettings{};
 					sld->pending_source_settings.flags = static_cast<IPLSimulationFlags>(
@@ -957,12 +960,16 @@ void SteamAudioServer::tick(float delta) {
 				inputs.hybridReverbOverlapPercent = 0.25f;
 				inputs.baked = IPL_FALSE;
 
-				if (sld->source) {
-					iplSourceSetInputs(sld->source, inputs.flags, &inputs);
+				if (src) {
+					if (sd->cfg.direct_enabled) {
+						iplSourceSetInputs(src, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+					}
 				} else {
-					// Source not created yet — stash the inputs so the job can apply
-					// them right after iplSourceCreate (first run is already correct).
-					sld->pending_inputs = inputs;
+					sld->pending_direct_inputs = inputs;
+				}
+				if (sd->cfg.reflection_enabled) {
+					sld->pending_refl_inputs = inputs;
+					sld->refl_inputs_dirty = true;
 				}
 				sd->last_trf = src_trf;
 			}
@@ -970,10 +977,6 @@ void SteamAudioServer::tick(float delta) {
 	}
 
 	// ── STEP 5: Submit the direct-sim job ────────────────────────────────────
-	// The job performs deferred IPLSource creation, the scene/simulator commit
-	// (coordinated with the reflection thread), iplSimulatorRunDirect, and finally
-	// wakes the reflection thread. It is fire-and-forget — the next tick's STEP 1
-	// barrier waits on it.
 	direct_task_id = WorkerThreadPool::get_singleton()->add_native_task(
 			&SteamAudioServer::run_direct_job, this, true, "SteamAudio direct sim");
 	direct_job_pending = true;
@@ -984,99 +987,166 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 	PROFILE_FUNCTION_NAMED("direct_sim_job");
 	auto job_start = std::chrono::steady_clock::now();
 
-	// Shared lock keeps the collections stable for the job's duration —
-	// apply_pending_ops() (mixing thread) unique-locks the same mutex, so it
-	// cannot add/remove sources or listeners while the job runs.
 	std::shared_lock lock(self->collections_mutex);
 
-	// 1. Deferred IPLSource creation (the old "adding_ipl_source" work, moved off
-	//    the main thread). Inputs were stashed by tick() so the first run is correct.
+	// 1. Scene/simulator mutations, commits, and reflection input writes.
+	//    Serialized against simulation_thread_func via refl_mux so no IPLScene or
+	//    IPLSimulator mutation can overlap iplSimulatorRunReflections.
+	bool wake_refl = false;
 	{
-		PROFILE_FUNCTION_NAMED("adding_ipl_source");
-		for (auto *ld : self->listeners) {
-			if (!ld->simulator)
-				continue;
-			for (auto *sd : self->sources) {
-				for (auto &sld : sd->listener_data) {
-					if (sld.listener != ld || !sld.pending_create)
-						continue;
-					if (handleErr(iplSourceCreate(ld->simulator, &sld.pending_source_settings, &sld.source), "SteamAudio: Failed to create source")) {
-						iplSourceAdd(sld.source, ld->simulator);
-						iplSourceSetInputs(sld.source, sld.pending_inputs.flags, &sld.pending_inputs);
-					}
-					sld.pending_create = false;
-				}
-			}
-		}
-	}
-
-	// 2. Commit scene + simulators, coordinated with the reflection thread.
-	//    Only commit/add conflict with a running simulation, and the reflection
-	//    thread only starts a pass once new_inputs_set is true (set in step 4) —
-	//    so during this step the reflection thread is either mid-pass (defer the
-	//    commit) or blocked (safe to commit now).
-	bool need_commit = self->scene_dirty;
-	if (!need_commit) {
-		for (auto *ld : self->listeners) {
-			if (ld->dirty) {
-				need_commit = true;
-				break;
-			}
-		}
-	}
-	if (need_commit) {
-		// Decide-and-commit under refl_mux so this is mutually exclusive with the
-		// reflection thread's transition into a pass (simulation_thread_func takes
-		// the same lock to set is_refl_thread_processing). While we hold the lock the
-		// reflection thread cannot start a pass, so observing
-		// is_refl_thread_processing == false guarantees it stays idle until we commit.
 		std::unique_lock<std::mutex> lock_refl(self->refl_mux);
-		// Hold off the reflection thread from starting a new pass until committed.
-		self->refl_thread_wait_for_commit.store(true);
 		if (!self->is_refl_thread_processing.load()) {
 			PROFILE_FUNCTION_NAMED("committing_scene_and_simulators");
+
+			self->apply_pending_geom_ops();
+
+			std::vector<PendingSimSourceRemoval> src_removals;
+			std::vector<IPLSimulator> sim_releases;
+			{
+				std::lock_guard sim_lock(self->sim_ops_mutex);
+				src_removals.swap(self->pending_sim_source_removals);
+				sim_releases.swap(self->pending_sim_releases);
+			}
+
+			for (auto &rem : src_removals) {
+				if (rem.simulator && rem.source) {
+					iplSourceRemove(rem.source, rem.simulator);
+					for (auto *ld : self->listeners) {
+						if (ld->simulator.load(std::memory_order_acquire) == rem.simulator) {
+							ld->dirty = true;
+							break;
+						}
+					}
+				}
+				if (rem.source) {
+					iplSourceRelease(&rem.source);
+				}
+				if (rem.simulator) {
+					iplSimulatorRelease(&rem.simulator);
+				}
+			}
+
+			for (auto *ld : self->listeners) {
+				if (ld->pending_simulator_create) {
+					self->create_listener_simulator(ld);
+				}
+			}
+
+			{
+				PROFILE_FUNCTION_NAMED("adding_ipl_source");
+				for (auto *ld : self->listeners) {
+					IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+					if (!sim)
+						continue;
+					for (auto *sd : self->sources) {
+						for (auto &sld : sd->listener_data) {
+							if (sld.listener != ld)
+								continue;
+							if (sld.pending_create) {
+								IPLSource created = nullptr;
+								if (handleErr(iplSourceCreate(sim, &sld.pending_source_settings, &created), "SteamAudio: Failed to create source")) {
+									iplSourceAdd(created, sim);
+									if (sd->cfg.direct_enabled) {
+										iplSourceSetInputs(created, IPL_SIMULATIONFLAGS_DIRECT, &sld.pending_direct_inputs);
+									}
+									if (sd->cfg.reflection_enabled) {
+										iplSourceSetInputs(created, IPL_SIMULATIONFLAGS_REFLECTIONS, &sld.pending_refl_inputs);
+										sld.refl_inputs_dirty = false;
+									}
+									sld.source.store(created, std::memory_order_release);
+									ld->dirty = true;
+								}
+								sld.pending_create = false;
+								sld.pending_sim_membership = SimMembershipOp::None;
+							} else if (sld.pending_sim_membership != SimMembershipOp::None) {
+								IPLSource src = sld.source.load(std::memory_order_acquire);
+								if (src) {
+									if (sld.pending_sim_membership == SimMembershipOp::Add) {
+										iplSourceAdd(src, sim);
+									} else {
+										iplSourceRemove(src, sim);
+									}
+									ld->dirty = true;
+								}
+								sld.pending_sim_membership = SimMembershipOp::None;
+							}
+						}
+					}
+				}
+			}
+
 			bool committed_scene = false;
 			if (self->scene_dirty) {
 				iplSceneCommit(self->phonon_scene);
 				self->scene_dirty = false;
 				committed_scene = true;
 			}
+
 			for (auto *ld : self->listeners) {
-				if (!ld->simulator)
+				IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+				if (!sim)
 					continue;
 				if (committed_scene || ld->dirty) {
-					iplSimulatorCommit(ld->simulator);
+					iplSimulatorCommit(sim);
 					ld->dirty = false;
 				}
 			}
-			self->refl_thread_wait_for_commit.store(false);
+
+			for (auto &sim : sim_releases) {
+				if (sim) {
+					iplSimulatorRelease(&sim);
+				}
+			}
+
+			// Apply reflection inputs only while the reflection thread is idle.
+			for (auto *ld : self->listeners) {
+				IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+				if (!sim)
+					continue;
+				if (ld->refl_shared_inputs_dirty && ld->simulator_reflection_enabled) {
+					iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_REFLECTIONS, &ld->pending_refl_shared_inputs);
+					ld->refl_shared_inputs_dirty = false;
+				}
+				if (ld->simulator_reflection_enabled) {
+					wake_refl = true;
+				}
+			}
+			for (auto *sd : self->sources) {
+				for (auto &sld : sd->listener_data) {
+					if (!sld.refl_inputs_dirty)
+						continue;
+					IPLSource src = sld.source.load(std::memory_order_acquire);
+					if (src && sd->cfg.reflection_enabled) {
+						iplSourceSetInputs(src, IPL_SIMULATIONFLAGS_REFLECTIONS, &sld.pending_refl_inputs);
+					}
+					sld.refl_inputs_dirty = false;
+				}
+			}
 		}
-		// else: reflection thread is mid-pass — leave refl_thread_wait_for_commit
-		// set and the dirty flags pending; a later job commits when it is idle.
 	}
 
-	// 3. Run the direct simulation for every simulator.
+	// 2. Run the direct simulation for every simulator.
 	{
 		PROFILE_FUNCTION_NAMED("running_direct_simulation");
 		for (auto *ld : self->listeners) {
-			if (!ld->simulator)
+			IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+			if (!sim)
 				continue;
-			iplSimulatorRunDirect(ld->simulator);
+			iplSimulatorRunDirect(sim);
 		}
 	}
 
-	// 4. Inputs are committed/ready — wake the reflection thread. Set the flag under
-	//    refl_mux so the store cannot interleave with the reflection thread's wait
-	//    predicate evaluation and lose the wake-up.
-	{
-		std::unique_lock<std::mutex> lock_refl(self->refl_mux);
-		self->new_inputs_set.store(true);
+	// 3. Wake the reflection thread only when we completed an idle commit/input update.
+	if (wake_refl) {
+		{
+			std::unique_lock<std::mutex> lock_refl(self->refl_mux);
+			self->new_inputs_set.store(true);
+		}
+		self->refl_cv.notify_one();
 	}
-	self->refl_cv.notify_one();
 
 	auto job_end = std::chrono::steady_clock::now();
 	float dur_ms = std::chrono::duration<float, std::milli>(job_end - job_start).count();
-	// Exponential moving average (alpha = 0.1)
 	float prev = self->direct_job_avg_duration_ms.load(std::memory_order_relaxed);
 	self->direct_job_avg_duration_ms.store(prev * 0.9f + dur_ms * 0.1f, std::memory_order_relaxed);
 }
@@ -1084,16 +1154,10 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 void SteamAudioServer::simulation_thread_func() {
 	LocalVector<IPLSimulator> simulators;
 	while (is_running.load()) {
-		// Wait for ready inputs and transition to "processing" atomically under
-		// refl_mux. run_direct_job() takes the same lock to decide whether it may
-		// commit (see the commit block there): because that decision and this
-		// transition share refl_mux, a commit and a reflection pass can never run
-		// concurrently on the same simulator. The long iplSimulatorRunReflections
-		// calls below run with NO lock held, preserving the non-blocking design.
 		{
 			std::unique_lock<std::mutex> lock_refl(refl_mux);
 			refl_cv.wait(lock_refl, [&] {
-				return (!refl_thread_wait_for_commit.load() && new_inputs_set.load()) || !is_running.load();
+				return new_inputs_set.load() || !is_running.load();
 			});
 
 			if (!is_running.load())
@@ -1108,15 +1172,14 @@ void SteamAudioServer::simulation_thread_func() {
 
 			PROFILE_FUNCTION_NAMED("refl_sim");
 
-			// Snapshot simulators with retain so we don't hold collections_mutex
-			// during the potentially long iplSimulatorRunReflections calls.
 			simulators.clear();
 			{
 				std::shared_lock lock(collections_mutex);
 				for (auto *ld : listeners) {
-					if (!ld->simulator || !ld->simulator_reflection_enabled)
+					IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+					if (!sim || !ld->simulator_reflection_enabled)
 						continue;
-					simulators.push_back(iplSimulatorRetain(ld->simulator));
+					simulators.push_back(iplSimulatorRetain(sim));
 				}
 			}
 
@@ -1131,12 +1194,9 @@ void SteamAudioServer::simulation_thread_func() {
 
 			auto sim_end = std::chrono::steady_clock::now();
 			float dur_ms = std::chrono::duration<float, std::milli>(sim_end - sim_start).count();
-			// Exponential moving average (alpha = 0.1)
 			float prev = sim_thread_avg_duration_ms.load(std::memory_order_relaxed);
 			sim_thread_avg_duration_ms.store(prev * 0.9f + dur_ms * 0.1f, std::memory_order_relaxed);
 
-			// Clear "processing" under refl_mux so a direct job blocked on the lock
-			// observes the cleared flag and may commit on its next pass.
 			{
 				std::unique_lock<std::mutex> lock_refl(refl_mux);
 				is_refl_thread_processing.store(false);
@@ -1222,33 +1282,10 @@ void SteamAudioServer::mixing_thread_func() {
 	}
 }
 
-void SteamAudioServer::create_listener_ipl(ListenerData *ld) {
-	ld->simulator_reflection_enabled = ld->cfg.reflection_simulation_enabled;
+void SteamAudioServer::create_listener_audio(ListenerData *ld) {
+	ld->pending_simulator_create = true;
 	ld->dirty = true;
 	ld->push_buffer.resize(cached_audio_settings.frameSize);
-
-	// Initialize Simulator for this listener
-	IPLSimulationSettings sim_cfg{};
-	sim_cfg.flags = IPL_SIMULATIONFLAGS_DIRECT;
-	if (ld->cfg.reflection_simulation_enabled) {
-		sim_cfg.flags = static_cast<IPLSimulationFlags>(sim_cfg.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
-	}
-	sim_cfg.sceneType = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
-	sim_cfg.reflectionType = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
-	sim_cfg.maxNumOcclusionSamples = get_project_int("steamaudio/max_occlusion_samples", 64);
-	sim_cfg.maxNumRays = ld->cfg.num_refl_rays;
-	sim_cfg.numDiffuseSamples = 32;
-	sim_cfg.maxDuration = ld->cfg.refl_duration;
-	sim_cfg.maxOrder = ld->cfg.refl_ambisonics_order;
-	sim_cfg.maxNumSources = 256;
-	sim_cfg.numThreads = 2;
-	sim_cfg.samplingRate = cached_audio_settings.samplingRate;
-	sim_cfg.frameSize = cached_audio_settings.frameSize;
-
-	if (handleErr(iplSimulatorCreate(phonon_context, &sim_cfg, &ld->simulator), "SteamAudio: Failed to create simulator for listener")) {
-		iplSimulatorSetScene(ld->simulator, phonon_scene);
-		iplSimulatorCommit(ld->simulator);
-	}
 
 	if (ld->cfg.reflection_simulation_enabled && ld->cfg.refl_type == IPL_REFLECTIONEFFECTTYPE_CONVOLUTION) {
 		int max_order = ld->cfg.refl_ambisonics_order;
@@ -1269,6 +1306,167 @@ void SteamAudioServer::create_listener_ipl(ListenerData *ld) {
 		iplAudioBufferAllocate(phonon_context, num_channels, cached_audio_settings.frameSize, &ld->mixed_ambisonics_buffer);
 		iplAudioBufferAllocate(phonon_context, 2, cached_audio_settings.frameSize, &ld->decode_output_buffer);
 	}
+}
+
+void SteamAudioServer::create_listener_simulator(ListenerData *ld) {
+	ld->pending_simulator_create = false;
+	ld->simulator_reflection_enabled = ld->cfg.reflection_simulation_enabled;
+
+	IPLSimulationSettings sim_cfg{};
+	sim_cfg.flags = IPL_SIMULATIONFLAGS_DIRECT;
+	if (ld->cfg.reflection_simulation_enabled) {
+		sim_cfg.flags = static_cast<IPLSimulationFlags>(sim_cfg.flags | IPL_SIMULATIONFLAGS_REFLECTIONS);
+	}
+	sim_cfg.sceneType = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+	sim_cfg.reflectionType = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
+	sim_cfg.maxNumOcclusionSamples = get_project_int("steamaudio/max_occlusion_samples", 64);
+	sim_cfg.maxNumRays = ld->cfg.num_refl_rays;
+	sim_cfg.numDiffuseSamples = 32;
+	sim_cfg.maxDuration = ld->cfg.refl_duration;
+	sim_cfg.maxOrder = ld->cfg.refl_ambisonics_order;
+	sim_cfg.maxNumSources = 256;
+	sim_cfg.numThreads = 2;
+	sim_cfg.samplingRate = cached_audio_settings.samplingRate;
+	sim_cfg.frameSize = cached_audio_settings.frameSize;
+
+	IPLSimulator sim = nullptr;
+	if (handleErr(iplSimulatorCreate(phonon_context, &sim_cfg, &sim), "SteamAudio: Failed to create simulator for listener")) {
+		iplSimulatorSetScene(sim, phonon_scene);
+		if (ld->direct_shared_inputs_dirty) {
+			iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &ld->pending_direct_shared_inputs);
+			ld->direct_shared_inputs_dirty = false;
+		}
+		ld->simulator.store(sim, std::memory_order_release);
+		ld->dirty = true;
+	}
+}
+
+void SteamAudioServer::apply_pending_geom_ops() {
+	PROFILE_FUNCTION();
+
+	std::vector<PendingGeomOp> ops;
+	{
+		std::lock_guard lock(geom_ops_mutex);
+		ops.swap(pending_geom_ops);
+	}
+
+	PROFILING_PLOT_NUMBER("NumSteamGeometries", (int64_t)geometries.size());
+	if (ops.empty())
+		return;
+
+	for (auto &op : ops) {
+		std::visit([&](auto &pending) {
+			using T = std::decay_t<decltype(pending)>;
+
+			if constexpr (std::is_same_v<T, PendingGeomCreate>) {
+				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
+				if (!g)
+					return;
+				for (auto *existing : geometries) {
+					if (existing == g)
+						return;
+				}
+				IPLMaterial mat = ipl_material_from_floats(pending.material);
+				if (pending.dynamic) {
+					IPLSceneSettings sub_scene_cfg{};
+					sub_scene_cfg.radeonRaysDevice = nullptr;
+					sub_scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+					if (sub_scene_cfg.type == IPL_SCENETYPE_EMBREE) {
+						if (embree_dev == nullptr) {
+							ERR_PRINT("SteamAudio: geometry_create_dynamic with scene_type EMBREE and uninitialized embree device.");
+							return;
+						}
+						sub_scene_cfg.embreeDevice = embree_dev;
+					}
+					if (!handleErr(iplSceneCreate(phonon_context, &sub_scene_cfg, &g->sub_scene), "SteamAudio: Failed to create sub-scene")) {
+						return;
+					}
+					IPLStaticMesh m = create_ipl_mesh_from_raw(g->sub_scene, pending.verts, pending.tris, mat);
+					if (m) {
+						g->meshes.push_back(m);
+						iplStaticMeshAdd(m, g->sub_scene);
+					}
+					iplSceneCommit(g->sub_scene);
+
+					IPLInstancedMeshSettings inst_cfg{};
+					inst_cfg.subScene = g->sub_scene;
+					inst_cfg.transform = ipl_mat4_from(Transform3D());
+					if (handleErr(iplInstancedMeshCreate(phonon_scene, &inst_cfg, &g->instanced_mesh), "SteamAudio: Failed to create instanced mesh")) {
+						iplInstancedMeshAdd(g->instanced_mesh, phonon_scene);
+					}
+				} else {
+					IPLStaticMesh m = create_ipl_mesh_from_raw(phonon_scene, pending.verts, pending.tris, mat);
+					if (m) {
+						g->meshes.push_back(m);
+						iplStaticMeshAdd(m, phonon_scene);
+					}
+				}
+				geometries.push_back(g);
+				scene_dirty = true;
+
+			} else if constexpr (std::is_same_v<T, PendingGeomTransform>) {
+				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
+				if (!g || !g->dynamic || !g->instanced_mesh)
+					return;
+				if (!g->has_last_trf || !pending.transform.is_equal_approx(g->last_trf)) {
+					IPLMatrix4x4 m = ipl_mat4_from(pending.transform);
+					iplInstancedMeshUpdateTransform(g->instanced_mesh, phonon_scene, m);
+					g->last_trf = pending.transform;
+					g->has_last_trf = true;
+					scene_dirty = true;
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingGeomMaterial>) {
+				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
+				if (!g)
+					return;
+				IPLMaterial mat = ipl_material_from_floats(pending.material);
+				IPLScene target_scene = g->dynamic ? g->sub_scene : phonon_scene;
+				if (!target_scene)
+					return;
+				for (auto &m : g->meshes) {
+					iplStaticMeshSetMaterial(m, target_scene, &mat, 0);
+				}
+				if (g->dynamic) {
+					iplSceneCommit(g->sub_scene);
+				}
+				scene_dirty = true;
+
+			} else if constexpr (std::is_same_v<T, PendingGeomRemove>) {
+				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
+				if (!g)
+					return;
+				for (uint32_t i = 0; i < geometries.size(); ++i) {
+					if (geometries[i] != g)
+						continue;
+					if (g->dynamic) {
+						for (auto &m : g->meshes) {
+							if (g->sub_scene)
+								iplStaticMeshRemove(m, g->sub_scene);
+							iplStaticMeshRelease(&m);
+						}
+						if (g->instanced_mesh) {
+							iplInstancedMeshRemove(g->instanced_mesh, phonon_scene);
+							iplInstancedMeshRelease(&g->instanced_mesh);
+						}
+						if (g->sub_scene)
+							iplSceneRelease(&g->sub_scene);
+					} else {
+						for (auto &m : g->meshes) {
+							iplStaticMeshRemove(m, phonon_scene);
+							iplStaticMeshRelease(&m);
+						}
+					}
+					geometries.remove_at(i);
+					scene_dirty = true;
+					break;
+				}
+				geometry_owner.free(g->self);
+				memdelete(g);
+			}
+		}, op);
+	}
+	PROFILING_PLOT_NUMBER("NumSteamGeometries", (int64_t)geometries.size());
 }
 
 void SteamAudioServer::apply_pending_ops() {
@@ -1321,15 +1519,17 @@ void SteamAudioServer::apply_pending_ops() {
 					if (sources[i] != sd)
 						continue;
 					for (auto &sld : sd->listener_data) {
-						// No counter fix-up needed: removing the source removes it from
-						// every listener's derived contributor scan next cycle.
-
-						// Remove source from its simulator (reuse ld loop)
-						for (auto *ld : listeners) {
-							if (ld->simulator && sld.source && sld.listener == ld) {
-								iplSourceRemove(sld.source, ld->simulator);
-								ld->dirty = true;
+						IPLSource src = sld.source.exchange(nullptr, std::memory_order_acq_rel);
+						if (src) {
+							IPLSimulator sim = nullptr;
+							for (auto *ld : listeners) {
+								if (sld.listener == ld) {
+									sim = ld->simulator.load(std::memory_order_acquire);
+									break;
+								}
 							}
+							std::lock_guard sim_lock(sim_ops_mutex);
+							pending_sim_source_removals.push_back({ sim ? iplSimulatorRetain(sim) : nullptr, src });
 						}
 						cleanup_source_listener_data(sld, phonon_context);
 					}
@@ -1348,23 +1548,16 @@ void SteamAudioServer::apply_pending_ops() {
 						return;
 				}
 
-				// Build the IPL simulator and per-listener IPL objects from cfg.
-				create_listener_ipl(ld);
+				create_listener_audio(ld);
 
 				// Create per-listener state for all existing sources
 				for (auto *sd : sources) {
 					SourceListenerData sld;
 					if (create_source_listener_data(sld, sd, ld, phonon_context, &cached_audio_settings, phonon_hrtf)) {
-						// Align the new pair with the source's current mix so it doesn't
-						// force re-consumption of a mix this listener was never present for.
 						sld.last_consumed_mix = sd->mix_generation;
 						sd->listener_data.push_back(sld);
 					}
 				}
-
-				// No contributor seeding needed: the new listener's generation (1) does
-				// not match any pair's last_contributed_generation (0), so Phase 3's
-				// derived scan treats every relevant source as a pending contributor.
 
 				listeners.push_back(ld);
 
@@ -1373,6 +1566,8 @@ void SteamAudioServer::apply_pending_ops() {
 				if (!ld)
 					return;
 
+				IPLSimulator sim = ld->simulator.exchange(nullptr, std::memory_order_acq_rel);
+
 				// Clean up per-listener state in all sources
 				for (auto *sd : sources) {
 					for (uint32_t i = 0; i < sd->listener_data.size(); ++i) {
@@ -1380,13 +1575,10 @@ void SteamAudioServer::apply_pending_ops() {
 							continue;
 						SourceListenerData &sld = sd->listener_data[i];
 
-						// No counter fix-up needed: removing this pair drops the listener
-						// from each source's derived consumer scan and removes the source
-						// from this (now-gone) listener's contributor scan automatically.
-
-						// Remove source from simulator before releasing
-						if (ld->simulator && sld.source) {
-							iplSourceRemove(sld.source, ld->simulator);
+						IPLSource src = sld.source.exchange(nullptr, std::memory_order_acq_rel);
+						if (src) {
+							std::lock_guard sim_lock(sim_ops_mutex);
+							pending_sim_source_removals.push_back({ sim ? iplSimulatorRetain(sim) : nullptr, src });
 						}
 						cleanup_source_listener_data(sld, phonon_context);
 						sd->listener_data.remove_at(i);
@@ -1394,12 +1586,14 @@ void SteamAudioServer::apply_pending_ops() {
 					}
 				}
 
+				if (sim) {
+					std::lock_guard sim_lock(sim_ops_mutex);
+					pending_sim_releases.push_back(sim);
+				}
+
 				for (uint32_t i = 0; i < listeners.size(); ++i) {
 					if (listeners[i] != ld)
 						continue;
-					if (ld->simulator) {
-						iplSimulatorRelease(&ld->simulator);
-					}
 					if (ld->reflection_mixer) {
 						iplReflectionMixerRelease(&ld->reflection_mixer);
 					}
@@ -1457,59 +1651,9 @@ void SteamAudioServer::apply_pending_ops() {
 					ld->playbacks.push_back({ pending.playback, 0, is_playback_of_source });
 				}
 				if (was_empty) {
-					// Listener was inactive — start a fresh cycle. Clearing the buffer
-					// and bumping the generation together keeps the invariant that a new
-					// generation always starts from a zeroed push_buffer; the bump makes
-					// stale last_contributed_generation values mismatch, re-arming Phase 3
-					// to re-contribute every relevant source. No counter seeding: both
-					// contributors and consumers are derived each cycle, so a pair whose
-					// last_consumed_mix lags the source's mix_generation is picked up by
-					// the mix-reset gate once the listener is active again.
 					ld->push_buffer.fill(Vector2(0, 0));
 					ld->generation++;
 				}
-
-			} else if constexpr (std::is_same_v<T, PendingAddGeometry>) {
-				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
-				if (!g)
-					return;
-				for (auto *existing : geometries) {
-					if (existing == g)
-						return;
-				}
-				geometries.push_back(g);
-				scene_dirty = true;
-
-			} else if constexpr (std::is_same_v<T, PendingRemoveGeometry>) {
-				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
-				if (!g)
-					return;
-				for (uint32_t i = 0; i < geometries.size(); ++i) {
-					if (geometries[i] != g)
-						continue;
-					if (g->dynamic) {
-						for (auto &m : g->meshes) {
-							iplStaticMeshRemove(m, g->sub_scene);
-							iplStaticMeshRelease(&m);
-						}
-						if (g->instanced_mesh) {
-							iplInstancedMeshRemove(g->instanced_mesh, phonon_scene);
-							iplInstancedMeshRelease(&g->instanced_mesh);
-						}
-						if (g->sub_scene)
-							iplSceneRelease(&g->sub_scene);
-					} else {
-						for (auto &m : g->meshes) {
-							iplStaticMeshRemove(m, phonon_scene);
-							iplStaticMeshRelease(&m);
-						}
-					}
-					geometries.remove_at(i);
-					scene_dirty = true;
-					break;
-				}
-				geometry_owner.free(g->self);
-				memdelete(g);
 			}
 		}, op);
 	}
@@ -1657,7 +1801,7 @@ void SteamAudioServer::process_audio(double dt) {
 					continue;
 				if (sld.out_of_range)
 					continue;
-				if (!sld.direct_simulated_once)
+				if (!sld.direct_simulated_once.load(std::memory_order_acquire))
 					continue;
 				ListenerData *ld = sld.listener;
 				if (ld->cfg.is_sensor)
@@ -1958,7 +2102,7 @@ void SteamAudioServer::process_audio(double dt) {
 				// Not simulated yet: has no valid audio/effects. Mark it done for this
 				// generation (and consumed) so it never blocks the round. Phase 2 also
 				// withholds its mixing, so no audio is consumed meanwhile.
-				if (!sld->direct_simulated_once) {
+				if (!sld->direct_simulated_once.load(std::memory_order_acquire)) {
 					sld->last_contributed_generation = ld->generation;
 					sld->last_consumed_mix = sd->mix_generation;
 					continue;
@@ -1987,11 +2131,13 @@ void SteamAudioServer::process_audio(double dt) {
 				// whose ring buffer is full still releases the source's mix-reset gate.)
 				sld->last_consumed_mix = sd->mix_generation;
 
+				IPLSource sld_src = sld->source.load(std::memory_order_acquire);
+
 				// Direct effects
-				if (sd->cfg.direct_enabled && sld->source && sld->direct_effect) {
+				if (sd->cfg.direct_enabled && sld_src && sld->direct_effect) {
 					PROFILE_FUNCTION_NAMED("direct effect processing")
 					IPLSimulationOutputs outputs{};
-					iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+					iplSourceGetOutputs(sld_src, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 
 					IPLDirectEffectParams direct_params = outputs.direct;
 					direct_params.flags = static_cast<IPLDirectEffectFlags>(0);
@@ -2063,10 +2209,10 @@ void SteamAudioServer::process_audio(double dt) {
 				}
 
 				// Reflections
-				if (sd->cfg.reflection_enabled && sld->source && sld->reflection_effect) {
+				if (sd->cfg.reflection_enabled && sld_src && sld->reflection_effect) {
 					PROFILE_FUNCTION_NAMED("Reflection Effect Processing");
 					IPLSimulationOutputs outputs{};
-					iplSourceGetOutputs(sld->source, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+					iplSourceGetOutputs(sld_src, IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
 
 					IPLReflectionEffectParams refl_params = outputs.reflections;
 					refl_params.type = static_cast<IPLReflectionEffectType>(ld->cfg.refl_type);
@@ -2195,12 +2341,21 @@ void SteamAudioServer::process_audio(double dt) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 RID SteamAudioServer::listener_create() {
+	return listener_create_with_config(ListenerConfig{}, "", Transform3D(), false);
+}
+
+RID SteamAudioServer::listener_create_with_config(const ListenerConfig &cfg, const String &debug_name, const Transform3D &xform, bool has_xform) {
 	ensure_initialized();
 	ERR_FAIL_COND_V_MSG(!is_running.load(), RID(), "SteamAudioServer: listener_create() failed, the server is not running.");
 	ListenerData *ld = memnew(ListenerData);
+	ld->cfg = cfg;
 	RID rid = listener_owner.make_rid(ld);
 	ld->self = rid;
-	ld->debug_name = "listener_" + String::num_uint64(rid.get_id());
+	ld->debug_name = debug_name.is_empty() ? ("listener_" + String::num_uint64(rid.get_id())) : debug_name;
+	if (has_xform) {
+		ld->pending_transform = xform;
+		ld->has_transform = true;
+	}
 	{
 		std::lock_guard lock(pending_ops_mutex);
 		pending_ops.push_back(PendingAddListener{ rid });
@@ -2345,15 +2500,24 @@ const LocalVector<ListenerSourceDBLevel> &SteamAudioServer::listener_get_source_
 // ─────────────────────────────────────────────────────────────────────────────
 
 RID SteamAudioServer::source_create() {
+	return source_create_with_config(SourceConfig{}, "", Transform3D(), false);
+}
+
+RID SteamAudioServer::source_create_with_config(const SourceConfig &cfg, const String &debug_name, const Transform3D &xform, bool has_xform) {
 	ensure_initialized();
 	ERR_FAIL_COND_V_MSG(!is_running.load(), RID(), "SteamAudioServer: source_create() failed, the server is not running.");
 	SourceData *sd = memnew(SourceData);
+	sd->cfg = cfg;
 	RID rid = source_owner.make_rid(sd);
 	sd->self = rid;
-	sd->debug_name = "source_" + String::num_uint64(rid.get_id());
+	sd->debug_name = debug_name.is_empty() ? ("source_" + String::num_uint64(rid.get_id())) : debug_name;
 	sd->mixed_frames.resize(cached_audio_settings.frameSize);
 	sd->mixed_frames.fill(Vector2(0, 0));
 	sd->volume_linear = UtilityFunctions::db_to_linear(sd->cfg.volume_db);
+	if (has_xform) {
+		sd->pending_transform = xform;
+		sd->has_transform = true;
+	}
 	{
 		std::lock_guard lock(pending_ops_mutex);
 		pending_ops.push_back(PendingAddSource{ rid });
@@ -2583,58 +2747,18 @@ RID SteamAudioServer::geometry_create_internal(const PackedVector3Array &verts, 
 		UtilityFunctions::push_error("SteamAudio: scene is not initialized");
 		return RID();
 	}
-
-	IPLMaterial mat = ipl_material_from_floats(material);
+	if (verts.is_empty() || tris.size() < 3) {
+		return RID();
+	}
 
 	GeometryData *g = memnew(GeometryData);
 	g->dynamic = dynamic;
-
-	if (dynamic) {
-		IPLSceneSettings sub_scene_cfg{};
-		sub_scene_cfg.radeonRaysDevice = nullptr;
-		sub_scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
-		if (sub_scene_cfg.type == IPL_SCENETYPE_EMBREE) {
-			if (embree_dev == nullptr) {
-				memdelete(g);
-				ERR_FAIL_V_MSG(RID(), "SteamAudio: geometry_create_dynamic with scene_type EMBREE and uninitialized embree device.");
-			}
-			sub_scene_cfg.embreeDevice = embree_dev;
-		}
-		if (!handleErr(iplSceneCreate(phonon_context, &sub_scene_cfg, &g->sub_scene), "SteamAudio: Failed to create sub-scene")) {
-			memdelete(g);
-			return RID();
-		}
-
-		IPLStaticMesh m = create_ipl_mesh_from_raw(g->sub_scene, verts, tris, mat);
-		if (m) {
-			g->meshes.push_back(m);
-			iplStaticMeshAdd(m, g->sub_scene);
-		}
-		iplSceneCommit(g->sub_scene);
-
-		IPLInstancedMeshSettings inst_cfg{};
-		inst_cfg.subScene = g->sub_scene;
-		inst_cfg.transform = ipl_mat4_from(Transform3D());
-		handleErr(iplInstancedMeshCreate(phonon_scene, &inst_cfg, &g->instanced_mesh), "SteamAudio: Failed to create instanced mesh");
-		iplInstancedMeshAdd(g->instanced_mesh, phonon_scene);
-	} else {
-		IPLStaticMesh m = create_ipl_mesh_from_raw(phonon_scene, verts, tris, mat);
-		if (m) {
-			g->meshes.push_back(m);
-			iplStaticMeshAdd(m, phonon_scene);
-		}
-		if (g->meshes.empty()) {
-			memdelete(g);
-			return RID();
-		}
-	}
-
 	RID rid = geometry_owner.make_rid(g);
 	g->self = rid;
 
 	{
-		std::lock_guard lock(pending_ops_mutex);
-		pending_ops.push_back(PendingAddGeometry{ rid });
+		std::lock_guard lock(geom_ops_mutex);
+		pending_geom_ops.push_back(PendingGeomCreate{ rid, verts, tris, material, dynamic });
 	}
 	return rid;
 }
@@ -2648,31 +2772,22 @@ RID SteamAudioServer::geometry_create_dynamic(const PackedVector3Array &verts, c
 }
 
 void SteamAudioServer::geometry_set_transform(RID geometry, const Transform3D &xform) {
-	GeometryData *g = geometry_owner.get_or_null(geometry);
-	if (!g)
+	if (!geometry.is_valid())
 		return;
-	g->pending_transform = xform;
-	g->has_transform = true;
+	std::lock_guard lock(geom_ops_mutex);
+	pending_geom_ops.push_back(PendingGeomTransform{ geometry, xform });
 }
+
 void SteamAudioServer::geometry_set_material(RID geometry, const PackedFloat32Array &material) {
-	std::unique_lock lock(collections_mutex);
-	GeometryData *g = geometry_owner.get_or_null(geometry);
-	if (!g)
+	if (!geometry.is_valid())
 		return;
-	IPLMaterial mat = ipl_material_from_floats(material);
-	IPLScene target_scene = g->dynamic ? g->sub_scene : phonon_scene;
-	if (!target_scene)
-		return;
-	for (auto &m : g->meshes) {
-		iplStaticMeshSetMaterial(m, target_scene, &mat, 0);
-	}
-	if (g->dynamic) {
-		iplSceneCommit(g->sub_scene);
-	}
-	scene_dirty = true;
+	std::lock_guard lock(geom_ops_mutex);
+	pending_geom_ops.push_back(PendingGeomMaterial{ geometry, material });
 }
 
 void SteamAudioServer::geometry_free(RID geometry) {
-	std::lock_guard lock(pending_ops_mutex);
-	pending_ops.push_back(PendingRemoveGeometry{ geometry });
+	if (!geometry.is_valid())
+		return;
+	std::lock_guard lock(geom_ops_mutex);
+	pending_geom_ops.push_back(PendingGeomRemove{ geometry });
 }

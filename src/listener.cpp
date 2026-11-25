@@ -93,10 +93,18 @@ void SteamAudioListener::ready_internal() {
 	SteamAudioServer *srv = SteamAudioServer::get_singleton();
 	if (!srv)
 		return;
-	rid = srv->listener_create();
-	srv->listener_set_debug_name(rid, get_name());
-	push_config();
-	srv->listener_set_transform(rid, get_global_transform());
+	ListenerConfig cfg;
+	cfg.mask = mask;
+	cfg.range = range;
+	cfg.is_sensor = !sensor_slots.empty();
+	cfg.reflection_simulation_enabled = reflection_simulation_enabled;
+	cfg.num_refl_rays = num_refl_rays;
+	cfg.num_refl_bounces = num_refl_bounces;
+	cfg.refl_duration = refl_duration;
+	cfg.refl_ambisonics_order = refl_ambisonics_order;
+	cfg.refl_type = refl_type;
+	cfg.irradiance_min_dist = irradiance_min_dist;
+	rid = srv->listener_create_with_config(cfg, get_name(), get_global_transform(), true);
 }
 
 void SteamAudioListener::update_sensor_slots(float delta) {

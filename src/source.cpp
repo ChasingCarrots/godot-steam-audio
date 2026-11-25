@@ -156,12 +156,35 @@ void SteamAudioSource::register_on_server() {
 	SteamAudioServer *srv = SteamAudioServer::get_singleton();
 	if (!srv)
 		return;
-	rid = srv->source_create();
+	SourceConfig cfg;
+	cfg.layers = layers;
+	cfg.volume_db = volume_db;
+	cfg.doppler_factor = doppler_factor;
+	cfg.direct_enabled = direct_enabled;
+	cfg.binaural_enabled = binaural_enabled;
+	cfg.binaural_interpolation = binaural_interpolation;
+	cfg.binaural_spatial_blend = binaural_spatial_blend;
+	cfg.distance_attenuation_enabled = distance_attenuation_enabled;
+	cfg.distance_attenuation_min = distance_attenuation_min;
+	cfg.distance_attenuation_max = distance_attenuation_max;
+	cfg.air_absorption_enabled = air_absorption_enabled;
+	cfg.air_absorption_coefficients = air_absorption_coefficients;
+	cfg.occlusion_enabled = occlusion_enabled;
+	cfg.occlusion_type = occlusion_type;
+	cfg.occlusion_radius = occlusion_radius;
+	cfg.occlusion_samples = occlusion_samples;
+	cfg.transmission_enabled = transmission_enabled;
+	cfg.transmission_type = transmission_type;
+	cfg.transmission_rays = transmission_rays;
+	cfg.reflection_enabled = reflection_enabled;
+	cfg.reflection_duration = reflection_duration;
+	cfg.reflection_hybrid_delay = reflection_hybrid_delay;
+
+	rid = srv->source_create_with_config(cfg, get_name(), get_global_transform(), true);
+	if (!rid.is_valid())
+		return;
 	rid_to_node[rid.get_id()] = this;
-	srv->source_set_debug_name(rid, get_name());
-	push_config();
 	srv->source_set_effect_stack(rid, effect_stack);
-	srv->source_set_transform(rid, get_global_transform());
 }
 
 void SteamAudioSource::unregister_from_server() {

@@ -35,6 +35,27 @@ class AudioStream;
 
 struct ListenerData;
 
+// Atomic wrapper safe inside LocalVector (which copies elements only under unique collections_mutex).
+template <typename T>
+struct RelocatableAtomic {
+	std::atomic<T> value;
+	RelocatableAtomic(T v = T{}) : value(v) {}
+	RelocatableAtomic(const RelocatableAtomic &other) : value(other.value.load(std::memory_order_relaxed)) {}
+	RelocatableAtomic &operator=(const RelocatableAtomic &other) {
+		value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		return *this;
+	}
+	T load(std::memory_order order = std::memory_order_acquire) const { return value.load(order); }
+	void store(T v, std::memory_order order = std::memory_order_release) { value.store(v, order); }
+	T exchange(T v, std::memory_order order = std::memory_order_acq_rel) { return value.exchange(v, order); }
+};
+
+enum class SimMembershipOp : uint8_t {
+	None = 0,
+	Add,
+	Remove,
+};
+
 struct ListenerPlaybackEntry {
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
 	int remaining_from_push_buffer = 0;
@@ -75,8 +96,9 @@ struct ListenerData {
 	ListenerConfig cfg;
 	godot::String debug_name;
 
-	IPLSimulator simulator = nullptr;
+	std::atomic<IPLSimulator> simulator{ nullptr };
 	bool simulator_reflection_enabled = false;
+	bool pending_simulator_create = false;
 
 	// This buffer will be filled by the pre-mixed and steam audio handled
 	// audio data from all relevant sources (additive). When all relevant sources have
@@ -115,7 +137,13 @@ struct ListenerData {
 	// Cached transform data, updated on main thread
 	IPLCoordinateSpace3 cached_coords{};
 	godot::Transform3D last_trf;
+	bool has_last_trf = false;
 	bool dirty = false;
+
+	IPLSimulationSharedInputs pending_direct_shared_inputs{};
+	bool direct_shared_inputs_dirty = false;
+	IPLSimulationSharedInputs pending_refl_shared_inputs{};
+	bool refl_shared_inputs_dirty = false;
 
 	IPLReflectionMixer reflection_mixer = nullptr;
 	IPLAmbisonicsDecodeEffect ambisonics_decode_effect = nullptr;
@@ -132,7 +160,7 @@ struct SourceListenerData {
 	float dist_to_listener = 0.0f;
 	float doppler_pitch = 1.0f;
 	bool out_of_range = false;
-	bool direct_simulated_once = false;
+	RelocatableAtomic<bool> direct_simulated_once{ false };
 	// Generation of the listener's push_buffer that this SLD last contributed to.
 	// Compared against ListenerData::generation to determine if contribution is needed.
 	uint32_t last_contributed_generation = 0;
@@ -140,7 +168,7 @@ struct SourceListenerData {
 	// SourceData::mix_generation to decide whether this listener still owes a
 	// consumption of the source's current mix (gates the source's mix-reset).
 	uint64_t last_consumed_mix = 0;
-	IPLSource source = nullptr;
+	RelocatableAtomic<IPLSource> source{ nullptr };
 	IPLBinauralEffect binaural_effect = nullptr;
 	IPLDirectEffect direct_effect = nullptr;
 	IPLReflectionEffect reflection_effect = nullptr;
@@ -151,13 +179,13 @@ struct SourceListenerData {
 	IPLAudioBuffer ambisonics_buffer{};
 	uint8_t skip_reflection_applies = 0;
 
-	// IPLSource creation is allocation-heavy, so it is deferred from tick() (main
-	// thread) to the direct-sim job. When tick() decides this pair needs a source,
-	// it records the settings and the first frame's inputs here; the job performs
-	// the actual iplSourceCreate / iplSourceAdd / iplSourceSetInputs.
+	// Deferred simulation lifecycle and reflection inputs, consumed in run_direct_job's commit phase.
 	bool pending_create = false;
+	SimMembershipOp pending_sim_membership = SimMembershipOp::None;
 	IPLSourceSettings pending_source_settings{};
-	IPLSimulationInputs pending_inputs{};
+	IPLSimulationInputs pending_direct_inputs{};
+	IPLSimulationInputs pending_refl_inputs{};
+	bool refl_inputs_dirty = false;
 
 	uint32_t debug_times_contributed = 0;
 };
@@ -252,22 +280,18 @@ struct SourceData {
 struct GeometryData {
 	godot::RID self;
 	bool dynamic = false;
-	IPLScene sub_scene = nullptr;          // dynamic only
+	IPLScene sub_scene = nullptr;              // dynamic only
 	IPLInstancedMesh instanced_mesh = nullptr; // dynamic only
 	std::vector<IPLStaticMesh> meshes;
 
-	godot::Transform3D pending_transform;  // dynamic only
-	bool has_transform = false;
-	godot::Transform3D last_trf;
+	godot::Transform3D last_trf;               // dynamic only
+	bool has_last_trf = false;
 };
 
-// Helper to clean up a SourceListenerData's IPL resources
+// Helper to clean up a SourceListenerData's audio-side IPL resources
 void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx);
 
-// Pending operation types for the commit queue (RID-keyed). The data structs
-// themselves are allocated up-front by *_create() and live in the RID owners;
-// these ops only link/unlink them into the iteration lists and build/tear down
-// the IPL cross-references.
+// Pending operation types for the mixing thread's audio-graph queue (RID-keyed).
 struct PendingAddSource {
 	godot::RID source;
 };
@@ -296,24 +320,49 @@ struct PendingAddPlaybackToListener {
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
 };
 
-struct PendingAddGeometry {
-	godot::RID geometry;
-};
-
-struct PendingRemoveGeometry {
-	godot::RID geometry;
-};
-
 using PendingOp = std::variant<
 	PendingAddSource,
 	PendingRemoveSource,
 	PendingAddListener,
 	PendingRemoveListener,
 	PendingAddPlaybackToSource,
-	PendingAddPlaybackToListener,
-	PendingAddGeometry,
-	PendingRemoveGeometry
+	PendingAddPlaybackToListener
 >;
+
+// Geometry ops drained exclusively inside run_direct_job's idle-reflection commit phase.
+struct PendingGeomCreate {
+	godot::RID geometry;
+	godot::PackedVector3Array verts;
+	godot::PackedInt32Array tris;
+	godot::PackedFloat32Array material;
+	bool dynamic;
+};
+
+struct PendingGeomTransform {
+	godot::RID geometry;
+	godot::Transform3D transform;
+};
+
+struct PendingGeomMaterial {
+	godot::RID geometry;
+	godot::PackedFloat32Array material;
+};
+
+struct PendingGeomRemove {
+	godot::RID geometry;
+};
+
+using PendingGeomOp = std::variant<
+	PendingGeomCreate,
+	PendingGeomTransform,
+	PendingGeomMaterial,
+	PendingGeomRemove
+>;
+
+struct PendingSimSourceRemoval {
+	IPLSimulator simulator = nullptr; // retained handle, released after iplSourceRemove
+	IPLSource source = nullptr;       // owned handle, released after iplSourceRemove
+};
 
 class SteamAudioServer : public godot::Object {
 	GDCLASS(SteamAudioServer, godot::Object)
@@ -356,21 +405,32 @@ private:
 	std::vector<ListenerData *> listeners;
 	godot::LocalVector<GeometryData *> geometries;
 
-	// Protects the iteration lists (sources/listeners/geometries).
+	// Protects sources and listeners (geometries is owned exclusively by the simulation commit phase).
 	// Unique-locked briefly by the mixing thread to apply pending ops.
 	// Shared-locked by tick(), process_audio() (after applying ops),
 	// simulation_thread, and debug functions.
 	std::shared_mutex collections_mutex;
 
-	// Pending operations queue: callers enqueue, mixing thread drains.
+	// Pending audio-graph operations queue: callers enqueue, mixing thread drains.
 	std::mutex pending_ops_mutex;
 	std::vector<PendingOp> pending_ops;
 	void apply_pending_ops();
 
-	// Builds the IPL simulator and per-listener IPL objects from ld->cfg.
-	void create_listener_ipl(ListenerData *ld);
+	// Pending geometry operations queue: main thread enqueues, run_direct_job commit phase drains.
+	std::mutex geom_ops_mutex;
+	std::vector<PendingGeomOp> pending_geom_ops;
+	void apply_pending_geom_ops();
 
-	std::atomic<bool> refl_thread_wait_for_commit;
+	// Deferred IPLSource/IPLSimulator teardown pushed by mixing thread, drained in run_direct_job commit phase.
+	std::mutex sim_ops_mutex;
+	std::vector<PendingSimSourceRemoval> pending_sim_source_removals;
+	std::vector<IPLSimulator> pending_sim_releases;
+
+	// Builds audio-side per-listener IPL objects (mixer/decode) from ld->cfg.
+	void create_listener_audio(ListenerData *ld);
+	// Builds the IPLSimulator for ld inside run_direct_job's commit phase.
+	void create_listener_simulator(ListenerData *ld);
+
 	std::atomic<bool> is_refl_thread_processing;
 	std::atomic<bool> new_inputs_set;
 
@@ -415,6 +475,7 @@ public:
 
 	// ── Listener RID API ─────────────────────────────────────────────────────
 	godot::RID listener_create();
+	godot::RID listener_create_with_config(const ListenerConfig &cfg, const godot::String &debug_name, const godot::Transform3D &xform, bool has_xform);
 	void listener_free(godot::RID listener);
 	void listener_set_transform(godot::RID listener, const godot::Transform3D &xform);
 	void listener_set_mask(godot::RID listener, uint32_t mask);
@@ -434,6 +495,7 @@ public:
 
 	// ── Source RID API ───────────────────────────────────────────────────────
 	godot::RID source_create();
+	godot::RID source_create_with_config(const SourceConfig &cfg, const godot::String &debug_name, const godot::Transform3D &xform, bool has_xform);
 	void source_free(godot::RID source);
 	void source_set_transform(godot::RID source, const godot::Transform3D &xform);
 	void source_set_layers(godot::RID source, uint32_t layers);
