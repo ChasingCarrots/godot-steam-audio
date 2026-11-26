@@ -5,6 +5,7 @@
 #include "listener.hpp"
 #include "material.hpp"
 #include "server.hpp"
+#include "soundfield.hpp"
 #include "source.hpp"
 #include "parameterized_audio_stream.h"
 #include "AudioStreamSteamAudioListener.h"
@@ -35,6 +36,8 @@ void init_ext(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<SteamAudioListener>();
 		ClassDB::register_class<SteamAudioListenerSensorSlot>();
 		ClassDB::register_class<SteamAudioSource>();
+		ClassDB::register_class<SteamAudioSoundfieldSector>();
+		ClassDB::register_class<SteamAudioSoundfield>();
 		ClassDB::register_class<SteamAudioMaterial>();
 		ClassDB::register_class<SteamAudioGeometry>();
 		ClassDB::register_abstract_class<ParameterCondition>();

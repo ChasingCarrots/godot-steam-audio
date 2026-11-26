@@ -10,6 +10,7 @@
 #include "godot_cpp/templates/hash_map.hpp"
 #include "godot_cpp/templates/local_vector.hpp"
 #include "godot_cpp/templates/rid_owner.hpp"
+#include "godot_cpp/variant/packed_float32_array.hpp"
 #include "godot_cpp/variant/packed_vector2_array.hpp"
 #include "godot_cpp/variant/packed_int32_array.hpp"
 #include "godot_cpp/variant/packed_vector3_array.hpp"
@@ -347,6 +348,83 @@ struct FrameData {
 // Helper to clean up a SourceListenerData's audio-side IPL resources
 void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx);
 
+static constexpr int SOUNDFIELD_PROBE_COUNT = 36;
+
+struct SoundfieldConfig {
+	std::atomic<uint32_t> layers{ 1 };
+	std::atomic<bool> enabled{ true };
+	std::atomic<float> volume_db{ 0.0f };
+	std::atomic<float> probe_distance{ 32.0f };
+	std::atomic<float> smoothing_time{ 0.18f };
+};
+
+struct SoundfieldSectorState {
+	int id = -1;
+	godot::Vector3 nominal_direction = godot::Vector3(0, 1, 0);
+	float volume_linear = 1.0f;
+	float pitch_scale = 1.0f;
+	godot::Ref<godot::AudioStreamPlayback> playback;
+	PlaybackResampleState resample_state;
+	godot::PackedFloat32Array mixed_frames;
+	int mixed_frames_ready = 0;
+};
+
+struct SoundfieldListenerSectorDSP {
+	int id = -1;
+	IPLDirectEffect direct_effect = nullptr;
+	IPLBinauralEffect binaural_effect = nullptr;
+	IPLAudioBuffer input_buffer{};
+	IPLAudioBuffer direct_buffer{};
+	IPLAudioBuffer output_buffer{};
+
+	float target_occlusion = 0.0f;
+	float target_transmission[3] = { 0.2f, 0.05f, 0.015f };
+	float last_occluded_transmission[3] = { 0.2f, 0.05f, 0.015f };
+	godot::Vector3 target_direction = godot::Vector3(0, 1, 0);
+
+	float smoothed_occlusion = 0.0f;
+	float smoothed_transmission[3] = { 0.2f, 0.05f, 0.015f };
+	godot::Vector3 smoothed_direction = godot::Vector3(0, 1, 0);
+	bool has_smoothed = false;
+};
+
+struct SoundfieldListenerData {
+	ListenerData *listener = nullptr;
+	uint32_t last_contributed_generation = 0;
+	uint64_t last_consumed_mix = 0;
+	std::atomic<bool> probed_once{ false };
+
+	// Direct-only Embree sky probe sources owned by listener->simulator.
+	IPLSource probe_sources[SOUNDFIELD_PROBE_COUNT]{};
+	bool probes_created = false;
+	bool probes_pending_create = false;
+	bool probes_attached = false;
+	bool probes_in_sim = false;
+	SimMembershipOp pending_probe_membership = SimMembershipOp::None;
+	IPLSimulationInputs pending_probe_inputs[SOUNDFIELD_PROBE_COUNT]{};
+	IPLSimulationInputs pending_switch_probe_inputs[SOUNDFIELD_PROBE_COUNT]{};
+	bool has_pending_switch_probe_inputs = false;
+
+	bool dsp_ready = false;
+	std::vector<SoundfieldListenerSectorDSP> sector_dsp;
+
+	std::mutex sim_state_mutex;
+	float last_outdoorness = 0.0f;
+	float last_output_rms_left = 0.0f;
+	float last_output_rms_right = 0.0f;
+};
+
+struct SoundfieldData {
+	godot::RID self;
+	SoundfieldConfig cfg;
+	godot::String debug_name;
+	std::atomic<float> volume_linear{ 1.0f };
+	uint64_t mix_generation = 0;
+	bool mixed_ready = false;
+	std::vector<SoundfieldSectorState> sectors;
+	std::vector<std::unique_ptr<SoundfieldListenerData>> listener_data;
+};
+
 // Pending operation types for the mixing thread's audio-graph queue (RID-keyed).
 struct PendingAddSource {
 	godot::RID source;
@@ -376,13 +454,65 @@ struct PendingAddPlaybackToListener {
 	godot::Ref<AudioStreamSteamAudioListenerPlayback> playback;
 };
 
+struct PendingAddSoundfield {
+	godot::RID soundfield;
+};
+
+struct PendingRemoveSoundfield {
+	godot::RID soundfield;
+};
+
+struct PendingSoundfieldAddSector {
+	godot::RID soundfield;
+	int sector_id = -1;
+	godot::Vector3 direction;
+	godot::Ref<godot::AudioStreamPlayback> playback;
+	float volume_linear = 1.0f;
+	float pitch_scale = 1.0f;
+};
+
+struct PendingSoundfieldRemoveSector {
+	godot::RID soundfield;
+	int sector_id = -1;
+};
+
+struct PendingSoundfieldClearSectors {
+	godot::RID soundfield;
+};
+
+struct PendingSoundfieldSectorVolume {
+	godot::RID soundfield;
+	int sector_id = -1;
+	float volume_linear = 1.0f;
+};
+
+struct PendingSoundfieldSectorPitch {
+	godot::RID soundfield;
+	int sector_id = -1;
+	float pitch_scale = 1.0f;
+};
+
+struct PendingSoundfieldSectorDirection {
+	godot::RID soundfield;
+	int sector_id = -1;
+	godot::Vector3 direction;
+};
+
 using PendingOp = std::variant<
 	PendingAddSource,
 	PendingRemoveSource,
 	PendingAddListener,
 	PendingRemoveListener,
 	PendingAddPlaybackToSource,
-	PendingAddPlaybackToListener
+	PendingAddPlaybackToListener,
+	PendingAddSoundfield,
+	PendingRemoveSoundfield,
+	PendingSoundfieldAddSector,
+	PendingSoundfieldRemoveSector,
+	PendingSoundfieldClearSectors,
+	PendingSoundfieldSectorVolume,
+	PendingSoundfieldSectorPitch,
+	PendingSoundfieldSectorDirection
 >;
 
 // Geometry and frame ops drained exclusively inside run_direct_job's idle-reflection commit phase.
@@ -482,11 +612,17 @@ private:
 	godot::RID_PtrOwner<ListenerData, true> listener_owner;
 	godot::RID_PtrOwner<GeometryData, true> geometry_owner;
 	godot::RID_PtrOwner<FrameData, true> frame_owner;
+	godot::RID_PtrOwner<SoundfieldData, true> soundfield_owner;
 
 	godot::LocalVector<SourceData *> sources;
 	std::vector<ListenerData *> listeners;
 	godot::LocalVector<GeometryData *> geometries;
 	godot::LocalVector<FrameData *> frames;
+	godot::LocalVector<SoundfieldData *> soundfields;
+
+	// Precomputed hemisphere probe directions for soundfield occlusion/transmission probing.
+	godot::Vector3 sky_probe_dirs[SOUNDFIELD_PROBE_COUNT];
+	std::atomic<int> next_soundfield_sector_id{ 1 };
 
 	// Protects sources and listeners (geometries is owned exclusively by the simulation commit phase).
 	// Unique-locked briefly by the mixing thread to apply pending ops.
@@ -513,6 +649,14 @@ private:
 	void create_listener_audio(ListenerData *ld);
 	// Builds the IPLSimulator for ld inside run_direct_job's commit phase.
 	void create_listener_simulator(ListenerData *ld);
+	// Soundfield DSP helpers (called on mix thread / finish()).
+	std::unique_ptr<SoundfieldListenerData> create_soundfield_listener_data(SoundfieldData *sf, ListenerData *ld);
+	SoundfieldListenerSectorDSP *find_soundfield_sector_dsp(SoundfieldListenerData &sfld, int sector_id);
+	bool ensure_soundfield_sector_dsp(SoundfieldListenerSectorDSP &dsp);
+	void cleanup_soundfield_sector_dsp(SoundfieldListenerSectorDSP &dsp);
+	void release_soundfield_listener_dsp(SoundfieldListenerData &sfld);
+	void cleanup_soundfield_listener_data(SoundfieldListenerData &sfld);
+
 	// Scene / two-level instance helpers (called only in init / run_direct_job commit phase).
 	IPLScene create_ipl_scene();
 	FrameData *find_sim_frame(godot::RID frame_rid);
@@ -538,6 +682,7 @@ private:
 	bool scene_dirty = false;
 
 	godot::Ref<godot::AudioBuffer> mix_scratch_buffer;
+	godot::PackedVector2Array soundfield_mix_scratch;
 	godot::Ref<godot::AudioBuffer> effect_src_buffer;
 	godot::Ref<godot::AudioBuffer> effect_dst_buffer;
 
@@ -636,6 +781,23 @@ public:
 	bool frame_is_moving(godot::RID frame);
 	void frame_free(godot::RID frame);
 
+	// ── Soundfield RID API ───────────────────────────────────────────────────
+	godot::RID soundfield_create();
+	void soundfield_free(godot::RID soundfield);
+	void soundfield_set_layers(godot::RID soundfield, uint32_t layers);
+	void soundfield_set_enabled(godot::RID soundfield, bool enabled);
+	void soundfield_set_volume_db(godot::RID soundfield, float volume_db);
+	void soundfield_set_probe_distance(godot::RID soundfield, float distance);
+	void soundfield_set_smoothing_time(godot::RID soundfield, float seconds);
+	void soundfield_set_debug_name(godot::RID soundfield, const godot::String &name);
+	int soundfield_add_sector(godot::RID soundfield, const godot::Vector3 &direction, godot::Ref<godot::AudioStreamPlayback> playback, float volume_db = 0.0f, float pitch_scale = 1.0f, float from_position = 0.0f);
+	void soundfield_remove_sector(godot::RID soundfield, int sector_id);
+	void soundfield_set_sector_volume_db(godot::RID soundfield, int sector_id, float volume_db);
+	void soundfield_set_sector_pitch_scale(godot::RID soundfield, int sector_id, float pitch_scale);
+	void soundfield_set_sector_direction(godot::RID soundfield, int sector_id, const godot::Vector3 &direction);
+	void soundfield_clear_sectors(godot::RID soundfield);
+	godot::Dictionary soundfield_get_debug_state(godot::RID soundfield, godot::RID listener);
+
 	// Audio pulling and effect application. dt is the wall-clock time (seconds) since
 	// the previous process_audio cycle, used to pace sensor-only source mixing.
 	void process_audio(double dt);
@@ -666,10 +828,13 @@ public:
 	int get_listener_count();
 	int get_geometry_count();
 	int get_frame_count();
+	int get_soundfield_count();
 	godot::String get_source_name(int index);
 	godot::String get_listener_name(int index);
+	godot::String get_soundfield_name(int index);
 	godot::String get_source_debug_string(int index);
 	godot::String get_listener_debug_string(int index);
+	godot::String get_soundfield_debug_string(int index);
 
 private:
 	// Internal RID creation shared by static, dynamic, and batched multi-material geometry.

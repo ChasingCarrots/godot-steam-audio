@@ -305,6 +305,23 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("frame_is_moving", "frame"), &SteamAudioServer::frame_is_moving);
 	ClassDB::bind_method(D_METHOD("frame_free", "frame"), &SteamAudioServer::frame_free);
 
+	// Soundfield RID API
+	ClassDB::bind_method(D_METHOD("soundfield_create"), &SteamAudioServer::soundfield_create);
+	ClassDB::bind_method(D_METHOD("soundfield_free", "soundfield"), &SteamAudioServer::soundfield_free);
+	ClassDB::bind_method(D_METHOD("soundfield_set_layers", "soundfield", "layers"), &SteamAudioServer::soundfield_set_layers);
+	ClassDB::bind_method(D_METHOD("soundfield_set_enabled", "soundfield", "enabled"), &SteamAudioServer::soundfield_set_enabled);
+	ClassDB::bind_method(D_METHOD("soundfield_set_volume_db", "soundfield", "volume_db"), &SteamAudioServer::soundfield_set_volume_db);
+	ClassDB::bind_method(D_METHOD("soundfield_set_probe_distance", "soundfield", "distance"), &SteamAudioServer::soundfield_set_probe_distance);
+	ClassDB::bind_method(D_METHOD("soundfield_set_smoothing_time", "soundfield", "seconds"), &SteamAudioServer::soundfield_set_smoothing_time);
+	ClassDB::bind_method(D_METHOD("soundfield_set_debug_name", "soundfield", "name"), &SteamAudioServer::soundfield_set_debug_name);
+	ClassDB::bind_method(D_METHOD("soundfield_add_sector", "soundfield", "direction", "playback", "volume_db", "pitch_scale", "from_position"), &SteamAudioServer::soundfield_add_sector, DEFVAL(0.0f), DEFVAL(1.0f), DEFVAL(0.0f));
+	ClassDB::bind_method(D_METHOD("soundfield_remove_sector", "soundfield", "sector_id"), &SteamAudioServer::soundfield_remove_sector);
+	ClassDB::bind_method(D_METHOD("soundfield_set_sector_volume_db", "soundfield", "sector_id", "volume_db"), &SteamAudioServer::soundfield_set_sector_volume_db);
+	ClassDB::bind_method(D_METHOD("soundfield_set_sector_pitch_scale", "soundfield", "sector_id", "pitch_scale"), &SteamAudioServer::soundfield_set_sector_pitch_scale);
+	ClassDB::bind_method(D_METHOD("soundfield_set_sector_direction", "soundfield", "sector_id", "direction"), &SteamAudioServer::soundfield_set_sector_direction);
+	ClassDB::bind_method(D_METHOD("soundfield_clear_sectors", "soundfield"), &SteamAudioServer::soundfield_clear_sectors);
+	ClassDB::bind_method(D_METHOD("soundfield_get_debug_state", "soundfield", "listener"), &SteamAudioServer::soundfield_get_debug_state);
+
 	ClassDB::bind_method(D_METHOD("get_mixing_thread_usage_pct"), &SteamAudioServer::get_mixing_thread_usage_pct);
 	ClassDB::bind_method(D_METHOD("get_stress_mitigation"), &SteamAudioServer::get_stress_mitigation);
 	ClassDB::bind_method(D_METHOD("get_sim_thread_avg_duration_ms"), &SteamAudioServer::get_sim_thread_avg_duration_ms);
@@ -317,10 +334,13 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_listener_count"), &SteamAudioServer::get_listener_count);
 	ClassDB::bind_method(D_METHOD("get_geometry_count"), &SteamAudioServer::get_geometry_count);
 	ClassDB::bind_method(D_METHOD("get_frame_count"), &SteamAudioServer::get_frame_count);
+	ClassDB::bind_method(D_METHOD("get_soundfield_count"), &SteamAudioServer::get_soundfield_count);
 	ClassDB::bind_method(D_METHOD("get_source_name", "index"), &SteamAudioServer::get_source_name);
 	ClassDB::bind_method(D_METHOD("get_listener_name", "index"), &SteamAudioServer::get_listener_name);
+	ClassDB::bind_method(D_METHOD("get_soundfield_name", "index"), &SteamAudioServer::get_soundfield_name);
 	ClassDB::bind_method(D_METHOD("get_source_debug_string", "index"), &SteamAudioServer::get_source_debug_string);
 	ClassDB::bind_method(D_METHOD("get_listener_debug_string", "index"), &SteamAudioServer::get_listener_debug_string);
+	ClassDB::bind_method(D_METHOD("get_soundfield_debug_string", "index"), &SteamAudioServer::get_soundfield_debug_string);
 }
 
 float SteamAudioServer::get_mixing_thread_usage_pct() const {
@@ -357,6 +377,11 @@ int SteamAudioServer::get_frame_count() {
 	return (int)frame_owner.get_rid_count();
 }
 
+int SteamAudioServer::get_soundfield_count() {
+	std::shared_lock lock(collections_mutex);
+	return (int)soundfields.size();
+}
+
 String SteamAudioServer::get_source_name(int index) {
 	std::shared_lock lock(collections_mutex);
 	if (index < 0 || index >= (int)sources.size())
@@ -369,6 +394,13 @@ String SteamAudioServer::get_listener_name(int index) {
 	if (index < 0 || index >= (int)listeners.size())
 		return "";
 	return listeners[index]->debug_name;
+}
+
+String SteamAudioServer::get_soundfield_name(int index) {
+	std::shared_lock lock(collections_mutex);
+	if (index < 0 || index >= (int)soundfields.size())
+		return "";
+	return soundfields[index]->debug_name;
 }
 
 String SteamAudioServer::get_source_debug_string(int index) {
@@ -459,6 +491,54 @@ String SteamAudioServer::get_listener_debug_string(int index) {
 	s += "dirty: " + String(ld->dirty ? "yes" : "no") + "\n";
 	s += "refl_thread_processing: " + String(is_refl_thread_processing.load() ? "yes" : "no") +
 			" new_inputs_set: " + String(new_inputs_set.load() ? "yes" : "no") + "\n";
+	return s;
+}
+
+String SteamAudioServer::get_soundfield_debug_string(int index) {
+	std::shared_lock lock(collections_mutex);
+	if (index < 0 || index >= (int)soundfields.size())
+		return "";
+	SoundfieldData *sf = soundfields[index];
+
+	String s;
+	s += "name: " + sf->debug_name + "\n";
+	s += "enabled: " + String(sf->cfg.enabled.load(std::memory_order_relaxed) ? "yes\n" : "no\n");
+	s += "layers: " + String::num_uint64(sf->cfg.layers.load(std::memory_order_relaxed)) + "\n";
+	s += "volume_db: " + String::num(sf->cfg.volume_db.load(std::memory_order_relaxed), 2) + "\n";
+	s += "probe_distance: " + String::num(sf->cfg.probe_distance.load(std::memory_order_relaxed), 2) + "\n";
+	s += "smoothing_time: " + String::num(sf->cfg.smoothing_time.load(std::memory_order_relaxed), 3) + "\n";
+	s += "mix_generation: " + String::num_int64((int64_t)sf->mix_generation) + "\n";
+	s += "sectors: " + String::num_int64((int64_t)sf->sectors.size()) + "\n";
+	for (size_t i = 0; i < sf->sectors.size(); ++i) {
+		const auto &sec = sf->sectors[i];
+		s += "  sec[" + String::num_int64((int64_t)i) + "] id=" + String::num_int64(sec.id);
+		s += " dir=(" + String::num(sec.nominal_direction.x, 2) + "," + String::num(sec.nominal_direction.y, 2) + "," + String::num(sec.nominal_direction.z, 2) + ")";
+		s += " playing=" + String((sec.playback.is_valid() && sec.playback->is_playing()) ? "yes" : "no");
+		s += " vol=" + String::num(sec.volume_linear, 3);
+		s += " pitch=" + String::num(sec.pitch_scale, 3) + "\n";
+	}
+	s += "listener_data: " + String::num_int64((int64_t)sf->listener_data.size()) + "\n";
+	for (size_t i = 0; i < sf->listener_data.size(); ++i) {
+		auto &sfld_ptr = sf->listener_data[i];
+		if (!sfld_ptr)
+			continue;
+		auto &sfld = *sfld_ptr;
+		String lname = sfld.listener ? sfld.listener->debug_name : "<null>";
+		std::lock_guard<std::mutex> st_lock(sfld.sim_state_mutex);
+		s += "  sfld[" + String::num_int64((int64_t)i) + "] listener=" + lname;
+		s += " probed_once=" + String(sfld.probed_once.load(std::memory_order_acquire) ? "yes" : "no");
+		s += " probes_attached=" + String(sfld.probes_attached ? "yes" : "no");
+		s += " dsp_ready=" + String(sfld.dsp_ready ? "yes" : "no");
+		s += " outdoorness=" + String::num(sfld.last_outdoorness, 3);
+		s += " rms=(" + String::num(sfld.last_output_rms_left, 4) + "," + String::num(sfld.last_output_rms_right, 4) + ")\n";
+		for (const auto &dsp : sfld.sector_dsp) {
+			s += "    dsp id=" + String::num_int64(dsp.id);
+			s += " open=" + String::num(dsp.target_occlusion, 3);
+			s += " smooth_open=" + String::num(dsp.smoothed_occlusion, 3);
+			s += " trans=(" + String::num(dsp.target_transmission[0], 3) + "," + String::num(dsp.target_transmission[1], 3) + "," + String::num(dsp.target_transmission[2], 3) + ")";
+			s += " dir=(" + String::num(dsp.target_direction.x, 2) + "," + String::num(dsp.target_direction.y, 2) + "," + String::num(dsp.target_direction.z, 2) + ")\n";
+		}
+	}
 	return s;
 }
 
@@ -813,6 +893,17 @@ void SteamAudioServer::init() {
 		phonon_hrtf = nullptr;
 	}
 
+	// Fibonacci hemisphere covering +0.04 through +0.98 elevation to avoid ground/floor hits.
+	constexpr double kPi = 3.14159265358979323846;
+	const double golden_angle = kPi * (3.0 - std::sqrt(5.0));
+	for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+		double t = (static_cast<double>(i) + 0.5) / static_cast<double>(SOUNDFIELD_PROBE_COUNT);
+		double y = 0.04 + t * 0.94;
+		double r = std::sqrt(MAX(0.0, 1.0 - y * y));
+		double theta = golden_angle * static_cast<double>(i);
+		sky_probe_dirs[i] = Vector3(static_cast<float>(std::cos(theta) * r), static_cast<float>(y), static_cast<float>(std::sin(theta) * r)).normalized();
+	}
+
 	is_running.store(true);
 
 	simulation_thread.instantiate();
@@ -896,6 +987,24 @@ void SteamAudioServer::finish() {
 		memdelete(sd);
 	}
 	sources.clear();
+
+	for (auto *sf : soundfields) {
+		for (auto &sfld_ptr : sf->listener_data) {
+			if (sfld_ptr) {
+				for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+					if (sfld_ptr->probe_sources[i]) {
+						iplSourceRelease(&sfld_ptr->probe_sources[i]);
+					}
+				}
+				cleanup_soundfield_listener_data(*sfld_ptr);
+			}
+		}
+		sf->listener_data.clear();
+		sf->sectors.clear();
+		soundfield_owner.free(sf->self);
+		memdelete(sf);
+	}
+	soundfields.clear();
 
 	for (auto *f : frames) {
 		for (auto &kv : f->instances) {
@@ -1073,6 +1182,114 @@ void SteamAudioServer::tick(float delta) {
 				float final_db_level = source_db_level.db_level + 20.0f * Math::log(MAX(total_direct_factor, 1e-10f)) / Math::log(10.0f);
 				source_db_level.db_level = final_db_level;
 				ld->source_db_levels.push_back(source_db_level);
+			}
+		}
+
+		// Read Embree hemisphere sky probe outputs for active soundfields.
+		{
+			PROFILE_FUNCTION_NAMED("soundfield_probe_readout");
+			for (auto *sf : soundfields) {
+				if (!sf->cfg.enabled.load(std::memory_order_relaxed) || sf->sectors.empty() ||
+						(sf->cfg.layers.load(std::memory_order_relaxed) & ld->cfg.mask) == 0 || ld->cfg.is_sensor)
+					continue;
+				for (auto &sfld_ptr : sf->listener_data) {
+					if (!sfld_ptr || sfld_ptr->listener != ld || !sfld_ptr->probes_created ||
+							!sfld_ptr->probes_attached || sfld_ptr->pending_probe_membership != SimMembershipOp::None)
+						continue;
+					SoundfieldListenerData &sfld = *sfld_ptr;
+
+					float probe_occ[SOUNDFIELD_PROBE_COUNT];
+					float probe_trans[SOUNDFIELD_PROBE_COUNT][3];
+					float open_sum = 0.0f;
+					int valid_probes = 0;
+
+					for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+						IPLSource psrc = sfld.probe_sources[i];
+						if (!psrc) {
+							probe_occ[i] = 1.0f;
+							probe_trans[i][0] = probe_trans[i][1] = probe_trans[i][2] = 1.0f;
+							continue;
+						}
+						IPLSimulationOutputs outputs{};
+						iplSourceGetOutputs(psrc, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+						probe_occ[i] = outputs.direct.occlusion;
+						for (int b = 0; b < 3; ++b) {
+							probe_trans[i][b] = outputs.direct.transmission[b];
+						}
+						open_sum += probe_occ[i];
+						valid_probes++;
+					}
+
+					if (valid_probes > 0) {
+						std::lock_guard<std::mutex> st_lock(sfld.sim_state_mutex);
+						sfld.last_outdoorness = open_sum / static_cast<float>(valid_probes);
+						for (const auto &sec : sf->sectors) {
+							SoundfieldListenerSectorDSP *dsp = find_soundfield_sector_dsp(sfld, sec.id);
+							if (!dsp)
+								continue;
+							const Vector3 nom = sec.nominal_direction;
+							float w_total = 0.0f;
+							float w_open = 0.0f;
+							float w_closed = 0.0f;
+							float w_trans_valid = 0.0f;
+							float trans_acc[3] = { 0.0f, 0.0f, 0.0f };
+							Vector3 open_dir_acc(0.0f, 0.0f, 0.0f);
+
+							for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+								float d = sky_probe_dirs[i].dot(nom);
+								if (d <= 0.0f)
+									continue;
+								float w = d * d;
+								w_total += w;
+								float occ = CLAMP(probe_occ[i], 0.0f, 1.0f);
+								float w_o = w * occ;
+								float w_c = w * (1.0f - occ);
+								w_open += w_o;
+								w_closed += w_c;
+								open_dir_acc += sky_probe_dirs[i] * w_o;
+								// Volumetric transmission traces the center ray only; ignore {1,1,1} from an unoccluded center ray.
+								bool center_unoccluded = (probe_trans[i][0] >= 0.999f && probe_trans[i][1] >= 0.999f && probe_trans[i][2] >= 0.999f);
+								if (w_c > 1e-6f && !center_unoccluded) {
+									w_trans_valid += w_c;
+									for (int b = 0; b < 3; ++b) {
+										trans_acc[b] += probe_trans[i][b] * w_c;
+									}
+								}
+							}
+
+							float openness = (w_total > 1e-6f) ? (w_open / w_total) : 1.0f;
+							dsp->target_occlusion = openness;
+							if (w_trans_valid > 1e-6f) {
+								for (int b = 0; b < 3; ++b) {
+									float t = trans_acc[b] / w_trans_valid;
+									dsp->target_transmission[b] = t;
+									dsp->last_occluded_transmission[b] = t;
+								}
+							} else if (w_closed > 1e-6f) {
+								for (int b = 0; b < 3; ++b) {
+									dsp->target_transmission[b] = dsp->last_occluded_transmission[b];
+								}
+							} else {
+								dsp->target_transmission[0] = dsp->target_transmission[1] = dsp->target_transmission[2] = 1.0f;
+							}
+
+							Vector3 dir = nom;
+							if (w_open > 1e-6f && openness < 0.99f && open_dir_acc.length_squared() > 1e-6f) {
+								Vector3 esc_dir = open_dir_acc.normalized();
+								float avg_trans = (dsp->target_transmission[0] + dsp->target_transmission[1] + dsp->target_transmission[2]) / 3.0f;
+								float trans_energy = (1.0f - openness) * avg_trans;
+								float open_share = openness / MAX(openness + trans_energy, 1e-4f);
+								float pull = open_share * CLAMP(1.0f - openness, 0.0f, 1.0f) * 0.85f;
+								Vector3 blended = nom.lerp(esc_dir, pull);
+								if (blended.length_squared() > 1e-6f) {
+									dir = blended.normalized();
+								}
+							}
+							dsp->target_direction = dir;
+						}
+						sfld.probed_once.store(true, std::memory_order_release);
+					}
+				}
 			}
 		}
 	}
@@ -1297,6 +1514,81 @@ void SteamAudioServer::tick(float delta) {
 				}
 				sd->last_trf = src_trf;
 			}
+
+			// Update Embree sky probe inputs for active soundfields on this listener.
+			{
+				PROFILE_FUNCTION_NAMED("soundfield_probe_update");
+				for (auto *sf : soundfields) {
+					SoundfieldListenerData *sfld = nullptr;
+					for (auto &entry : sf->listener_data) {
+						if (entry && entry->listener == ld) {
+							sfld = entry.get();
+							break;
+						}
+					}
+					if (!sfld)
+						continue;
+
+					const bool active = sf->cfg.enabled.load(std::memory_order_relaxed) &&
+							!sf->sectors.empty() &&
+							(sf->cfg.layers.load(std::memory_order_relaxed) & ld->cfg.mask) != 0 &&
+							!ld->cfg.is_sensor;
+
+					if (!active) {
+						if (sfld->probes_created && sfld->probes_attached) {
+							sfld->pending_probe_membership = SimMembershipOp::Remove;
+							sfld->probes_attached = false;
+							sfld->probed_once.store(false, std::memory_order_release);
+							ld->dirty = true;
+						} else if (!sfld->probes_created && sfld->probes_pending_create) {
+							sfld->probes_pending_create = false;
+						}
+						continue;
+					}
+
+					if (!sfld->probes_created && !sfld->probes_pending_create) {
+						sfld->probes_pending_create = true;
+						ld->dirty = true;
+					} else if (sfld->probes_created && !sfld->probes_attached) {
+						sfld->pending_probe_membership = SimMembershipOp::Add;
+						sfld->probes_attached = true;
+						ld->dirty = true;
+					}
+
+					const float probe_dist = MAX(1.0f, sf->cfg.probe_distance.load(std::memory_order_relaxed));
+					for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+						Vector3 probe_world_pos = listener_world_trf.origin + sky_probe_dirs[i] * probe_dist;
+						Vector3 active_pos = active_sim_from_world.xform(probe_world_pos);
+						Vector3 target_pos = target_sim_from_world.xform(probe_world_pos);
+
+						IPLSimulationInputs inputs{};
+						inputs.flags = IPL_SIMULATIONFLAGS_DIRECT;
+						inputs.directFlags = static_cast<IPLDirectSimulationFlags>(IPL_DIRECTSIMULATIONFLAGS_OCCLUSION | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+						inputs.source = ipl_coords_from(Transform3D(Basis(), active_pos));
+						inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
+						inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
+						inputs.occlusionRadius = probe_dist * 0.10f;
+						inputs.numOcclusionSamples = 4;
+						inputs.numTransmissionRays = 2;
+						inputs.baked = IPL_FALSE;
+
+						IPLSimulationInputs target_inputs = inputs;
+						target_inputs.source = ipl_coords_from(Transform3D(Basis(), target_pos));
+
+						if (sfld->probes_created && sfld->probe_sources[i]) {
+							iplSourceSetInputs(sfld->probe_sources[i], IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+						} else {
+							sfld->pending_probe_inputs[i] = target_inputs;
+						}
+						if (frame_switching) {
+							sfld->pending_switch_probe_inputs[i] = target_inputs;
+						}
+					}
+					if (frame_switching) {
+						sfld->has_pending_switch_probe_inputs = true;
+					}
+				}
+			}
 		}
 	}
 
@@ -1380,6 +1672,20 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 									sld.has_pending_switch_direct_inputs = false;
 								}
 							}
+							for (auto *sf : self->soundfields) {
+								for (auto &sfld_ptr : sf->listener_data) {
+									if (!sfld_ptr || sfld_ptr->listener != ld || !sfld_ptr->has_pending_switch_probe_inputs)
+										continue;
+									if (sfld_ptr->probes_created) {
+										for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+											if (sfld_ptr->probe_sources[i]) {
+												iplSourceSetInputs(sfld_ptr->probe_sources[i], IPL_SIMULATIONFLAGS_DIRECT, &sfld_ptr->pending_switch_probe_inputs[i]);
+											}
+										}
+									}
+									sfld_ptr->has_pending_switch_probe_inputs = false;
+								}
+							}
 						}
 					}
 				}
@@ -1422,6 +1728,56 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 									ld->dirty = true;
 								}
 								sld.pending_sim_membership = SimMembershipOp::None;
+							}
+						}
+					}
+					for (auto *sf : self->soundfields) {
+						for (auto &sfld_ptr : sf->listener_data) {
+							if (!sfld_ptr || sfld_ptr->listener != ld)
+								continue;
+							if (sfld_ptr->probes_pending_create) {
+								IPLSourceSettings pcfg{};
+								pcfg.flags = IPL_SIMULATIONFLAGS_DIRECT;
+								bool any_ok = false;
+								for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+									IPLSource created = nullptr;
+									if (handleErr(iplSourceCreate(sim, &pcfg, &created), "SteamAudio: Failed to create soundfield probe source")) {
+										iplSourceAdd(created, sim);
+										iplSourceSetInputs(created, IPL_SIMULATIONFLAGS_DIRECT, &sfld_ptr->pending_probe_inputs[i]);
+										sfld_ptr->probe_sources[i] = created;
+										any_ok = true;
+									}
+								}
+								sfld_ptr->probes_created = any_ok;
+								sfld_ptr->probes_attached = any_ok;
+								sfld_ptr->probes_in_sim = any_ok;
+								sfld_ptr->probes_pending_create = false;
+								sfld_ptr->pending_probe_membership = SimMembershipOp::None;
+								if (any_ok) {
+									ld->dirty = true;
+								}
+							} else if (sfld_ptr->pending_probe_membership != SimMembershipOp::None) {
+								if (sfld_ptr->probes_created) {
+									const bool want_in_sim = (sfld_ptr->pending_probe_membership == SimMembershipOp::Add);
+									if (want_in_sim != sfld_ptr->probes_in_sim) {
+										bool any_changed = false;
+										for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+											if (!sfld_ptr->probe_sources[i])
+												continue;
+											if (want_in_sim) {
+												iplSourceAdd(sfld_ptr->probe_sources[i], sim);
+											} else {
+												iplSourceRemove(sfld_ptr->probe_sources[i], sim);
+											}
+											any_changed = true;
+										}
+										sfld_ptr->probes_in_sim = want_in_sim;
+										if (any_changed) {
+											ld->dirty = true;
+										}
+									}
+								}
+								sfld_ptr->pending_probe_membership = SimMembershipOp::None;
 							}
 						}
 					}
@@ -1717,7 +2073,7 @@ void SteamAudioServer::create_listener_simulator(ListenerData *ld) {
 	sim_cfg.numDiffuseSamples = 32;
 	sim_cfg.maxDuration = ld->cfg.refl_duration;
 	sim_cfg.maxOrder = ld->cfg.refl_ambisonics_order;
-	sim_cfg.maxNumSources = 256;
+	sim_cfg.maxNumSources = 320;
 	sim_cfg.numThreads = 2;
 	sim_cfg.samplingRate = cached_audio_settings.samplingRate;
 	sim_cfg.frameSize = cached_audio_settings.frameSize;
@@ -2056,6 +2412,14 @@ void SteamAudioServer::apply_pending_ops() {
 					}
 				}
 
+				for (auto *sf : soundfields) {
+					auto sfld = create_soundfield_listener_data(sf, ld);
+					if (sfld) {
+						sfld->last_consumed_mix = sf->mix_generation;
+						sf->listener_data.push_back(std::move(sfld));
+					}
+				}
+
 				listeners.push_back(ld);
 
 			} else if constexpr (std::is_same_v<T, PendingRemoveListener>) {
@@ -2079,6 +2443,26 @@ void SteamAudioServer::apply_pending_ops() {
 						}
 						cleanup_source_listener_data(sld, phonon_context);
 						sd->listener_data.remove_at(i);
+						break;
+					}
+				}
+
+				for (auto *sf : soundfields) {
+					for (size_t i = 0; i < sf->listener_data.size(); ++i) {
+						if (!sf->listener_data[i] || sf->listener_data[i]->listener != ld)
+							continue;
+						auto &sfld = *sf->listener_data[i];
+						{
+							std::lock_guard sim_lock(sim_ops_mutex);
+							for (int p = 0; p < SOUNDFIELD_PROBE_COUNT; ++p) {
+								if (sfld.probe_sources[p]) {
+									pending_sim_source_removals.push_back({ (sim && sfld.probes_in_sim) ? iplSimulatorRetain(sim) : nullptr, sfld.probe_sources[p] });
+									sfld.probe_sources[p] = nullptr;
+								}
+							}
+						}
+						cleanup_soundfield_listener_data(sfld);
+						sf->listener_data.erase(sf->listener_data.begin() + i);
 						break;
 					}
 				}
@@ -2141,6 +2525,182 @@ void SteamAudioServer::apply_pending_ops() {
 				if (was_empty) {
 					ld->push_buffer.fill(Vector2(0, 0));
 					ld->generation++;
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingAddSoundfield>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				for (auto *existing : soundfields) {
+					if (existing == sf)
+						return;
+				}
+				for (auto *ld : listeners) {
+					auto sfld = create_soundfield_listener_data(sf, ld);
+					if (sfld) {
+						sfld->last_consumed_mix = sf->mix_generation;
+						sf->listener_data.push_back(std::move(sfld));
+					}
+				}
+				soundfields.push_back(sf);
+
+			} else if constexpr (std::is_same_v<T, PendingRemoveSoundfield>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				for (auto &sec : sf->sectors) {
+					if (sec.playback.is_valid()) {
+						sec.playback->stop();
+					}
+				}
+				for (uint32_t i = 0; i < soundfields.size(); ++i) {
+					if (soundfields[i] != sf)
+						continue;
+					for (auto &sfld_ptr : sf->listener_data) {
+						if (!sfld_ptr)
+							continue;
+						IPLSimulator sim = nullptr;
+						for (auto *ld : listeners) {
+							if (sfld_ptr->listener == ld) {
+								sim = ld->simulator.load(std::memory_order_acquire);
+								break;
+							}
+						}
+						{
+							std::lock_guard sim_lock(sim_ops_mutex);
+							for (int p = 0; p < SOUNDFIELD_PROBE_COUNT; ++p) {
+								if (sfld_ptr->probe_sources[p]) {
+									pending_sim_source_removals.push_back({ (sim && sfld_ptr->probes_in_sim) ? iplSimulatorRetain(sim) : nullptr, sfld_ptr->probe_sources[p] });
+									sfld_ptr->probe_sources[p] = nullptr;
+								}
+							}
+						}
+						cleanup_soundfield_listener_data(*sfld_ptr);
+					}
+					sf->listener_data.clear();
+					sf->sectors.clear();
+					soundfields.remove_at(i);
+					break;
+				}
+				soundfield_owner.free(sf->self);
+				memdelete(sf);
+
+			} else if constexpr (std::is_same_v<T, PendingSoundfieldAddSector>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				SoundfieldSectorState sec;
+				sec.id = pending.sector_id;
+				sec.nominal_direction = pending.direction.length_squared() > 1e-6f ? pending.direction.normalized() : Vector3(0, 1, 0);
+				sec.volume_linear = pending.volume_linear;
+				sec.pitch_scale = pending.pitch_scale;
+				sec.playback = pending.playback;
+				sec.mixed_frames.resize(cached_audio_settings.frameSize);
+				sec.mixed_frames.fill(0.0f);
+				sec.resample_state.resampler = create_resampler(1);
+				sf->sectors.push_back(std::move(sec));
+				const auto &added = sf->sectors.back();
+				for (auto &sfld_ptr : sf->listener_data) {
+					if (!sfld_ptr)
+						continue;
+					SoundfieldListenerSectorDSP dsp;
+					dsp.id = added.id;
+					dsp.target_direction = added.nominal_direction;
+					dsp.smoothed_direction = added.nominal_direction;
+					std::lock_guard<std::mutex> st_lock(sfld_ptr->sim_state_mutex);
+					sfld_ptr->sector_dsp.push_back(std::move(dsp));
+				}
+				sf->mixed_ready = false;
+
+			} else if constexpr (std::is_same_v<T, PendingSoundfieldRemoveSector>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				for (size_t i = 0; i < sf->sectors.size(); ++i) {
+					if (sf->sectors[i].id != pending.sector_id)
+						continue;
+					if (sf->sectors[i].playback.is_valid()) {
+						sf->sectors[i].playback->stop();
+					}
+					sf->sectors.erase(sf->sectors.begin() + i);
+					break;
+				}
+				for (auto &sfld_ptr : sf->listener_data) {
+					if (!sfld_ptr)
+						continue;
+					std::lock_guard<std::mutex> st_lock(sfld_ptr->sim_state_mutex);
+					for (size_t i = 0; i < sfld_ptr->sector_dsp.size(); ++i) {
+						if (sfld_ptr->sector_dsp[i].id != pending.sector_id)
+							continue;
+						cleanup_soundfield_sector_dsp(sfld_ptr->sector_dsp[i]);
+						sfld_ptr->sector_dsp.erase(sfld_ptr->sector_dsp.begin() + i);
+						break;
+					}
+					if (sfld_ptr->sector_dsp.empty()) {
+						sfld_ptr->dsp_ready = false;
+					}
+				}
+				if (sf->sectors.empty()) {
+					sf->mixed_ready = false;
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingSoundfieldClearSectors>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				for (auto &sec : sf->sectors) {
+					if (sec.playback.is_valid()) {
+						sec.playback->stop();
+					}
+				}
+				sf->sectors.clear();
+				for (auto &sfld_ptr : sf->listener_data) {
+					if (!sfld_ptr)
+						continue;
+					{
+						std::lock_guard<std::mutex> st_lock(sfld_ptr->sim_state_mutex);
+						for (auto &dsp : sfld_ptr->sector_dsp) {
+							cleanup_soundfield_sector_dsp(dsp);
+						}
+						sfld_ptr->sector_dsp.clear();
+					}
+					sfld_ptr->dsp_ready = false;
+					sfld_ptr->probed_once.store(false, std::memory_order_release);
+				}
+				sf->mixed_ready = false;
+
+			} else if constexpr (std::is_same_v<T, PendingSoundfieldSectorVolume>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				for (auto &sec : sf->sectors) {
+					if (sec.id == pending.sector_id) {
+						sec.volume_linear = pending.volume_linear;
+						break;
+					}
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingSoundfieldSectorPitch>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				for (auto &sec : sf->sectors) {
+					if (sec.id == pending.sector_id) {
+						sec.pitch_scale = pending.pitch_scale;
+						break;
+					}
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingSoundfieldSectorDirection>) {
+				SoundfieldData *sf = soundfield_owner.get_or_null(pending.soundfield);
+				if (!sf)
+					return;
+				Vector3 dir = pending.direction.length_squared() > 1e-6f ? pending.direction.normalized() : Vector3(0, 1, 0);
+				for (auto &sec : sf->sectors) {
+					if (sec.id == pending.sector_id) {
+						sec.nominal_direction = dir;
+						break;
+					}
 				}
 			}
 		}, op);
@@ -2238,6 +2798,7 @@ void SteamAudioServer::process_audio(double dt) {
 	apply_pending_ops();
 
 	std::shared_lock lock(collections_mutex);
+	PROFILING_PLOT_NUMBER("NumSteamSoundfields", (int64_t)soundfields.size());
 
 	{
 		PROFILE_FUNCTION_NAMED("process_audio_phase1");
@@ -2535,6 +3096,102 @@ void SteamAudioServer::process_audio(double dt) {
 				}
 			}
 		}
+
+		// Mix active soundfield sectors.
+		for (auto *sf : soundfields) {
+			if (!sf->cfg.enabled.load(std::memory_order_relaxed) || sf->sectors.empty())
+				continue;
+
+			PROFILE_FUNCTION_NAMED("Soundfield Pre-mixing");
+
+			const uint32_t sf_layers = sf->cfg.layers.load(std::memory_order_relaxed);
+			bool has_output_consumer = false;
+			for (auto &sfld_ptr : sf->listener_data) {
+				if (!sfld_ptr)
+					continue;
+				ListenerData *ld = sfld_ptr->listener;
+				if ((sf_layers & ld->cfg.mask) == 0 || ld->cfg.is_sensor)
+					continue;
+				if (!sfld_ptr->probed_once.load(std::memory_order_acquire))
+					continue;
+				std::lock_guard pb_lock(*ld->playbacks_mutex);
+				for (auto &pb : ld->playbacks) {
+					if (pb.playback->is_playing()) {
+						has_output_consumer = true;
+						break;
+					}
+				}
+				if (has_output_consumer)
+					break;
+			}
+			if (!has_output_consumer)
+				continue;
+
+			// Mix-reset gate: wait until every active consumer has consumed this mix_generation.
+			if (sf->mixed_ready) {
+				bool consumers_pending = false;
+				for (auto &sfld_ptr : sf->listener_data) {
+					if (!sfld_ptr)
+						continue;
+					ListenerData *ld = sfld_ptr->listener;
+					if ((sf_layers & ld->cfg.mask) == 0 || ld->cfg.is_sensor)
+						continue;
+					if (!sfld_ptr->probed_once.load(std::memory_order_acquire))
+						continue;
+					if (sfld_ptr->last_consumed_mix >= sf->mix_generation)
+						continue;
+					std::lock_guard pb_lock(*ld->playbacks_mutex);
+					for (auto &pb : ld->playbacks) {
+						if (pb.playback->is_playing()) {
+							consumers_pending = true;
+							break;
+						}
+					}
+					if (consumers_pending)
+						break;
+				}
+				if (consumers_pending)
+					continue;
+
+				for (auto &sec : sf->sectors) {
+					sec.mixed_frames.fill(0.0f);
+					sec.mixed_frames_ready = 0;
+				}
+				sf->mixed_ready = false;
+			}
+
+			const float sf_volume_linear = sf->volume_linear.load(std::memory_order_relaxed);
+			bool all_ready = true;
+			for (auto &sec : sf->sectors) {
+				if (sec.mixed_frames_ready >= frame_size)
+					continue;
+				if (!sec.playback.is_valid() || !sec.playback->is_playing()) {
+					sec.mixed_frames.fill(0.0f);
+					sec.mixed_frames_ready = frame_size;
+					continue;
+				}
+
+				int to_pull = frame_size - sec.mixed_frames_ready;
+				float rate_scale = MAX(sec.pitch_scale, 0.05f);
+				float gain = sec.volume_linear * sf_volume_linear;
+				int mixed_start = sec.mixed_frames_ready;
+				float *dst = sec.mixed_frames.ptrw();
+				int pulled = pull_playback_frames<1>(sec.playback, sec.resample_state, rate_scale, to_pull,
+						[&](int idx, float mono) {
+							dst[mixed_start + idx] = mono * gain;
+						});
+
+				sec.mixed_frames_ready += pulled;
+				if (sec.mixed_frames_ready < frame_size) {
+					all_ready = false;
+				}
+			}
+
+			if (all_ready) {
+				sf->mixed_ready = true;
+				sf->mix_generation++;
+			}
+		}
 	}
 
 	{
@@ -2560,6 +3217,17 @@ void SteamAudioServer::process_audio(double dt) {
 					if (pb.remaining_from_push_buffer > 0) {
 						drains_pending = true;
 						break;
+					}
+				}
+			}
+
+			if (ld->cfg.is_sensor) {
+				for (auto *sf : soundfields) {
+					for (auto &entry : sf->listener_data) {
+						if (entry && entry->listener == ld && entry->dsp_ready) {
+							release_soundfield_listener_dsp(*entry);
+							break;
+						}
 					}
 				}
 			}
@@ -2803,6 +3471,151 @@ void SteamAudioServer::process_audio(double dt) {
 							}
 						}
 					}
+				}
+			}
+
+			// Contribute active soundfields to this listener.
+			for (auto *sf : soundfields) {
+				SoundfieldListenerData *sfld = nullptr;
+				for (auto &entry : sf->listener_data) {
+					if (entry && entry->listener == ld) {
+						sfld = entry.get();
+						break;
+					}
+				}
+				if (!sfld)
+					continue;
+
+				const bool mask_match = ((sf->cfg.layers.load(std::memory_order_relaxed) & ld->cfg.mask) != 0) && !ld->cfg.is_sensor;
+				if (!mask_match) {
+					if (sfld->dsp_ready) {
+						release_soundfield_listener_dsp(*sfld);
+					}
+					continue;
+				}
+				if (!sf->cfg.enabled.load(std::memory_order_relaxed) || sf->sectors.empty())
+					continue;
+
+				if (sfld->last_contributed_generation == ld->generation)
+					continue;
+
+				if (!sfld->probed_once.load(std::memory_order_acquire)) {
+					sfld->last_contributed_generation = ld->generation;
+					sfld->last_consumed_mix = sf->mix_generation;
+					continue;
+				}
+
+				if (!sf->mixed_ready) {
+					any_contributor_pending = true;
+					continue;
+				}
+
+				PROFILE_FUNCTION_NAMED("Soundfield Binaural Mixing");
+
+				sfld->last_contributed_generation = ld->generation;
+				sfld->last_consumed_mix = sf->mix_generation;
+
+				if (soundfield_mix_scratch.size() != frame_size) {
+					soundfield_mix_scratch.resize(frame_size);
+				}
+				soundfield_mix_scratch.fill(Vector2(0, 0));
+				Vector2 *sf_sum = soundfield_mix_scratch.ptrw();
+
+				const int sr = cached_audio_settings.samplingRate;
+				const float block_dt = (sr > 0) ? (static_cast<float>(frame_size) / static_cast<float>(sr)) : 0.01f;
+				const float tau = MAX(0.005f, sf->cfg.smoothing_time.load(std::memory_order_relaxed));
+				const float alpha = 1.0f - std::exp(-block_dt / tau);
+
+				for (const auto &sec : sf->sectors) {
+					SoundfieldListenerSectorDSP *dsp = find_soundfield_sector_dsp(*sfld, sec.id);
+					if (!dsp)
+						continue;
+					if (!ensure_soundfield_sector_dsp(*dsp))
+						continue;
+					sfld->dsp_ready = true;
+
+					float t_occ;
+					float t_trans[3];
+					Vector3 t_dir;
+					{
+						std::lock_guard<std::mutex> st_lock(sfld->sim_state_mutex);
+						t_occ = dsp->target_occlusion;
+						t_trans[0] = dsp->target_transmission[0];
+						t_trans[1] = dsp->target_transmission[1];
+						t_trans[2] = dsp->target_transmission[2];
+						t_dir = dsp->target_direction;
+					}
+
+					if (!dsp->has_smoothed) {
+						dsp->smoothed_occlusion = t_occ;
+						for (int b = 0; b < 3; ++b)
+							dsp->smoothed_transmission[b] = t_trans[b];
+						dsp->smoothed_direction = t_dir;
+						dsp->has_smoothed = true;
+					} else {
+						dsp->smoothed_occlusion += alpha * (t_occ - dsp->smoothed_occlusion);
+						for (int b = 0; b < 3; ++b)
+							dsp->smoothed_transmission[b] += alpha * (t_trans[b] - dsp->smoothed_transmission[b]);
+						Vector3 blended_dir = dsp->smoothed_direction.lerp(t_dir, alpha);
+						if (blended_dir.length_squared() > 1e-6f) {
+							dsp->smoothed_direction = blended_dir.normalized();
+						}
+					}
+
+					memcpy(dsp->input_buffer.data[0], sec.mixed_frames.ptr(), sizeof(float) * frame_size);
+
+					IPLDirectEffectParams dp{};
+					dp.flags = static_cast<IPLDirectEffectFlags>(IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+					dp.transmissionType = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+					dp.distanceAttenuation = 1.0f;
+					dp.occlusion = dsp->smoothed_occlusion;
+					dp.transmission[0] = dsp->smoothed_transmission[0];
+					dp.transmission[1] = dsp->smoothed_transmission[1];
+					dp.transmission[2] = dsp->smoothed_transmission[2];
+					iplDirectEffectApply(dsp->direct_effect, &dp, &dsp->input_buffer, &dsp->direct_buffer);
+
+					if (phonon_hrtf && dsp->binaural_effect) {
+						IPLBinauralEffectParams bp{};
+						bp.direction = iplCalculateRelativeDirection(
+								phonon_context,
+								ipl_vec3_from(dsp->smoothed_direction),
+								IPLVector3{ 0.0f, 0.0f, 0.0f },
+								ld_world_coords.ahead,
+								ld_world_coords.up);
+						bp.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
+						bp.spatialBlend = 1.0f;
+						bp.hrtf = phonon_hrtf;
+						iplBinauralEffectApply(dsp->binaural_effect, &bp, &dsp->direct_buffer, &dsp->output_buffer);
+
+						const float *out_l = dsp->output_buffer.data[0];
+						const float *out_r = dsp->output_buffer.data[1];
+						for (int s = 0; s < frame_size; ++s) {
+							sf_sum[s].x += out_l[s];
+							sf_sum[s].y += out_r[s];
+						}
+					} else {
+						const float *mono = dsp->direct_buffer.data[0];
+						for (int s = 0; s < frame_size; ++s) {
+							sf_sum[s].x += mono[s];
+							sf_sum[s].y += mono[s];
+						}
+					}
+				}
+
+				float sum_l = 0.0f;
+				float sum_r = 0.0f;
+				for (int s = 0; s < frame_size; ++s) {
+					float l = sf_sum[s].x;
+					float r = sf_sum[s].y;
+					ld->push_buffer[s].x += l;
+					ld->push_buffer[s].y += r;
+					sum_l += l * l;
+					sum_r += r * r;
+				}
+				{
+					std::lock_guard<std::mutex> st_lock(sfld->sim_state_mutex);
+					sfld->last_output_rms_left = std::sqrt(sum_l / static_cast<float>(frame_size));
+					sfld->last_output_rms_right = std::sqrt(sum_r / static_cast<float>(frame_size));
 				}
 			}
 
@@ -3435,3 +4248,226 @@ void SteamAudioServer::frame_free(RID frame) {
 	pending_geom_ops.push_back(PendingFrameRemove{ frame });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Soundfield RID API
+// ─────────────────────────────────────────────────────────────────────────────
+
+SoundfieldListenerSectorDSP *SteamAudioServer::find_soundfield_sector_dsp(SoundfieldListenerData &sfld, int sector_id) {
+	for (auto &dsp : sfld.sector_dsp) {
+		if (dsp.id == sector_id)
+			return &dsp;
+	}
+	return nullptr;
+}
+
+bool SteamAudioServer::ensure_soundfield_sector_dsp(SoundfieldListenerSectorDSP &dsp) {
+	if (dsp.direct_effect)
+		return true;
+	if (!phonon_context)
+		return false;
+
+	IPLDirectEffectSettings direct_cfg{};
+	direct_cfg.numChannels = 1;
+	if (!handleErr(iplDirectEffectCreate(phonon_context, &cached_audio_settings, &direct_cfg, &dsp.direct_effect), "SteamAudio: Failed to create soundfield direct effect")) {
+		return false;
+	}
+
+	if (phonon_hrtf) {
+		IPLBinauralEffectSettings bin_cfg{};
+		bin_cfg.hrtf = phonon_hrtf;
+		handleErr(iplBinauralEffectCreate(phonon_context, &cached_audio_settings, &bin_cfg, &dsp.binaural_effect), "SteamAudio: Failed to create soundfield binaural effect");
+	}
+
+	iplAudioBufferAllocate(phonon_context, 1, cached_audio_settings.frameSize, &dsp.input_buffer);
+	iplAudioBufferAllocate(phonon_context, 1, cached_audio_settings.frameSize, &dsp.direct_buffer);
+	iplAudioBufferAllocate(phonon_context, 2, cached_audio_settings.frameSize, &dsp.output_buffer);
+	return true;
+}
+
+void SteamAudioServer::cleanup_soundfield_sector_dsp(SoundfieldListenerSectorDSP &dsp) {
+	if (dsp.direct_effect)
+		iplDirectEffectRelease(&dsp.direct_effect);
+	if (dsp.binaural_effect)
+		iplBinauralEffectRelease(&dsp.binaural_effect);
+	if (dsp.input_buffer.data) {
+		iplAudioBufferFree(phonon_context, &dsp.input_buffer);
+		dsp.input_buffer = IPLAudioBuffer{};
+	}
+	if (dsp.direct_buffer.data) {
+		iplAudioBufferFree(phonon_context, &dsp.direct_buffer);
+		dsp.direct_buffer = IPLAudioBuffer{};
+	}
+	if (dsp.output_buffer.data) {
+		iplAudioBufferFree(phonon_context, &dsp.output_buffer);
+		dsp.output_buffer = IPLAudioBuffer{};
+	}
+	dsp.has_smoothed = false;
+}
+
+void SteamAudioServer::release_soundfield_listener_dsp(SoundfieldListenerData &sfld) {
+	for (auto &dsp : sfld.sector_dsp) {
+		cleanup_soundfield_sector_dsp(dsp);
+	}
+	sfld.dsp_ready = false;
+}
+
+std::unique_ptr<SoundfieldListenerData> SteamAudioServer::create_soundfield_listener_data(SoundfieldData *sf, ListenerData *ld) {
+	auto sfld = std::make_unique<SoundfieldListenerData>();
+	sfld->listener = ld;
+	sfld->sector_dsp.reserve(sf->sectors.size());
+	for (const auto &sec : sf->sectors) {
+		SoundfieldListenerSectorDSP dsp;
+		dsp.id = sec.id;
+		dsp.target_direction = sec.nominal_direction;
+		dsp.smoothed_direction = sec.nominal_direction;
+		sfld->sector_dsp.push_back(std::move(dsp));
+	}
+	return sfld;
+}
+
+void SteamAudioServer::cleanup_soundfield_listener_data(SoundfieldListenerData &sfld) {
+	release_soundfield_listener_dsp(sfld);
+	sfld.sector_dsp.clear();
+}
+
+RID SteamAudioServer::soundfield_create() {
+	ensure_initialized();
+	ERR_FAIL_COND_V_MSG(!is_running.load(), RID(), "SteamAudioServer: soundfield_create() failed, the server is not running.");
+	SoundfieldData *sf = memnew(SoundfieldData);
+	RID rid = soundfield_owner.make_rid(sf);
+	sf->self = rid;
+	sf->debug_name = "soundfield_" + String::num_uint64(rid.get_id());
+
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingAddSoundfield{ rid });
+	return rid;
+}
+
+void SteamAudioServer::soundfield_free(RID soundfield) {
+	if (!soundfield.is_valid())
+		return;
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingRemoveSoundfield{ soundfield });
+}
+
+void SteamAudioServer::soundfield_set_layers(RID soundfield, uint32_t layers) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.layers.store(layers, std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_enabled(RID soundfield, bool enabled) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.enabled.store(enabled, std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_volume_db(RID soundfield, float volume_db) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.volume_db.store(volume_db, std::memory_order_relaxed);
+		sf->volume_linear.store(static_cast<float>(UtilityFunctions::db_to_linear(volume_db)), std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_probe_distance(RID soundfield, float distance) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.probe_distance.store(MAX(1.0f, distance), std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_smoothing_time(RID soundfield, float seconds) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.smoothing_time.store(MAX(0.005f, seconds), std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_debug_name(RID soundfield, const String &name) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->debug_name = name;
+	}
+}
+
+int SteamAudioServer::soundfield_add_sector(RID soundfield, const Vector3 &direction, Ref<AudioStreamPlayback> playback, float volume_db, float pitch_scale, float from_position) {
+	if (!soundfield.is_valid() || playback.is_null())
+		return -1;
+	playback->start(from_position);
+	// Prime the lazily-initialized `_is_playing` GDExtension virtual before publishing to the mixing thread.
+	(void)playback->is_playing();
+	int sector_id = next_soundfield_sector_id.fetch_add(1, std::memory_order_relaxed);
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingSoundfieldAddSector{
+		soundfield,
+		sector_id,
+		direction,
+		playback,
+		static_cast<float>(UtilityFunctions::db_to_linear(volume_db)),
+		pitch_scale
+	});
+	return sector_id;
+}
+
+void SteamAudioServer::soundfield_remove_sector(RID soundfield, int sector_id) {
+	if (!soundfield.is_valid() || sector_id < 0)
+		return;
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingSoundfieldRemoveSector{ soundfield, sector_id });
+}
+
+void SteamAudioServer::soundfield_set_sector_volume_db(RID soundfield, int sector_id, float volume_db) {
+	if (!soundfield.is_valid() || sector_id < 0)
+		return;
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingSoundfieldSectorVolume{ soundfield, sector_id, static_cast<float>(UtilityFunctions::db_to_linear(volume_db)) });
+}
+
+void SteamAudioServer::soundfield_set_sector_pitch_scale(RID soundfield, int sector_id, float pitch_scale) {
+	if (!soundfield.is_valid() || sector_id < 0)
+		return;
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingSoundfieldSectorPitch{ soundfield, sector_id, pitch_scale });
+}
+
+void SteamAudioServer::soundfield_set_sector_direction(RID soundfield, int sector_id, const Vector3 &direction) {
+	if (!soundfield.is_valid() || sector_id < 0)
+		return;
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingSoundfieldSectorDirection{ soundfield, sector_id, direction });
+}
+
+void SteamAudioServer::soundfield_clear_sectors(RID soundfield) {
+	if (!soundfield.is_valid())
+		return;
+	std::lock_guard lock(pending_ops_mutex);
+	pending_ops.push_back(PendingSoundfieldClearSectors{ soundfield });
+}
+
+Dictionary SteamAudioServer::soundfield_get_debug_state(RID soundfield, RID listener) {
+	Dictionary out;
+	std::shared_lock lock(collections_mutex);
+	auto *sf = soundfield_owner.get_or_null(soundfield);
+	auto *ld = listener_owner.get_or_null(listener);
+	if (!sf || !ld)
+		return out;
+	for (auto &sfld_ptr : sf->listener_data) {
+		if (!sfld_ptr || sfld_ptr->listener != ld)
+			continue;
+		std::lock_guard<std::mutex> st_lock(sfld_ptr->sim_state_mutex);
+		out["outdoorness"] = sfld_ptr->last_outdoorness;
+		out["rms_left"] = sfld_ptr->last_output_rms_left;
+		out["rms_right"] = sfld_ptr->last_output_rms_right;
+		out["spatializer"] = "binaural";
+		Array arr;
+		for (const auto &dsp : sfld_ptr->sector_dsp) {
+			Dictionary d;
+			d["id"] = dsp.id;
+			d["openness"] = dsp.target_occlusion;
+			d["smoothed_openness"] = dsp.smoothed_occlusion;
+			d["transmission"] = Vector3(dsp.target_transmission[0], dsp.target_transmission[1], dsp.target_transmission[2]);
+			d["direction"] = dsp.target_direction;
+			arr.push_back(d);
+		}
+		out["sectors"] = arr;
+		break;
+	}
+	return out;
+}
