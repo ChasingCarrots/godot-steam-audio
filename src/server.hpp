@@ -193,6 +193,12 @@ struct SourceListenerData {
 	IPLAudioBuffer ambisonics_buffer{};
 	uint8_t skip_reflection_applies = 0;
 
+	// Temporal smoothing and volumetric occlusion fallback for direct effect.
+	float smoothed_occlusion = 1.0f;
+	float smoothed_transmission[3] = { 1.0f, 1.0f, 1.0f };
+	float last_occluded_transmission[3] = { 0.5f, 0.25f, 0.1f };
+	bool has_smoothed_direct = false;
+
 	// Deferred simulation lifecycle and reflection inputs, consumed in run_direct_job's commit phase.
 	bool pending_create = false;
 	SimMembershipOp pending_sim_membership = SimMembershipOp::None;

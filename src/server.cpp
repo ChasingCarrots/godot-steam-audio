@@ -1035,7 +1035,19 @@ void SteamAudioServer::tick(float delta) {
 					float occlusion = direct_params.occlusion;
 					float transmission = 0.0f;
 					if (sd->cfg.transmission_enabled) {
-						transmission = (direct_params.transmission[0] + direct_params.transmission[1] + direct_params.transmission[2]) / 3.0f;
+						// Steam Audio traces transmission along the center ray only; when volumetric
+						// occlusion is partial but the center ray passes through an opening, reuse the
+						// last occluded transmission for the occluded fraction instead of snapping to 1.0.
+						bool center_unoccluded = (direct_params.transmission[0] >= 0.999f && direct_params.transmission[1] >= 0.999f && direct_params.transmission[2] >= 0.999f);
+						if (!center_unoccluded) {
+							for (int b = 0; b < 3; ++b) {
+								sld.last_occluded_transmission[b] = direct_params.transmission[b];
+							}
+						}
+						const float *tr = (sd->cfg.occlusion_type == IPL_OCCLUSIONTYPE_VOLUMETRIC && occlusion < 0.999f && center_unoccluded)
+								? sld.last_occluded_transmission
+								: direct_params.transmission;
+						transmission = (tr[0] + tr[1] + tr[2]) / 3.0f;
 					}
 					// Total direct sound = sound that goes around (occlusion) + sound that goes through (transmission)
 					// We assume transmission only applies to the occluded part.
@@ -1186,6 +1198,7 @@ void SteamAudioServer::tick(float delta) {
 				if (listener_range > 0.0f) {
 					if (!sld->out_of_range && sld->dist_to_listener > listener_range * 1.1f) {
 						sld->out_of_range = true;
+						sld->has_smoothed_direct = false;
 						if (src) {
 							sld->pending_sim_membership = SimMembershipOp::Remove;
 							ld->dirty = true;
@@ -2633,6 +2646,42 @@ void SteamAudioServer::process_audio(double dt) {
 
 					IPLDirectEffectParams direct_params = outputs.direct;
 					direct_params.flags = static_cast<IPLDirectEffectFlags>(0);
+
+					if (sd->cfg.occlusion_enabled || sd->cfg.transmission_enabled) {
+						if (sd->cfg.occlusion_enabled && sd->cfg.transmission_enabled && sd->cfg.occlusion_type == IPL_OCCLUSIONTYPE_VOLUMETRIC) {
+							bool center_unoccluded = (direct_params.transmission[0] >= 0.999f && direct_params.transmission[1] >= 0.999f && direct_params.transmission[2] >= 0.999f);
+							if (!center_unoccluded) {
+								for (int b = 0; b < 3; ++b) {
+									sld->last_occluded_transmission[b] = direct_params.transmission[b];
+								}
+							} else if (direct_params.occlusion < 0.999f) {
+								for (int b = 0; b < 3; ++b) {
+									direct_params.transmission[b] = sld->last_occluded_transmission[b];
+								}
+							}
+						}
+
+						if (!sld->has_smoothed_direct) {
+							sld->smoothed_occlusion = direct_params.occlusion;
+							for (int b = 0; b < 3; ++b) {
+								sld->smoothed_transmission[b] = direct_params.transmission[b];
+							}
+							sld->has_smoothed_direct = true;
+						} else {
+							constexpr float kSmoothTauSec = 0.15f;
+							int sr = cached_audio_settings.samplingRate;
+							float block_dt = (sr > 0) ? (static_cast<float>(frame_size) / static_cast<float>(sr)) : 0.01f;
+							float alpha = 1.0f - std::exp(-block_dt / kSmoothTauSec);
+							sld->smoothed_occlusion += alpha * (direct_params.occlusion - sld->smoothed_occlusion);
+							for (int b = 0; b < 3; ++b) {
+								sld->smoothed_transmission[b] += alpha * (direct_params.transmission[b] - sld->smoothed_transmission[b]);
+							}
+						}
+						direct_params.occlusion = sld->smoothed_occlusion;
+						for (int b = 0; b < 3; ++b) {
+							direct_params.transmission[b] = sld->smoothed_transmission[b];
+						}
+					}
 
 					if (sd->cfg.occlusion_enabled) {
 						direct_params.flags = static_cast<IPLDirectEffectFlags>(direct_params.flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
