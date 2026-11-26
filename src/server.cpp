@@ -2113,16 +2113,7 @@ void SteamAudioServer::apply_pending_ops() {
 				entry.playback = pending.playback;
 				entry.volume_linear = pending.volume_linear;
 				entry.pitch_scale = pending.pitch_scale;
-				if (godot_mix_rate != cached_audio_settings.samplingRate && godot_mix_rate > 0 && cached_audio_settings.samplingRate > 0) {
-					entry.resampler = std::shared_ptr<oboe::resampler::MultiChannelResampler>(
-						oboe::resampler::MultiChannelResampler::make(
-							2,
-							godot_mix_rate,
-							cached_audio_settings.samplingRate,
-							oboe::resampler::MultiChannelResampler::Quality::High
-						)
-					);
-				}
+				entry.resample_state.resampler = create_resampler(2);
 				sd->playbacks.push_back(std::move(entry));
 
 			} else if constexpr (std::is_same_v<T, PendingAddPlaybackToListener>) {
@@ -2154,6 +2145,89 @@ void SteamAudioServer::apply_pending_ops() {
 			}
 		}, op);
 	}
+}
+
+std::shared_ptr<oboe::resampler::MultiChannelResampler> SteamAudioServer::create_resampler(int channels) const {
+	if (godot_mix_rate == cached_audio_settings.samplingRate || godot_mix_rate <= 0 || cached_audio_settings.samplingRate <= 0)
+		return nullptr;
+	return std::shared_ptr<oboe::resampler::MultiChannelResampler>(
+		oboe::resampler::MultiChannelResampler::make(
+			channels,
+			godot_mix_rate,
+			cached_audio_settings.samplingRate,
+			oboe::resampler::MultiChannelResampler::Quality::High
+		)
+	);
+}
+
+template <int Channels, typename EmitFn>
+int SteamAudioServer::pull_playback_frames(
+		const Ref<AudioStreamPlayback> &playback,
+		PlaybackResampleState &state,
+		float pitch_scale,
+		int to_pull,
+		EmitFn &&emit_frame) {
+	auto ensure_buf = [](Ref<AudioBuffer> &buf, int32_t frames_needed) {
+		if (buf.is_null()) {
+			buf = AudioBuffer::create(frames_needed);
+		} else if (buf->get_frame_count() < frames_needed) {
+			buf->resize(frames_needed);
+		}
+	};
+
+	if (!state.resampler) {
+		state.resampler = create_resampler(Channels);
+	}
+
+	if (!state.resampler) {
+		ensure_buf(mix_scratch_buffer, to_pull);
+		int pulled = MIN(playback->mix_audio_buffer(mix_scratch_buffer, pitch_scale, to_pull), to_pull);
+		const auto *in_ptr = reinterpret_cast<const AudioFrame *>(mix_scratch_buffer->get_data_address());
+		for (int i = 0; i < pulled; ++i) {
+			if constexpr (Channels == 2) {
+				emit_frame(i, in_ptr[i].left, in_ptr[i].right);
+			} else {
+				emit_frame(i, (in_ptr[i].left + in_ptr[i].right) * 0.5f);
+			}
+		}
+		return pulled;
+	}
+
+	int produced = 0;
+	while (produced < to_pull) {
+		if (state.resampler->isWriteNeeded()) {
+			if (state.unconsumed_input_index >= state.unconsumed_input_count) {
+				int needed_out = to_pull - produced;
+				int needed_in = int(std::ceil((double)needed_out * godot_mix_rate / cached_audio_settings.samplingRate)) + 16;
+				ensure_buf(state.unconsumed_input_buffer, needed_in);
+				state.unconsumed_input_count = playback->mix_audio_buffer(state.unconsumed_input_buffer, pitch_scale, needed_in);
+				state.unconsumed_input_index = 0;
+				if (state.unconsumed_input_count <= 0) {
+					break;
+				}
+			}
+			const auto *in_ptr = reinterpret_cast<const AudioFrame *>(state.unconsumed_input_buffer->get_data_address());
+			const AudioFrame &in_frame = in_ptr[state.unconsumed_input_index++];
+			if constexpr (Channels == 2) {
+				float in_data[2] = { in_frame.left, in_frame.right };
+				state.resampler->writeNextFrame(in_data);
+			} else {
+				float in_data[1] = { (in_frame.left + in_frame.right) * 0.5f };
+				state.resampler->writeNextFrame(in_data);
+			}
+		} else {
+			if constexpr (Channels == 2) {
+				float out_data[2];
+				state.resampler->readNextFrame(out_data);
+				emit_frame(produced++, out_data[0], out_data[1]);
+			} else {
+				float out_data[1];
+				state.resampler->readNextFrame(out_data);
+				emit_frame(produced++, out_data[0]);
+			}
+		}
+	}
+	return produced;
 }
 
 void SteamAudioServer::process_audio(double dt) {
@@ -2394,73 +2468,16 @@ void SteamAudioServer::process_audio(double dt) {
 				if (pb.num_mixed_in_current_mixed_frames >= frame_size)
 					continue;
 
-				if (godot_mix_rate != cached_audio_settings.samplingRate && godot_mix_rate > 0 && cached_audio_settings.samplingRate > 0 && !pb.resampler) {
-					pb.resampler = std::shared_ptr<oboe::resampler::MultiChannelResampler>(
-						oboe::resampler::MultiChannelResampler::make(
-							2,
-							godot_mix_rate,
-							cached_audio_settings.samplingRate,
-							oboe::resampler::MultiChannelResampler::Quality::High
-						)
-					);
-				}
-
-				auto ensure_buf = [](Ref<AudioBuffer> &buf, int32_t frames_needed) {
-					if (buf.is_null()) {
-						buf = AudioBuffer::create(frames_needed);
-					} else if (buf->get_frame_count() < frames_needed) {
-						buf->resize(frames_needed);
-					}
-				};
-
 				int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
-				const AudioFrame *frames_ptr = nullptr;
-				int pulled_count = 0;
-				if (!pb.resampler) {
-					ensure_buf(mix_scratch_buffer, to_pull);
-					pulled_count = pb.playback->mix_audio_buffer(mix_scratch_buffer, pb.pitch_scale, to_pull);
-					frames_ptr = reinterpret_cast<const AudioFrame *>(mix_scratch_buffer->get_data_address());
-				} else {
-					ensure_buf(resampled_scratch_buffer, to_pull);
-					auto *out_ptr = reinterpret_cast<AudioFrame *>(resampled_scratch_buffer->get_data_address());
-					int produced = 0;
-					while (produced < to_pull) {
-						if (pb.resampler->isWriteNeeded()) {
-							if (pb.unconsumed_input_index >= pb.unconsumed_input_count) {
-								int needed_out = to_pull - produced;
-								int needed_in = int(std::ceil((double)needed_out * godot_mix_rate / cached_audio_settings.samplingRate)) + 16;
-								ensure_buf(pb.unconsumed_input_buffer, needed_in);
-								pb.unconsumed_input_count = pb.playback->mix_audio_buffer(pb.unconsumed_input_buffer, pb.pitch_scale, needed_in);
-								pb.unconsumed_input_index = 0;
-								if (pb.unconsumed_input_count <= 0) {
-									break;
-								}
-							}
-							const auto *in_ptr = reinterpret_cast<const AudioFrame *>(pb.unconsumed_input_buffer->get_data_address());
-							const AudioFrame &in_frame = in_ptr[pb.unconsumed_input_index++];
-							float in_data[2] = { in_frame.left, in_frame.right };
-							pb.resampler->writeNextFrame(in_data);
-						} else {
-							float out_data[2];
-							pb.resampler->readNextFrame(out_data);
-							out_ptr[produced++] = AudioFrame{out_data[0], out_data[1]};
-						}
-					}
-					frames_ptr = out_ptr;
-					pulled_count = produced;
-				}
+				float gain = pb.volume_linear * sd->volume_linear;
+				int mixed_start = pb.num_mixed_in_current_mixed_frames;
+				int pulled = pull_playback_frames<2>(pb.playback, pb.resample_state, pb.pitch_scale, to_pull,
+						[&](int idx, float l, float r) {
+							sd->mixed_frames[mixed_start + idx] += Vector2(l, r) * gain;
+						});
 
-				pb.debug_num_mixed += pulled_count;
-
-				int pulled = MIN(pulled_count, to_pull);
-
-				int mixed_index = pb.num_mixed_in_current_mixed_frames;
-				for (int frames_index = 0; frames_index < pulled; ++frames_index) {
-					if (mixed_index >= frame_size)
-						break; // precaution, but should really not happen...
-					sd->mixed_frames[mixed_index] += Vector2(frames_ptr[frames_index].left, frames_ptr[frames_index].right) * pb.volume_linear * sd->volume_linear;
-					++mixed_index;
-				}
+				pb.debug_num_mixed += pulled;
+				int mixed_index = mixed_start + pulled;
 				min_frames_ready = MIN(min_frames_ready, mixed_index);
 				pb.num_mixed_in_current_mixed_frames = mixed_index;
 			}

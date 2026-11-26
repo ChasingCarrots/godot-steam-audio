@@ -212,6 +212,13 @@ struct SourceListenerData {
 	uint32_t debug_times_contributed = 0;
 };
 
+struct PlaybackResampleState {
+	std::shared_ptr<oboe::resampler::MultiChannelResampler> resampler;
+	godot::Ref<godot::AudioBuffer> unconsumed_input_buffer;
+	int unconsumed_input_count = 0;
+	int unconsumed_input_index = 0;
+};
+
 struct SourcePlaybackEntry {
 	godot::Ref<godot::AudioStreamPlayback> playback;
 	int num_mixed_in_current_mixed_frames = 0;
@@ -220,10 +227,7 @@ struct SourcePlaybackEntry {
 
 	uint32_t debug_num_mixed = 0;
 
-	std::shared_ptr<oboe::resampler::MultiChannelResampler> resampler;
-	godot::Ref<godot::AudioBuffer> unconsumed_input_buffer;
-	int unconsumed_input_count = 0;
-	int unconsumed_input_index = 0;
+	PlaybackResampleState resample_state;
 };
 
 // All configuration a source pushes into the server. Plain data, read across
@@ -534,9 +538,17 @@ private:
 	bool scene_dirty = false;
 
 	godot::Ref<godot::AudioBuffer> mix_scratch_buffer;
-	godot::Ref<godot::AudioBuffer> resampled_scratch_buffer;
 	godot::Ref<godot::AudioBuffer> effect_src_buffer;
 	godot::Ref<godot::AudioBuffer> effect_dst_buffer;
+
+	std::shared_ptr<oboe::resampler::MultiChannelResampler> create_resampler(int channels) const;
+	template <int Channels, typename EmitFn>
+	int pull_playback_frames(
+			const godot::Ref<godot::AudioStreamPlayback> &playback,
+			PlaybackResampleState &state,
+			float pitch_scale,
+			int to_pull,
+			EmitFn &&emit_frame);
 
 	// Cached audio settings, set once during init()
 	IPLAudioSettings cached_audio_settings{};
