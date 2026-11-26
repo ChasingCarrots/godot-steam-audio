@@ -31,6 +31,8 @@ float SteamAudioListenerSensorSlot::get_db_level() { return db_level; }
 
 void SteamAudioListener::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_rid"), &SteamAudioListener::get_rid);
+	ClassDB::bind_method(D_METHOD("set_frame", "frame"), &SteamAudioListener::set_frame);
+	ClassDB::bind_method(D_METHOD("get_frame"), &SteamAudioListener::get_frame);
 	ClassDB::bind_method(D_METHOD("play_on_audiostreamplayer", "audiostreamplayer"), &SteamAudioListener::play_on_audiostreamplayer);
 
 	ClassDB::bind_method(D_METHOD("get_reflection_simulation_enabled"), &SteamAudioListener::get_reflection_simulation_enabled);
@@ -105,6 +107,9 @@ void SteamAudioListener::ready_internal() {
 	cfg.refl_type = refl_type;
 	cfg.irradiance_min_dist = irradiance_min_dist;
 	rid = srv->listener_create_with_config(cfg, get_name(), get_global_transform(), true);
+	if (frame.is_valid()) {
+		srv->listener_set_frame(rid, frame);
+	}
 }
 
 void SteamAudioListener::update_sensor_slots(float delta) {
@@ -295,6 +300,15 @@ void SteamAudioListener::set_refl_type(int p_refl_type) { refl_type = p_refl_typ
 void SteamAudioListener::set_mask(uint32_t p_mask) { mask = p_mask; push_config(); }
 void SteamAudioListener::set_range(float p_range) { range = p_range; push_config(); }
 void SteamAudioListener::set_reflection_simulation_enabled(bool p_enabled) { reflection_simulation_enabled = p_enabled; push_config(); }
+
+void SteamAudioListener::set_frame(RID p_frame) {
+	frame = p_frame;
+	if (!rid.is_valid())
+		return;
+	SteamAudioServer *srv = SteamAudioServer::get_singleton();
+	if (srv)
+		srv->listener_set_frame(rid, frame);
+}
 
 void SteamAudioListener::set_num_source_db_sensor_slots(int p_num_source_db_sensor_slots) {
 	int current_size = sensor_slots.size();

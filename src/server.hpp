@@ -7,6 +7,7 @@
 #include "godot_cpp/classes/object.hpp"
 #include "godot_cpp/classes/thread.hpp"
 #include "godot_cpp/classes/worker_thread_pool.hpp"
+#include "godot_cpp/templates/hash_map.hpp"
 #include "godot_cpp/templates/local_vector.hpp"
 #include "godot_cpp/templates/rid_owner.hpp"
 #include "godot_cpp/variant/packed_vector2_array.hpp"
@@ -134,16 +135,29 @@ struct ListenerData {
 	godot::Transform3D pending_transform;
 	bool has_transform = false;
 
-	// Cached transform data, updated on main thread
-	IPLCoordinateSpace3 cached_coords{};
+	// Target reference frame (invalid = World Frame) and the frame currently bound to simulator.
+	godot::RID frame;
+	godot::RID active_sim_frame;
+
+	// Cached simulation-space transform (in target frame), updated on main thread.
 	godot::Transform3D last_trf;
 	bool has_last_trf = false;
 	bool dirty = false;
+
+	// World-space pose and Ambisonics IR-frame decode pose, synchronized for mixing/reflection threads.
+	IPLCoordinateSpace3 world_coords{};
+	godot::Basis world_basis;
+	godot::RID pending_ir_frame;
+	godot::RID ir_frame;
+	IPLCoordinateSpace3 refl_decode_coords{};
+	std::unique_ptr<std::mutex> orientation_mutex = std::make_unique<std::mutex>();
 
 	IPLSimulationSharedInputs pending_direct_shared_inputs{};
 	bool direct_shared_inputs_dirty = false;
 	IPLSimulationSharedInputs pending_refl_shared_inputs{};
 	bool refl_shared_inputs_dirty = false;
+	IPLSimulationSharedInputs pending_switch_direct_shared_inputs{};
+	bool has_pending_frame_switch = false;
 
 	IPLReflectionMixer reflection_mixer = nullptr;
 	IPLAmbisonicsDecodeEffect ambisonics_decode_effect = nullptr;
@@ -186,6 +200,8 @@ struct SourceListenerData {
 	IPLSimulationInputs pending_direct_inputs{};
 	IPLSimulationInputs pending_refl_inputs{};
 	bool refl_inputs_dirty = false;
+	IPLSimulationInputs pending_switch_direct_inputs{};
+	bool has_pending_switch_direct_inputs = false;
 
 	uint32_t debug_times_contributed = 0;
 };
@@ -275,17 +291,47 @@ struct SourceData {
 	uint32_t debug_times_mixed = 0;
 };
 
-// Static and dynamic geometry unified. For static geometry, sub_scene /
-// instanced_mesh are null and the meshes live directly in the main scene.
+// Two-level instanced geometry: every geometry owns an immutable sub-scene holding one
+// multi-material IPLStaticMesh, mounted as an IPLInstancedMesh into the World scene and each Frame.
 struct GeometryData {
 	godot::RID self;
 	bool dynamic = false;
-	IPLScene sub_scene = nullptr;              // dynamic only
-	IPLInstancedMesh instanced_mesh = nullptr; // dynamic only
-	std::vector<IPLStaticMesh> meshes;
+	godot::RID frame; // invalid = World Frame; valid = moving reference frame RID
+	IPLScene sub_scene = nullptr;
+	IPLStaticMesh mesh = nullptr;
+	IPLInstancedMesh world_instanced_mesh = nullptr;
 
-	godot::Transform3D last_trf;               // dynamic only
+	godot::Transform3D local_trf;
+	godot::Transform3D world_last_trf;
+	bool has_world_last_trf = false;
+};
+
+struct FrameInstance {
+	IPLInstancedMesh instanced_mesh = nullptr;
+	bool enabled = false;
+	godot::Transform3D last_trf;
 	bool has_last_trf = false;
+};
+
+struct FrameData {
+	godot::RID self;
+	std::atomic<bool> freed{ false };
+
+	// Main-thread state used by tick().
+	godot::Transform3D world_transform;
+	godot::Transform3D inv_world_transform;
+	bool has_world_transform = false;
+	bool is_moving = false;
+
+	// Commit-phase state owned exclusively by run_direct_job's idle-reflection phase.
+	IPLScene scene = nullptr;
+	godot::Transform3D sim_world_transform;
+	godot::Transform3D sim_inv_world_transform;
+	bool sim_is_moving = false;
+	bool scene_dirty = false;
+	bool need_rebuild_scene = false;
+	bool committed_this_pass = false;
+	godot::HashMap<GeometryData *, FrameInstance> instances;
 };
 
 // Helper to clean up a SourceListenerData's audio-side IPL resources
@@ -329,13 +375,15 @@ using PendingOp = std::variant<
 	PendingAddPlaybackToListener
 >;
 
-// Geometry ops drained exclusively inside run_direct_job's idle-reflection commit phase.
+// Geometry and frame ops drained exclusively inside run_direct_job's idle-reflection commit phase.
 struct PendingGeomCreate {
 	godot::RID geometry;
 	godot::PackedVector3Array verts;
 	godot::PackedInt32Array tris;
-	godot::PackedFloat32Array material;
-	bool dynamic;
+	godot::PackedInt32Array mat_indices;
+	godot::PackedFloat32Array materials_flat;
+	bool dynamic = false;
+	godot::RID frame;
 };
 
 struct PendingGeomTransform {
@@ -346,17 +394,40 @@ struct PendingGeomTransform {
 struct PendingGeomMaterial {
 	godot::RID geometry;
 	godot::PackedFloat32Array material;
+	int material_index = 0;
 };
 
 struct PendingGeomRemove {
 	godot::RID geometry;
 };
 
+struct PendingFrameCreate {
+	godot::RID frame;
+};
+
+struct PendingFrameTransform {
+	godot::RID frame;
+	godot::Transform3D transform;
+};
+
+struct PendingFrameMoving {
+	godot::RID frame;
+	bool moving = false;
+};
+
+struct PendingFrameRemove {
+	godot::RID frame;
+};
+
 using PendingGeomOp = std::variant<
 	PendingGeomCreate,
 	PendingGeomTransform,
 	PendingGeomMaterial,
-	PendingGeomRemove
+	PendingGeomRemove,
+	PendingFrameCreate,
+	PendingFrameTransform,
+	PendingFrameMoving,
+	PendingFrameRemove
 >;
 
 struct PendingSimSourceRemoval {
@@ -400,10 +471,12 @@ private:
 	godot::RID_PtrOwner<SourceData, true> source_owner;
 	godot::RID_PtrOwner<ListenerData, true> listener_owner;
 	godot::RID_PtrOwner<GeometryData, true> geometry_owner;
+	godot::RID_PtrOwner<FrameData, true> frame_owner;
 
 	godot::LocalVector<SourceData *> sources;
 	std::vector<ListenerData *> listeners;
 	godot::LocalVector<GeometryData *> geometries;
+	godot::LocalVector<FrameData *> frames;
 
 	// Protects sources and listeners (geometries is owned exclusively by the simulation commit phase).
 	// Unique-locked briefly by the mixing thread to apply pending ops.
@@ -430,6 +503,17 @@ private:
 	void create_listener_audio(ListenerData *ld);
 	// Builds the IPLSimulator for ld inside run_direct_job's commit phase.
 	void create_listener_simulator(ListenerData *ld);
+	// Scene / two-level instance helpers (called only in init / run_direct_job commit phase).
+	IPLScene create_ipl_scene();
+	FrameData *find_sim_frame(godot::RID frame_rid);
+	FrameData *get_valid_frame_main(godot::RID frame_rid);
+	IPLScene scene_for_frame(godot::RID frame_rid);
+	godot::Transform3D compute_world_trf(GeometryData *g);
+	void sync_geometry_in_world(GeometryData *g);
+	void sync_geometry_in_frame(GeometryData *g, FrameData *f);
+	void remove_geometry_from_frame(GeometryData *g, FrameData *f);
+	void rebuild_world_scene();
+	void rebuild_frame_scene(FrameData *f);
 
 	std::atomic<bool> is_refl_thread_processing;
 	std::atomic<bool> new_inputs_set;
@@ -478,6 +562,9 @@ public:
 	godot::RID listener_create_with_config(const ListenerConfig &cfg, const godot::String &debug_name, const godot::Transform3D &xform, bool has_xform);
 	void listener_free(godot::RID listener);
 	void listener_set_transform(godot::RID listener, const godot::Transform3D &xform);
+	void listener_set_frame(godot::RID listener, godot::RID frame);
+	godot::RID listener_get_frame(godot::RID listener);
+	godot::RID listener_get_active_frame(godot::RID listener);
 	void listener_set_mask(godot::RID listener, uint32_t mask);
 	void listener_set_range(godot::RID listener, float range);
 	void listener_set_sensor(godot::RID listener, bool enabled);
@@ -516,12 +603,20 @@ public:
 	int source_get_num_active_playbacks(godot::RID source);
 
 	// ── Geometry RID API ─────────────────────────────────────────────────────
-	// Materials are passed as 7 floats: absorption[3], scattering, transmission[3].
+	// Materials are passed as 7 floats per material: absorption[3], scattering, transmission[3].
 	godot::RID geometry_create_static(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material);
 	godot::RID geometry_create_dynamic(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material);
+	godot::RID geometry_create_batched(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedInt32Array &mat_indices, const godot::PackedFloat32Array &materials_flat, bool dynamic, godot::RID frame = godot::RID());
 	void geometry_set_transform(godot::RID geometry, const godot::Transform3D &xform);
-	void geometry_set_material(godot::RID geometry, const godot::PackedFloat32Array &material);
+	void geometry_set_material(godot::RID geometry, const godot::PackedFloat32Array &material, int material_index = 0);
 	void geometry_free(godot::RID geometry);
+
+	// ── Moving Reference Frame RID API ───────────────────────────────────────
+	godot::RID frame_create();
+	void frame_set_world_transform(godot::RID frame, const godot::Transform3D &xform);
+	void frame_set_moving(godot::RID frame, bool moving);
+	bool frame_is_moving(godot::RID frame);
+	void frame_free(godot::RID frame);
 
 	// Audio pulling and effect application. dt is the wall-clock time (seconds) since
 	// the previous process_audio cycle, used to pace sensor-only source mixing.
@@ -551,14 +646,16 @@ public:
 	float get_direct_job_avg_duration_ms() const;
 	int get_source_count();
 	int get_listener_count();
+	int get_geometry_count();
+	int get_frame_count();
 	godot::String get_source_name(int index);
 	godot::String get_listener_name(int index);
 	godot::String get_source_debug_string(int index);
 	godot::String get_listener_debug_string(int index);
 
 private:
-	// Internal RID create/free shared by static and dynamic geometry.
-	godot::RID geometry_create_internal(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedFloat32Array &material, bool dynamic);
+	// Internal RID creation shared by static, dynamic, and batched multi-material geometry.
+	godot::RID geometry_create_internal(const godot::PackedVector3Array &verts, const godot::PackedInt32Array &tris, const godot::PackedInt32Array &mat_indices, const godot::PackedFloat32Array &materials_flat, bool dynamic, godot::RID frame);
 };
 
 #endif // STEAM_AUDIO_SERVER_H

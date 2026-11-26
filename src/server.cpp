@@ -60,15 +60,35 @@ static float get_project_float(const String &key, float def) {
 	return float(v);
 }
 
-// Build an IPLStaticMesh from raw triangle data (no Godot node knowledge). The
-// vertices are expected pre-transformed into the desired space. Triangles are
-// given as a flat index array (3 indices per triangle), Godot CW winding (it is
-// flipped to IPL CCW here).
-static IPLStaticMesh create_ipl_mesh_from_raw(IPLScene scene, const PackedVector3Array &verts, const PackedInt32Array &tris, const IPLMaterial &material) {
+// Build a multi-material IPLStaticMesh from raw triangle data. Vertices are in the
+// sub-scene's local space; Godot CW triangles are flipped to IPL CCW.
+static IPLStaticMesh create_ipl_mesh_from_raw_multi(
+		IPLScene scene,
+		const PackedVector3Array &verts,
+		const PackedInt32Array &tris,
+		const PackedInt32Array &mat_indices,
+		const PackedFloat32Array &materials_flat) {
 	int num_verts = (int)verts.size();
 	int num_tris = (int)tris.size() / 3;
 	if (num_verts == 0 || num_tris == 0)
 		return nullptr;
+
+	int num_mats = MAX(1, (int)(materials_flat.size() / 7));
+	std::vector<IPLMaterial> ipl_mats(num_mats);
+	for (int m = 0; m < num_mats; ++m) {
+		IPLMaterial mat{ { 0.f, 0.f, 0.f }, 0.f, { 0.f, 0.f, 0.f } };
+		int off = m * 7;
+		if (off + 6 < materials_flat.size()) {
+			mat.absorption[0] = materials_flat[off + 0];
+			mat.absorption[1] = materials_flat[off + 1];
+			mat.absorption[2] = materials_flat[off + 2];
+			mat.scattering = materials_flat[off + 3];
+			mat.transmission[0] = materials_flat[off + 4];
+			mat.transmission[1] = materials_flat[off + 5];
+			mat.transmission[2] = materials_flat[off + 6];
+		}
+		ipl_mats[m] = mat;
+	}
 
 	std::vector<IPLVector3> ipl_verts(num_verts);
 	std::vector<IPLTriangle> ipl_tris(num_tris);
@@ -77,23 +97,24 @@ static IPLStaticMesh create_ipl_mesh_from_raw(IPLScene scene, const PackedVector
 	for (int j = 0; j < num_verts; j++) {
 		ipl_verts[j] = ipl_vec3_from(verts[j]);
 	}
-	for (int j = 0; j < num_tris * 3; j += 3) {
+	bool has_indices = (mat_indices.size() == num_tris);
+	for (int j = 0; j < num_tris; j++) {
+		int base = j * 3;
 		// godot tris are cw, ipl tris are ccw
-		ipl_tris[j / 3].indices[0] = tris[j];
-		ipl_tris[j / 3].indices[1] = tris[j + 2];
-		ipl_tris[j / 3].indices[2] = tris[j + 1];
-		ipl_mat_indices[j / 3] = 0;
+		ipl_tris[j].indices[0] = tris[base];
+		ipl_tris[j].indices[1] = tris[base + 2];
+		ipl_tris[j].indices[2] = tris[base + 1];
+		ipl_mat_indices[j] = has_indices ? CLAMP(mat_indices[j], 0, num_mats - 1) : 0;
 	}
 
-	IPLMaterial mats[1] = { material };
 	IPLStaticMeshSettings static_mesh_cfg{};
 	static_mesh_cfg.numVertices = num_verts;
 	static_mesh_cfg.numTriangles = num_tris;
-	static_mesh_cfg.numMaterials = 1;
+	static_mesh_cfg.numMaterials = num_mats;
 	static_mesh_cfg.vertices = ipl_verts.data();
 	static_mesh_cfg.triangles = ipl_tris.data();
 	static_mesh_cfg.materialIndices = ipl_mat_indices.data();
-	static_mesh_cfg.materials = mats;
+	static_mesh_cfg.materials = ipl_mats.data();
 
 	IPLStaticMesh ipl_mesh = nullptr;
 	handleErr(iplStaticMeshCreate(scene, &static_mesh_cfg, &ipl_mesh), "Failed to create static mesh");
@@ -230,6 +251,9 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("listener_create"), &SteamAudioServer::listener_create);
 	ClassDB::bind_method(D_METHOD("listener_free", "listener"), &SteamAudioServer::listener_free);
 	ClassDB::bind_method(D_METHOD("listener_set_transform", "listener", "xform"), &SteamAudioServer::listener_set_transform);
+	ClassDB::bind_method(D_METHOD("listener_set_frame", "listener", "frame"), &SteamAudioServer::listener_set_frame);
+	ClassDB::bind_method(D_METHOD("listener_get_frame", "listener"), &SteamAudioServer::listener_get_frame);
+	ClassDB::bind_method(D_METHOD("listener_get_active_frame", "listener"), &SteamAudioServer::listener_get_active_frame);
 	ClassDB::bind_method(D_METHOD("listener_set_mask", "listener", "mask"), &SteamAudioServer::listener_set_mask);
 	ClassDB::bind_method(D_METHOD("listener_set_range", "listener", "range"), &SteamAudioServer::listener_set_range);
 	ClassDB::bind_method(D_METHOD("listener_set_sensor", "listener", "enabled"), &SteamAudioServer::listener_set_sensor);
@@ -269,9 +293,17 @@ void SteamAudioServer::_bind_methods() {
 	// Geometry RID API
 	ClassDB::bind_method(D_METHOD("geometry_create_static", "verts", "tris", "material"), &SteamAudioServer::geometry_create_static);
 	ClassDB::bind_method(D_METHOD("geometry_create_dynamic", "verts", "tris", "material"), &SteamAudioServer::geometry_create_dynamic);
+	ClassDB::bind_method(D_METHOD("geometry_create_batched", "verts", "tris", "mat_indices", "materials_flat", "dynamic", "frame"), &SteamAudioServer::geometry_create_batched, DEFVAL(RID()));
 	ClassDB::bind_method(D_METHOD("geometry_set_transform", "geometry", "xform"), &SteamAudioServer::geometry_set_transform);
-	ClassDB::bind_method(D_METHOD("geometry_set_material", "geometry", "material"), &SteamAudioServer::geometry_set_material);
+	ClassDB::bind_method(D_METHOD("geometry_set_material", "geometry", "material", "material_index"), &SteamAudioServer::geometry_set_material, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("geometry_free", "geometry"), &SteamAudioServer::geometry_free);
+
+	// Moving Reference Frame RID API
+	ClassDB::bind_method(D_METHOD("frame_create"), &SteamAudioServer::frame_create);
+	ClassDB::bind_method(D_METHOD("frame_set_world_transform", "frame", "xform"), &SteamAudioServer::frame_set_world_transform);
+	ClassDB::bind_method(D_METHOD("frame_set_moving", "frame", "moving"), &SteamAudioServer::frame_set_moving);
+	ClassDB::bind_method(D_METHOD("frame_is_moving", "frame"), &SteamAudioServer::frame_is_moving);
+	ClassDB::bind_method(D_METHOD("frame_free", "frame"), &SteamAudioServer::frame_free);
 
 	ClassDB::bind_method(D_METHOD("get_mixing_thread_usage_pct"), &SteamAudioServer::get_mixing_thread_usage_pct);
 	ClassDB::bind_method(D_METHOD("get_stress_mitigation"), &SteamAudioServer::get_stress_mitigation);
@@ -283,6 +315,8 @@ void SteamAudioServer::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "direct_job_avg_duration_ms"), "", "get_direct_job_avg_duration_ms");
 	ClassDB::bind_method(D_METHOD("get_source_count"), &SteamAudioServer::get_source_count);
 	ClassDB::bind_method(D_METHOD("get_listener_count"), &SteamAudioServer::get_listener_count);
+	ClassDB::bind_method(D_METHOD("get_geometry_count"), &SteamAudioServer::get_geometry_count);
+	ClassDB::bind_method(D_METHOD("get_frame_count"), &SteamAudioServer::get_frame_count);
 	ClassDB::bind_method(D_METHOD("get_source_name", "index"), &SteamAudioServer::get_source_name);
 	ClassDB::bind_method(D_METHOD("get_listener_name", "index"), &SteamAudioServer::get_listener_name);
 	ClassDB::bind_method(D_METHOD("get_source_debug_string", "index"), &SteamAudioServer::get_source_debug_string);
@@ -313,6 +347,14 @@ int SteamAudioServer::get_source_count() {
 int SteamAudioServer::get_listener_count() {
 	std::shared_lock lock(collections_mutex);
 	return (int)listeners.size();
+}
+
+int SteamAudioServer::get_geometry_count() {
+	return (int)geometry_owner.get_rid_count();
+}
+
+int SteamAudioServer::get_frame_count() {
+	return (int)frame_owner.get_rid_count();
 }
 
 String SteamAudioServer::get_source_name(int index) {
@@ -519,6 +561,220 @@ void SteamAudioServer::ensure_initialized() {
 	init();
 }
 
+IPLScene SteamAudioServer::create_ipl_scene() {
+	IPLSceneSettings scene_cfg{};
+	scene_cfg.radeonRaysDevice = nullptr;
+	scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+	if (scene_cfg.type == IPL_SCENETYPE_EMBREE) {
+		if (!embree_dev) {
+			ERR_PRINT("SteamAudio: create_ipl_scene with EMBREE and uninitialized embree device.");
+			return nullptr;
+		}
+		scene_cfg.embreeDevice = embree_dev;
+	}
+	IPLScene scene = nullptr;
+	if (!handleErr(iplSceneCreate(phonon_context, &scene_cfg, &scene), "SteamAudio: Failed to create scene")) {
+		return nullptr;
+	}
+	return scene;
+}
+
+FrameData *SteamAudioServer::find_sim_frame(RID frame_rid) {
+	if (!frame_rid.is_valid())
+		return nullptr;
+	for (auto *f : frames) {
+		if (f->self == frame_rid)
+			return f;
+	}
+	return nullptr;
+}
+
+FrameData *SteamAudioServer::get_valid_frame_main(RID frame_rid) {
+	if (!frame_rid.is_valid())
+		return nullptr;
+	FrameData *f = frame_owner.get_or_null(frame_rid);
+	if (!f || f->freed.load(std::memory_order_acquire))
+		return nullptr;
+	return f;
+}
+
+IPLScene SteamAudioServer::scene_for_frame(RID frame_rid) {
+	FrameData *f = find_sim_frame(frame_rid);
+	return (f && f->scene) ? f->scene : phonon_scene;
+}
+
+Transform3D SteamAudioServer::compute_world_trf(GeometryData *g) {
+	if (g->frame.is_valid()) {
+		FrameData *owner = find_sim_frame(g->frame);
+		if (owner) {
+			return owner->sim_world_transform * g->local_trf;
+		}
+	}
+	return g->local_trf;
+}
+
+void SteamAudioServer::sync_geometry_in_world(GeometryData *g) {
+	if (!g || !g->world_instanced_mesh || !phonon_scene)
+		return;
+	Transform3D target = compute_world_trf(g);
+	if (!g->has_world_last_trf || !target.is_equal_approx(g->world_last_trf)) {
+		IPLMatrix4x4 m = ipl_mat4_from(target);
+		iplInstancedMeshUpdateTransform(g->world_instanced_mesh, phonon_scene, m);
+		g->world_last_trf = target;
+		g->has_world_last_trf = true;
+		scene_dirty = true;
+	}
+}
+
+void SteamAudioServer::sync_geometry_in_frame(GeometryData *g, FrameData *f) {
+	if (!g || !g->sub_scene || !f || !f->scene)
+		return;
+
+	bool owned_by_frame = (g->frame == f->self);
+	bool should_enable = owned_by_frame || !f->sim_is_moving;
+
+	FrameInstance *fi_ptr = f->instances.getptr(g);
+	if (!should_enable) {
+		if (fi_ptr && fi_ptr->enabled && fi_ptr->instanced_mesh) {
+			iplInstancedMeshRemove(fi_ptr->instanced_mesh, f->scene);
+			fi_ptr->enabled = false;
+			f->scene_dirty = true;
+		}
+		return;
+	}
+
+	Transform3D target = owned_by_frame ? g->local_trf : (f->sim_inv_world_transform * compute_world_trf(g));
+
+	if (!fi_ptr) {
+		IPLInstancedMeshSettings inst_cfg{};
+		inst_cfg.subScene = g->sub_scene;
+		inst_cfg.transform = ipl_mat4_from(target);
+		IPLInstancedMesh inst = nullptr;
+		if (!handleErr(iplInstancedMeshCreate(f->scene, &inst_cfg, &inst), "SteamAudio: Failed to create frame instanced mesh")) {
+			return;
+		}
+		iplInstancedMeshAdd(inst, f->scene);
+		FrameInstance new_fi;
+		new_fi.instanced_mesh = inst;
+		new_fi.enabled = true;
+		new_fi.last_trf = target;
+		new_fi.has_last_trf = true;
+		f->instances[g] = new_fi;
+		f->scene_dirty = true;
+		return;
+	}
+
+	if (!fi_ptr->enabled) {
+		iplInstancedMeshAdd(fi_ptr->instanced_mesh, f->scene);
+		fi_ptr->enabled = true;
+		f->scene_dirty = true;
+	}
+
+	if (!fi_ptr->has_last_trf || !target.is_equal_approx(fi_ptr->last_trf)) {
+		IPLMatrix4x4 m = ipl_mat4_from(target);
+		iplInstancedMeshUpdateTransform(fi_ptr->instanced_mesh, f->scene, m);
+		fi_ptr->last_trf = target;
+		fi_ptr->has_last_trf = true;
+		f->scene_dirty = true;
+	}
+}
+
+void SteamAudioServer::remove_geometry_from_frame(GeometryData *g, FrameData *f) {
+	if (!g || !f || !f->scene)
+		return;
+	FrameInstance *fi_ptr = f->instances.getptr(g);
+	if (!fi_ptr)
+		return;
+	if (fi_ptr->instanced_mesh) {
+		if (fi_ptr->enabled) {
+			iplInstancedMeshRemove(fi_ptr->instanced_mesh, f->scene);
+		}
+		iplInstancedMeshRelease(&fi_ptr->instanced_mesh);
+	}
+	f->instances.erase(g);
+	f->need_rebuild_scene = true;
+}
+
+// Steam Audio's EmbreeInstancedMesh destructor recycles geomIDs without calling rtcDetachGeometry,
+// so Embree 4 rejects subsequent rtcAttachGeometryByID on the reused slot. Rebuilding the tiny
+// top-level instance scene on geometry removal avoids slot collisions while keeping sub-scenes intact.
+void SteamAudioServer::rebuild_world_scene() {
+	IPLScene fresh = create_ipl_scene();
+	if (!fresh)
+		return;
+	for (auto *g : geometries) {
+		if (g->world_instanced_mesh) {
+			if (phonon_scene) {
+				iplInstancedMeshRemove(g->world_instanced_mesh, phonon_scene);
+			}
+			iplInstancedMeshRelease(&g->world_instanced_mesh);
+		}
+		g->has_world_last_trf = false;
+	}
+	if (phonon_scene) {
+		iplSceneRelease(&phonon_scene);
+	}
+	phonon_scene = fresh;
+	for (auto *g : geometries) {
+		if (!g->sub_scene)
+			continue;
+		Transform3D trf = compute_world_trf(g);
+		IPLInstancedMeshSettings inst_cfg{};
+		inst_cfg.subScene = g->sub_scene;
+		inst_cfg.transform = ipl_mat4_from(trf);
+		if (handleErr(iplInstancedMeshCreate(phonon_scene, &inst_cfg, &g->world_instanced_mesh), "SteamAudio: Failed to recreate world instanced mesh")) {
+			iplInstancedMeshAdd(g->world_instanced_mesh, phonon_scene);
+			g->world_last_trf = trf;
+			g->has_world_last_trf = true;
+		}
+	}
+	for (auto *ld : listeners) {
+		if (!ld->active_sim_frame.is_valid()) {
+			IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+			if (sim) {
+				iplSimulatorSetScene(sim, phonon_scene);
+				ld->dirty = true;
+			}
+		}
+	}
+	scene_dirty = true;
+}
+
+void SteamAudioServer::rebuild_frame_scene(FrameData *f) {
+	if (!f)
+		return;
+	IPLScene fresh = create_ipl_scene();
+	if (!fresh)
+		return;
+	for (auto &kv : f->instances) {
+		if (kv.value.instanced_mesh) {
+			if (kv.value.enabled && f->scene) {
+				iplInstancedMeshRemove(kv.value.instanced_mesh, f->scene);
+			}
+			iplInstancedMeshRelease(&kv.value.instanced_mesh);
+		}
+	}
+	f->instances.clear();
+	if (f->scene) {
+		iplSceneRelease(&f->scene);
+	}
+	f->scene = fresh;
+	f->need_rebuild_scene = false;
+	for (auto *g : geometries) {
+		sync_geometry_in_frame(g, f);
+	}
+	for (auto *ld : listeners) {
+		if (ld->active_sim_frame == f->self) {
+			IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+			if (sim) {
+				iplSimulatorSetScene(sim, f->scene);
+				ld->dirty = true;
+			}
+		}
+	}
+	f->scene_dirty = true;
+}
+
 void SteamAudioServer::init() {
 	if (is_initialized)
 		return;
@@ -534,17 +790,12 @@ void SteamAudioServer::init() {
 		return;
 	}
 
-	IPLSceneSettings scene_cfg{};
-	scene_cfg.radeonRaysDevice = nullptr;
-	scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
-	if (scene_cfg.type == IPL_SCENETYPE_EMBREE) {
+	IPLSceneType scene_type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
+	if (scene_type == IPL_SCENETYPE_EMBREE) {
 		IPLEmbreeDeviceSettings embree_cfg{};
 		iplEmbreeDeviceCreate(phonon_context, &embree_cfg, &embree_dev);
-		scene_cfg.embreeDevice = embree_dev;
 	}
-	if (!handleErr(iplSceneCreate(phonon_context, &scene_cfg, &phonon_scene), "SteamAudio: Failed to create scene")) {
-		phonon_scene = nullptr;
-	}
+	phonon_scene = create_ipl_scene();
 
 	// Fixed at startup: a runtime device switch to a different rate leaves the HRTF,
 	// simulators and effects below stale.
@@ -646,24 +897,39 @@ void SteamAudioServer::finish() {
 	}
 	sources.clear();
 
+	for (auto *f : frames) {
+		for (auto &kv : f->instances) {
+			if (kv.value.instanced_mesh) {
+				if (kv.value.enabled && f->scene) {
+					iplInstancedMeshRemove(kv.value.instanced_mesh, f->scene);
+				}
+				iplInstancedMeshRelease(&kv.value.instanced_mesh);
+			}
+		}
+		f->instances.clear();
+		if (f->scene) {
+			iplSceneRelease(&f->scene);
+		}
+		frame_owner.free(f->self);
+		memdelete(f);
+	}
+	frames.clear();
+
 	for (auto *g : geometries) {
-		if (g->dynamic) {
-			if (g->instanced_mesh) {
-				iplInstancedMeshRemove(g->instanced_mesh, phonon_scene);
-				iplInstancedMeshRelease(&g->instanced_mesh);
+		if (g->world_instanced_mesh) {
+			if (phonon_scene) {
+				iplInstancedMeshRemove(g->world_instanced_mesh, phonon_scene);
 			}
-			for (auto &m : g->meshes) {
-				if (g->sub_scene)
-					iplStaticMeshRemove(m, g->sub_scene);
-				iplStaticMeshRelease(&m);
+			iplInstancedMeshRelease(&g->world_instanced_mesh);
+		}
+		if (g->mesh) {
+			if (g->sub_scene) {
+				iplStaticMeshRemove(g->mesh, g->sub_scene);
 			}
-			if (g->sub_scene)
-				iplSceneRelease(&g->sub_scene);
-		} else {
-			for (auto &m : g->meshes) {
-				iplStaticMeshRemove(m, phonon_scene);
-				iplStaticMeshRelease(&m);
-			}
+			iplStaticMeshRelease(&g->mesh);
+		}
+		if (g->sub_scene) {
+			iplSceneRelease(&g->sub_scene);
 		}
 		geometry_owner.free(g->self);
 		memdelete(g);
@@ -677,6 +943,10 @@ void SteamAudioServer::finish() {
 	if (phonon_scene) {
 		iplSceneRelease(&phonon_scene);
 		phonon_scene = nullptr;
+	}
+	if (embree_dev) {
+		iplEmbreeDeviceRelease(&embree_dev);
+		embree_dev = nullptr;
 	}
 	if (phonon_context) {
 		iplContextRelease(&phonon_context);
@@ -775,7 +1045,7 @@ void SteamAudioServer::tick(float delta) {
 				if (sd->cfg.air_absorption_enabled) {
 					IPLAirAbsorptionModel airAbsorptionModel = make_air_absorption_model(sd->cfg);
 					float air_absorption[3];
-					iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld->cached_coords.origin, &airAbsorptionModel, air_absorption);
+					iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld->world_coords.origin, &airAbsorptionModel, air_absorption);
 					float avg_air_absorption = (air_absorption[0] + air_absorption[1] + air_absorption[2]) / 3.0f;
 					total_direct_factor *= avg_air_absorption;
 				}
@@ -804,31 +1074,62 @@ void SteamAudioServer::tick(float delta) {
 
 			float stress_mitigation_factor = 0.1f + 0.9f * (1.0f - stress_mitigation.load());
 
+			// Resolve active (currently bound to sim) and target (requested) reference frames.
+			FrameData *active_frame = get_valid_frame_main(ld->active_sim_frame);
+			RID effective_target_frame = get_valid_frame_main(ld->frame) ? ld->frame : RID();
+			FrameData *target_frame = get_valid_frame_main(effective_target_frame);
+			Transform3D active_sim_from_world = active_frame ? active_frame->inv_world_transform : Transform3D();
+			Transform3D target_sim_from_world = target_frame ? target_frame->inv_world_transform : Transform3D();
+			bool frame_switching = (ld->active_sim_frame != effective_target_frame);
+
+			Transform3D listener_world_trf = ld->has_transform ? ld->pending_transform : Transform3D();
+
 			// Update listener transform from pushed data
 			if (ld->has_transform) {
-				Transform3D trf = ld->pending_transform;
-				if (!ld->has_last_trf || !trf.is_equal_approx(ld->last_trf)) {
-					ld->cached_coords = ipl_coords_from(trf);
+				// World-space pose and Ambisonics IR-frame decode pose for the mixing thread.
+				{
+					std::lock_guard<std::mutex> orient_lock(*ld->orientation_mutex);
+					ld->world_coords = ipl_coords_from(listener_world_trf);
+					ld->world_basis = listener_world_trf.basis;
+					FrameData *ir_f = get_valid_frame_main(ld->ir_frame);
+					Basis decode_basis = ir_f ? (ir_f->inv_world_transform.basis * listener_world_trf.basis) : listener_world_trf.basis;
+					ld->refl_decode_coords = ipl_coords_from(Transform3D(decode_basis, Vector3()));
+				}
 
+				Transform3D active_listener_trf = active_sim_from_world * listener_world_trf;
+				Transform3D target_listener_trf = target_sim_from_world * listener_world_trf;
+
+				auto make_shared_inputs = [&](const Transform3D &trf) {
 					IPLSimulationSharedInputs shared_inputs{};
-					shared_inputs.listener = ld->cached_coords;
+					shared_inputs.listener = ipl_coords_from(trf);
 					shared_inputs.numRays = ld->cfg.num_refl_rays;
 					shared_inputs.numBounces = ld->cfg.num_refl_bounces;
 					shared_inputs.duration = ld->cfg.refl_duration * stress_mitigation_factor;
 					shared_inputs.order = ld->cfg.refl_ambisonics_order;
 					shared_inputs.irradianceMinDistance = ld->cfg.irradiance_min_dist;
+					return shared_inputs;
+				};
 
-					if (sim) {
-						iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &shared_inputs);
-					} else {
-						ld->pending_direct_shared_inputs = shared_inputs;
-						ld->direct_shared_inputs_dirty = true;
-					}
+				// Direct inputs must match the scene currently bound to sim (active_sim_frame).
+				IPLSimulationSharedInputs direct_shared = make_shared_inputs(active_listener_trf);
+				if (sim) {
+					iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &direct_shared);
+				} else {
+					ld->pending_direct_shared_inputs = make_shared_inputs(target_listener_trf);
+					ld->direct_shared_inputs_dirty = true;
+				}
+
+				if (frame_switching) {
+					ld->pending_switch_direct_shared_inputs = make_shared_inputs(target_listener_trf);
+					ld->has_pending_frame_switch = true;
+				}
+
+				if (!ld->has_last_trf || !target_listener_trf.is_equal_approx(ld->last_trf) || frame_switching) {
 					if (ld->cfg.reflection_simulation_enabled) {
-						ld->pending_refl_shared_inputs = shared_inputs;
+						ld->pending_refl_shared_inputs = make_shared_inputs(target_listener_trf);
 						ld->refl_shared_inputs_dirty = true;
 					}
-					ld->last_trf = trf;
+					ld->last_trf = target_listener_trf;
 					ld->has_last_trf = true;
 				}
 			}
@@ -857,7 +1158,7 @@ void SteamAudioServer::tick(float delta) {
 				sd->cached_coords = ipl_coords_from(src_trf);
 
 				float prev_dist_to_listener = sld->dist_to_listener;
-				sld->dist_to_listener = src_trf.origin.distance_to(ld->last_trf.origin);
+				sld->dist_to_listener = src_trf.origin.distance_to(listener_world_trf.origin);
 
 				float doppler_factor = sd->cfg.doppler_factor;
 				if (doppler_factor > 0.0f && prev_dist_to_listener != 0.0f) {
@@ -945,7 +1246,10 @@ void SteamAudioServer::tick(float delta) {
 					}
 				}
 
-				inputs.source = sd->cached_coords;
+				Transform3D active_src_trf = active_sim_from_world * src_trf;
+				Transform3D target_src_trf = target_sim_from_world * src_trf;
+
+				inputs.source = ipl_coords_from(active_src_trf);
 				inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
 				inputs.airAbsorptionModel = make_air_absorption_model(sd->cfg);
 
@@ -960,15 +1264,22 @@ void SteamAudioServer::tick(float delta) {
 				inputs.hybridReverbOverlapPercent = 0.25f;
 				inputs.baked = IPL_FALSE;
 
+				IPLSimulationInputs target_inputs = inputs;
+				target_inputs.source = ipl_coords_from(target_src_trf);
+
 				if (src) {
 					if (sd->cfg.direct_enabled) {
 						iplSourceSetInputs(src, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
 					}
 				} else {
-					sld->pending_direct_inputs = inputs;
+					sld->pending_direct_inputs = target_inputs;
+				}
+				if (frame_switching && sd->cfg.direct_enabled) {
+					sld->pending_switch_direct_inputs = target_inputs;
+					sld->has_pending_switch_direct_inputs = true;
 				}
 				if (sd->cfg.reflection_enabled) {
-					sld->pending_refl_inputs = inputs;
+					sld->pending_refl_inputs = target_inputs;
 					sld->refl_inputs_dirty = true;
 				}
 				sd->last_trf = src_trf;
@@ -1029,6 +1340,35 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 			for (auto *ld : self->listeners) {
 				if (ld->pending_simulator_create) {
 					self->create_listener_simulator(ld);
+				} else {
+					IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+					if (sim) {
+						FrameData *target_f = self->find_sim_frame(ld->frame);
+						RID resolved_frame = target_f ? target_f->self : RID();
+						if (ld->active_sim_frame != resolved_frame) {
+							IPLScene target_scene = (target_f && target_f->scene) ? target_f->scene : self->phonon_scene;
+							if (target_scene) {
+								iplSimulatorSetScene(sim, target_scene);
+							}
+							ld->active_sim_frame = resolved_frame;
+							ld->dirty = true;
+							if (ld->has_pending_frame_switch) {
+								iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &ld->pending_switch_direct_shared_inputs);
+								ld->has_pending_frame_switch = false;
+							}
+							for (auto *sd : self->sources) {
+								for (auto &sld : sd->listener_data) {
+									if (sld.listener != ld || !sld.has_pending_switch_direct_inputs)
+										continue;
+									IPLSource src = sld.source.load(std::memory_order_acquire);
+									if (src && sd->cfg.direct_enabled) {
+										iplSourceSetInputs(src, IPL_SIMULATIONFLAGS_DIRECT, &sld.pending_switch_direct_inputs);
+									}
+									sld.has_pending_switch_direct_inputs = false;
+								}
+							}
+						}
+					}
 				}
 			}
 
@@ -1075,18 +1415,29 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 				}
 			}
 
-			bool committed_scene = false;
+			bool world_committed = false;
 			if (self->scene_dirty) {
 				iplSceneCommit(self->phonon_scene);
 				self->scene_dirty = false;
-				committed_scene = true;
+				world_committed = true;
+			}
+
+			for (auto *f : self->frames) {
+				f->committed_this_pass = false;
+				if (f->scene_dirty && f->scene) {
+					iplSceneCommit(f->scene);
+					f->scene_dirty = false;
+					f->committed_this_pass = true;
+				}
 			}
 
 			for (auto *ld : self->listeners) {
 				IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
 				if (!sim)
 					continue;
-				if (committed_scene || ld->dirty) {
+				FrameData *bound_f = self->find_sim_frame(ld->active_sim_frame);
+				bool bound_scene_committed = bound_f ? bound_f->committed_this_pass : world_committed;
+				if (bound_scene_committed || ld->dirty) {
 					iplSimulatorCommit(sim);
 					ld->dirty = false;
 				}
@@ -1108,6 +1459,7 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 					ld->refl_shared_inputs_dirty = false;
 				}
 				if (ld->simulator_reflection_enabled) {
+					ld->pending_ir_frame = ld->active_sim_frame;
 					wake_refl = true;
 				}
 			}
@@ -1152,7 +1504,13 @@ void SteamAudioServer::run_direct_job(void *p_self) {
 }
 
 void SteamAudioServer::simulation_thread_func() {
-	LocalVector<IPLSimulator> simulators;
+	struct SimEntry {
+		IPLSimulator sim = nullptr;
+		RID listener_rid;
+		RID sim_frame;
+		Basis sim_frame_inv_basis;
+	};
+	LocalVector<SimEntry> simulators;
 	while (is_running.load()) {
 		{
 			std::unique_lock<std::mutex> lock_refl(refl_mux);
@@ -1179,16 +1537,38 @@ void SteamAudioServer::simulation_thread_func() {
 					IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
 					if (!sim || !ld->simulator_reflection_enabled)
 						continue;
-					simulators.push_back(iplSimulatorRetain(sim));
+					Basis inv_basis;
+					if (ld->pending_ir_frame.is_valid()) {
+						FrameData *f = frame_owner.get_or_null(ld->pending_ir_frame);
+						if (f && !f->freed.load(std::memory_order_acquire)) {
+							inv_basis = f->sim_inv_world_transform.basis;
+						}
+					}
+					simulators.push_back({ iplSimulatorRetain(sim), ld->self, ld->pending_ir_frame, inv_basis });
 				}
 			}
 
-			for (auto &sim : simulators) {
-				iplSimulatorRunReflections(sim);
+			for (auto &entry : simulators) {
+				iplSimulatorRunReflections(entry.sim);
 			}
 
-			for (auto &sim : simulators) {
-				iplSimulatorRelease(&sim);
+			// Publish the IR's coordinate frame right after its pass finishes so Ambisonics
+			// decoding switches in lockstep with the newly produced impulse response.
+			{
+				std::shared_lock lock(collections_mutex);
+				for (auto &entry : simulators) {
+					ListenerData *ld = listener_owner.get_or_null(entry.listener_rid);
+					if (!ld)
+						continue;
+					std::lock_guard<std::mutex> orient_lock(*ld->orientation_mutex);
+					ld->ir_frame = entry.sim_frame;
+					Basis decode_basis = entry.sim_frame_inv_basis * ld->world_basis;
+					ld->refl_decode_coords = ipl_coords_from(Transform3D(decode_basis, Vector3()));
+				}
+			}
+
+			for (auto &entry : simulators) {
+				iplSimulatorRelease(&entry.sim);
 			}
 			simulators.clear();
 
@@ -1331,7 +1711,13 @@ void SteamAudioServer::create_listener_simulator(ListenerData *ld) {
 
 	IPLSimulator sim = nullptr;
 	if (handleErr(iplSimulatorCreate(phonon_context, &sim_cfg, &sim), "SteamAudio: Failed to create simulator for listener")) {
-		iplSimulatorSetScene(sim, phonon_scene);
+		FrameData *target_f = find_sim_frame(ld->frame);
+		RID resolved_frame = target_f ? target_f->self : RID();
+		IPLScene target_scene = (target_f && target_f->scene) ? target_f->scene : phonon_scene;
+		if (target_scene) {
+			iplSimulatorSetScene(sim, target_scene);
+		}
+		ld->active_sim_frame = resolved_frame;
 		if (ld->direct_shared_inputs_dirty) {
 			iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &ld->pending_direct_shared_inputs);
 			ld->direct_shared_inputs_dirty = false;
@@ -1354,6 +1740,8 @@ void SteamAudioServer::apply_pending_geom_ops() {
 	if (ops.empty())
 		return;
 
+	bool need_rebuild_world = false;
+
 	for (auto &op : ops) {
 		std::visit([&](auto &pending) {
 			using T = std::decay_t<decltype(pending)>;
@@ -1366,105 +1754,201 @@ void SteamAudioServer::apply_pending_geom_ops() {
 					if (existing == g)
 						return;
 				}
-				IPLMaterial mat = ipl_material_from_floats(pending.material);
-				if (pending.dynamic) {
-					IPLSceneSettings sub_scene_cfg{};
-					sub_scene_cfg.radeonRaysDevice = nullptr;
-					sub_scene_cfg.type = static_cast<IPLSceneType>(get_project_int("steamaudio/scene_type", IPL_SCENETYPE_DEFAULT));
-					if (sub_scene_cfg.type == IPL_SCENETYPE_EMBREE) {
-						if (embree_dev == nullptr) {
-							ERR_PRINT("SteamAudio: geometry_create_dynamic with scene_type EMBREE and uninitialized embree device.");
-							return;
-						}
-						sub_scene_cfg.embreeDevice = embree_dev;
-					}
-					if (!handleErr(iplSceneCreate(phonon_context, &sub_scene_cfg, &g->sub_scene), "SteamAudio: Failed to create sub-scene")) {
-						return;
-					}
-					IPLStaticMesh m = create_ipl_mesh_from_raw(g->sub_scene, pending.verts, pending.tris, mat);
-					if (m) {
-						g->meshes.push_back(m);
-						iplStaticMeshAdd(m, g->sub_scene);
-					}
-					iplSceneCommit(g->sub_scene);
+				g->sub_scene = create_ipl_scene();
+				if (!g->sub_scene)
+					return;
+				g->mesh = create_ipl_mesh_from_raw_multi(g->sub_scene, pending.verts, pending.tris, pending.mat_indices, pending.materials_flat);
+				if (!g->mesh) {
+					iplSceneRelease(&g->sub_scene);
+					return;
+				}
+				iplStaticMeshAdd(g->mesh, g->sub_scene);
+				iplSceneCommit(g->sub_scene);
 
-					IPLInstancedMeshSettings inst_cfg{};
-					inst_cfg.subScene = g->sub_scene;
-					inst_cfg.transform = ipl_mat4_from(Transform3D());
-					if (handleErr(iplInstancedMeshCreate(phonon_scene, &inst_cfg, &g->instanced_mesh), "SteamAudio: Failed to create instanced mesh")) {
-						iplInstancedMeshAdd(g->instanced_mesh, phonon_scene);
-					}
-				} else {
-					IPLStaticMesh m = create_ipl_mesh_from_raw(phonon_scene, pending.verts, pending.tris, mat);
-					if (m) {
-						g->meshes.push_back(m);
-						iplStaticMeshAdd(m, phonon_scene);
-					}
+				IPLInstancedMeshSettings inst_cfg{};
+				inst_cfg.subScene = g->sub_scene;
+				inst_cfg.transform = ipl_mat4_from(compute_world_trf(g));
+				if (handleErr(iplInstancedMeshCreate(phonon_scene, &inst_cfg, &g->world_instanced_mesh), "SteamAudio: Failed to create world instanced mesh")) {
+					iplInstancedMeshAdd(g->world_instanced_mesh, phonon_scene);
+					g->world_last_trf = compute_world_trf(g);
+					g->has_world_last_trf = true;
 				}
 				geometries.push_back(g);
 				scene_dirty = true;
 
+				for (auto *f : frames) {
+					sync_geometry_in_frame(g, f);
+				}
+
 			} else if constexpr (std::is_same_v<T, PendingGeomTransform>) {
 				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
-				if (!g || !g->dynamic || !g->instanced_mesh)
+				if (!g || !g->sub_scene)
 					return;
-				if (!g->has_last_trf || !pending.transform.is_equal_approx(g->last_trf)) {
-					IPLMatrix4x4 m = ipl_mat4_from(pending.transform);
-					iplInstancedMeshUpdateTransform(g->instanced_mesh, phonon_scene, m);
-					g->last_trf = pending.transform;
-					g->has_last_trf = true;
-					scene_dirty = true;
+				g->local_trf = pending.transform;
+				sync_geometry_in_world(g);
+				for (auto *f : frames) {
+					sync_geometry_in_frame(g, f);
 				}
 
 			} else if constexpr (std::is_same_v<T, PendingGeomMaterial>) {
 				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
-				if (!g)
+				if (!g || !g->sub_scene || !g->mesh)
 					return;
 				IPLMaterial mat = ipl_material_from_floats(pending.material);
-				IPLScene target_scene = g->dynamic ? g->sub_scene : phonon_scene;
-				if (!target_scene)
-					return;
-				for (auto &m : g->meshes) {
-					iplStaticMeshSetMaterial(m, target_scene, &mat, 0);
-				}
-				if (g->dynamic) {
-					iplSceneCommit(g->sub_scene);
-				}
+				iplStaticMeshSetMaterial(g->mesh, g->sub_scene, &mat, pending.material_index);
+				iplSceneCommit(g->sub_scene);
 				scene_dirty = true;
+				for (auto *f : frames) {
+					if (f->instances.has(g)) {
+						f->scene_dirty = true;
+					}
+				}
 
 			} else if constexpr (std::is_same_v<T, PendingGeomRemove>) {
 				GeometryData *g = geometry_owner.get_or_null(pending.geometry);
 				if (!g)
 					return;
+				for (auto *f : frames) {
+					remove_geometry_from_frame(g, f);
+				}
 				for (uint32_t i = 0; i < geometries.size(); ++i) {
 					if (geometries[i] != g)
 						continue;
-					if (g->dynamic) {
-						for (auto &m : g->meshes) {
-							if (g->sub_scene)
-								iplStaticMeshRemove(m, g->sub_scene);
-							iplStaticMeshRelease(&m);
-						}
-						if (g->instanced_mesh) {
-							iplInstancedMeshRemove(g->instanced_mesh, phonon_scene);
-							iplInstancedMeshRelease(&g->instanced_mesh);
-						}
-						if (g->sub_scene)
-							iplSceneRelease(&g->sub_scene);
-					} else {
-						for (auto &m : g->meshes) {
-							iplStaticMeshRemove(m, phonon_scene);
-							iplStaticMeshRelease(&m);
-						}
+					if (g->world_instanced_mesh) {
+						iplInstancedMeshRemove(g->world_instanced_mesh, phonon_scene);
+						iplInstancedMeshRelease(&g->world_instanced_mesh);
 					}
+					if (g->mesh) {
+						if (g->sub_scene)
+							iplStaticMeshRemove(g->mesh, g->sub_scene);
+						iplStaticMeshRelease(&g->mesh);
+					}
+					if (g->sub_scene)
+						iplSceneRelease(&g->sub_scene);
 					geometries.remove_at(i);
-					scene_dirty = true;
+					need_rebuild_world = true;
 					break;
 				}
 				geometry_owner.free(g->self);
 				memdelete(g);
+
+			} else if constexpr (std::is_same_v<T, PendingFrameCreate>) {
+				FrameData *f = frame_owner.get_or_null(pending.frame);
+				if (!f || f->freed.load(std::memory_order_acquire))
+					return;
+				for (auto *existing : frames) {
+					if (existing == f)
+						return;
+				}
+				f->scene = create_ipl_scene();
+				if (!f->scene)
+					return;
+				f->sim_world_transform = f->world_transform;
+				f->sim_inv_world_transform = f->inv_world_transform;
+				f->sim_is_moving = f->is_moving;
+				frames.push_back(f);
+				f->scene_dirty = true;
+				for (auto *g : geometries) {
+					if (g->frame == f->self) {
+						sync_geometry_in_world(g);
+					}
+					sync_geometry_in_frame(g, f);
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingFrameTransform>) {
+				FrameData *f = find_sim_frame(pending.frame);
+				if (!f)
+					return;
+				if (!pending.transform.is_equal_approx(f->sim_world_transform)) {
+					f->sim_world_transform = pending.transform;
+					f->sim_inv_world_transform = pending.transform.affine_inverse();
+					for (auto *g : geometries) {
+						if (g->frame == f->self) {
+							sync_geometry_in_world(g);
+							// Other moving frames observing this vehicle while parked also update.
+							for (auto *other_f : frames) {
+								if (other_f != f) {
+									sync_geometry_in_frame(g, other_f);
+								}
+							}
+						} else if (!f->sim_is_moving) {
+							sync_geometry_in_frame(g, f);
+						}
+					}
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingFrameMoving>) {
+				FrameData *f = find_sim_frame(pending.frame);
+				if (!f)
+					return;
+				if (f->sim_is_moving != pending.moving) {
+					f->sim_is_moving = pending.moving;
+					for (auto *g : geometries) {
+						if (g->frame != f->self) {
+							sync_geometry_in_frame(g, f);
+						}
+					}
+				}
+
+			} else if constexpr (std::is_same_v<T, PendingFrameRemove>) {
+				FrameData *f = frame_owner.get_or_null(pending.frame);
+				if (!f)
+					return;
+				// Detach any listeners still bound to this frame before releasing its scene.
+				for (auto *ld : listeners) {
+					if (ld->active_sim_frame == f->self) {
+						IPLSimulator sim = ld->simulator.load(std::memory_order_acquire);
+						if (sim && phonon_scene) {
+							iplSimulatorSetScene(sim, phonon_scene);
+						}
+						ld->active_sim_frame = RID();
+						ld->dirty = true;
+					}
+					if (ld->frame == f->self) {
+						ld->frame = RID();
+					}
+					std::lock_guard<std::mutex> orient_lock(*ld->orientation_mutex);
+					if (ld->ir_frame == f->self) {
+						ld->ir_frame = RID();
+						ld->refl_decode_coords = ipl_coords_from(Transform3D(ld->world_basis, Vector3()));
+					}
+				}
+				for (auto *g : geometries) {
+					if (g->frame == f->self) {
+						g->frame = RID();
+					}
+				}
+				for (uint32_t i = 0; i < frames.size(); ++i) {
+					if (frames[i] != f)
+						continue;
+					for (auto &kv : f->instances) {
+						if (kv.value.instanced_mesh) {
+							if (kv.value.enabled && f->scene) {
+								iplInstancedMeshRemove(kv.value.instanced_mesh, f->scene);
+							}
+							iplInstancedMeshRelease(&kv.value.instanced_mesh);
+						}
+					}
+					f->instances.clear();
+					if (f->scene) {
+						iplSceneRelease(&f->scene);
+					}
+					frames.remove_at(i);
+					break;
+				}
+				frame_owner.free(f->self);
+				memdelete(f);
 			}
 		}, op);
+	}
+
+	if (need_rebuild_world) {
+		rebuild_world_scene();
+	}
+	for (auto *f : frames) {
+		if (f->need_rebuild_scene) {
+			rebuild_frame_scene(f);
+		}
 	}
 	PROFILING_PLOT_NUMBER("NumSteamGeometries", (int64_t)geometries.size());
 }
@@ -2065,6 +2549,14 @@ void SteamAudioServer::process_audio(double dt) {
 
 			PROFILE_FUNCTION_NAMED("Listener mixing");
 
+			IPLCoordinateSpace3 ld_world_coords{};
+			IPLCoordinateSpace3 ld_refl_decode_coords{};
+			{
+				std::lock_guard<std::mutex> orient_lock(*ld->orientation_mutex);
+				ld_world_coords = ld->world_coords;
+				ld_refl_decode_coords = ld->refl_decode_coords;
+			}
+
 			// "Contributors done" is derived, not counted: a relevant, in-range,
 			// already-simulated source whose mix isn't ready yet leaves the round
 			// pending. When nothing remains pending, the push_buffer is complete.
@@ -2156,7 +2648,7 @@ void SteamAudioServer::process_audio(double dt) {
 
 						IPLAirAbsorptionModel airAbsorptionModel = make_air_absorption_model(sd->cfg);
 
-						iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld->cached_coords.origin, &airAbsorptionModel, direct_params.airAbsorption);
+						iplAirAbsorptionCalculate(phonon_context, sd->cached_coords.origin, ld_world_coords.origin, &airAbsorptionModel, direct_params.airAbsorption);
 					}
 
 					if (sd->cfg.distance_attenuation_enabled) {
@@ -2180,9 +2672,9 @@ void SteamAudioServer::process_audio(double dt) {
 
 						params.direction = iplCalculateRelativeDirection(phonon_context,
 								sd->cached_coords.origin,
-								ld->cached_coords.origin,
-								ld->cached_coords.ahead,
-								ld->cached_coords.up);
+								ld_world_coords.origin,
+								ld_world_coords.ahead,
+								ld_world_coords.up);
 						params.interpolation = static_cast<IPLHRTFInterpolation>(sd->cfg.binaural_interpolation);
 						params.spatialBlend = sd->cfg.binaural_spatial_blend;
 						params.hrtf = phonon_hrtf;
@@ -2233,7 +2725,7 @@ void SteamAudioServer::process_audio(double dt) {
 								IPLAmbisonicsDecodeEffectParams decode_params{};
 								decode_params.order = ld->cfg.refl_ambisonics_order;
 								decode_params.hrtf = phonon_hrtf;
-								decode_params.orientation = ld->cached_coords;
+								decode_params.orientation = ld_refl_decode_coords;
 								decode_params.binaural = IPL_TRUE;
 
 								iplAmbisonicsDecodeEffectApply(sld->ambisonics_decode_effect, &decode_params, &sld->ambisonics_buffer, &sld->output_buffer);
@@ -2279,7 +2771,7 @@ void SteamAudioServer::process_audio(double dt) {
 				IPLAmbisonicsDecodeEffectParams decode_params{};
 				decode_params.order = ld->cfg.refl_ambisonics_order;
 				decode_params.hrtf = phonon_hrtf;
-				decode_params.orientation = ld->cached_coords;
+				decode_params.orientation = ld_refl_decode_coords;
 				decode_params.binaural = IPL_TRUE;
 
 				iplAmbisonicsDecodeEffectApply(ld->ambisonics_decode_effect, &decode_params, &ld->mixed_ambisonics_buffer, &ld->decode_output_buffer);
@@ -2379,6 +2871,23 @@ void SteamAudioServer::listener_set_transform(RID listener, const Transform3D &x
 		return;
 	ld->pending_transform = xform;
 	ld->has_transform = true;
+}
+
+void SteamAudioServer::listener_set_frame(RID listener, RID frame) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	if (!ld)
+		return;
+	ld->frame = frame;
+}
+
+RID SteamAudioServer::listener_get_frame(RID listener) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	return ld ? ld->frame : RID();
+}
+
+RID SteamAudioServer::listener_get_active_frame(RID listener) {
+	ListenerData *ld = listener_owner.get_or_null(listener);
+	return ld ? ld->active_sim_frame : RID();
 }
 
 void SteamAudioServer::listener_set_mask(RID listener, uint32_t mask) {
@@ -2741,7 +3250,7 @@ int SteamAudioServer::source_get_num_active_playbacks(RID source) {
 // Geometry RID API
 // ─────────────────────────────────────────────────────────────────────────────
 
-RID SteamAudioServer::geometry_create_internal(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedFloat32Array &material, bool dynamic) {
+RID SteamAudioServer::geometry_create_internal(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedInt32Array &mat_indices, const PackedFloat32Array &materials_flat, bool dynamic, RID frame) {
 	ensure_initialized();
 	if (!phonon_scene || !phonon_context) {
 		UtilityFunctions::push_error("SteamAudio: scene is not initialized");
@@ -2753,22 +3262,27 @@ RID SteamAudioServer::geometry_create_internal(const PackedVector3Array &verts, 
 
 	GeometryData *g = memnew(GeometryData);
 	g->dynamic = dynamic;
+	g->frame = frame;
 	RID rid = geometry_owner.make_rid(g);
 	g->self = rid;
 
 	{
 		std::lock_guard lock(geom_ops_mutex);
-		pending_geom_ops.push_back(PendingGeomCreate{ rid, verts, tris, material, dynamic });
+		pending_geom_ops.push_back(PendingGeomCreate{ rid, verts, tris, mat_indices, materials_flat, dynamic, frame });
 	}
 	return rid;
 }
 
 RID SteamAudioServer::geometry_create_static(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedFloat32Array &material) {
-	return geometry_create_internal(verts, tris, material, false);
+	return geometry_create_internal(verts, tris, PackedInt32Array(), material, false, RID());
 }
 
 RID SteamAudioServer::geometry_create_dynamic(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedFloat32Array &material) {
-	return geometry_create_internal(verts, tris, material, true);
+	return geometry_create_internal(verts, tris, PackedInt32Array(), material, true, RID());
+}
+
+RID SteamAudioServer::geometry_create_batched(const PackedVector3Array &verts, const PackedInt32Array &tris, const PackedInt32Array &mat_indices, const PackedFloat32Array &materials_flat, bool dynamic, RID frame) {
+	return geometry_create_internal(verts, tris, mat_indices, materials_flat, dynamic, frame);
 }
 
 void SteamAudioServer::geometry_set_transform(RID geometry, const Transform3D &xform) {
@@ -2778,11 +3292,11 @@ void SteamAudioServer::geometry_set_transform(RID geometry, const Transform3D &x
 	pending_geom_ops.push_back(PendingGeomTransform{ geometry, xform });
 }
 
-void SteamAudioServer::geometry_set_material(RID geometry, const PackedFloat32Array &material) {
+void SteamAudioServer::geometry_set_material(RID geometry, const PackedFloat32Array &material, int material_index) {
 	if (!geometry.is_valid())
 		return;
 	std::lock_guard lock(geom_ops_mutex);
-	pending_geom_ops.push_back(PendingGeomMaterial{ geometry, material });
+	pending_geom_ops.push_back(PendingGeomMaterial{ geometry, material, material_index });
 }
 
 void SteamAudioServer::geometry_free(RID geometry) {
@@ -2791,3 +3305,67 @@ void SteamAudioServer::geometry_free(RID geometry) {
 	std::lock_guard lock(geom_ops_mutex);
 	pending_geom_ops.push_back(PendingGeomRemove{ geometry });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Moving Reference Frame RID API
+// ─────────────────────────────────────────────────────────────────────────────
+
+RID SteamAudioServer::frame_create() {
+	ensure_initialized();
+	if (!phonon_scene || !phonon_context) {
+		UtilityFunctions::push_error("SteamAudio: scene is not initialized");
+		return RID();
+	}
+
+	FrameData *f = memnew(FrameData);
+	RID rid = frame_owner.make_rid(f);
+	f->self = rid;
+
+	{
+		std::lock_guard lock(geom_ops_mutex);
+		pending_geom_ops.push_back(PendingFrameCreate{ rid });
+	}
+	return rid;
+}
+
+void SteamAudioServer::frame_set_world_transform(RID frame, const Transform3D &xform) {
+	FrameData *f = get_valid_frame_main(frame);
+	if (!f)
+		return;
+	if (f->has_world_transform && xform.is_equal_approx(f->world_transform))
+		return;
+	f->world_transform = xform;
+	f->inv_world_transform = xform.affine_inverse();
+	f->has_world_transform = true;
+
+	std::lock_guard lock(geom_ops_mutex);
+	pending_geom_ops.push_back(PendingFrameTransform{ frame, xform });
+}
+
+void SteamAudioServer::frame_set_moving(RID frame, bool moving) {
+	FrameData *f = get_valid_frame_main(frame);
+	if (!f)
+		return;
+	if (f->is_moving == moving)
+		return;
+	f->is_moving = moving;
+
+	std::lock_guard lock(geom_ops_mutex);
+	pending_geom_ops.push_back(PendingFrameMoving{ frame, moving });
+}
+
+bool SteamAudioServer::frame_is_moving(RID frame) {
+	FrameData *f = get_valid_frame_main(frame);
+	return f ? f->is_moving : false;
+}
+
+void SteamAudioServer::frame_free(RID frame) {
+	FrameData *f = frame_owner.get_or_null(frame);
+	if (!f)
+		return;
+	f->freed.store(true, std::memory_order_release);
+
+	std::lock_guard lock(geom_ops_mutex);
+	pending_geom_ops.push_back(PendingFrameRemove{ frame });
+}
+

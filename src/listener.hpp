@@ -46,6 +46,7 @@ protected:
 private:
 	// Server-side handle. Invalid when the listener is not currently registered.
 	godot::RID rid;
+	godot::RID frame;
 
 	bool reflection_simulation_enabled = true;
 	int num_refl_rays = 4096;
@@ -74,6 +75,8 @@ public:
 	void _notification(int p_what);
 
 	godot::RID get_rid() const { return rid; }
+	void set_frame(godot::RID p_frame);
+	godot::RID get_frame() const { return frame; }
 
 	int get_num_refl_rays();
 	void set_num_refl_rays(int p_num_refl_rays);
