@@ -313,6 +313,9 @@ void SteamAudioServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("soundfield_set_volume_db", "soundfield", "volume_db"), &SteamAudioServer::soundfield_set_volume_db);
 	ClassDB::bind_method(D_METHOD("soundfield_set_probe_distance", "soundfield", "distance"), &SteamAudioServer::soundfield_set_probe_distance);
 	ClassDB::bind_method(D_METHOD("soundfield_set_smoothing_time", "soundfield", "seconds"), &SteamAudioServer::soundfield_set_smoothing_time);
+	ClassDB::bind_method(D_METHOD("soundfield_set_openness_exponent", "soundfield", "exponent"), &SteamAudioServer::soundfield_set_openness_exponent);
+	ClassDB::bind_method(D_METHOD("soundfield_set_aperture_boost", "soundfield", "boost"), &SteamAudioServer::soundfield_set_aperture_boost);
+	ClassDB::bind_method(D_METHOD("soundfield_set_portal_gain", "soundfield", "gain"), &SteamAudioServer::soundfield_set_portal_gain);
 	ClassDB::bind_method(D_METHOD("soundfield_set_debug_name", "soundfield", "name"), &SteamAudioServer::soundfield_set_debug_name);
 	ClassDB::bind_method(D_METHOD("soundfield_add_sector", "soundfield", "direction", "playback", "volume_db", "pitch_scale", "from_position"), &SteamAudioServer::soundfield_add_sector, DEFVAL(0.0f), DEFVAL(1.0f), DEFVAL(0.0f));
 	ClassDB::bind_method(D_METHOD("soundfield_remove_sector", "soundfield", "sector_id"), &SteamAudioServer::soundfield_remove_sector);
@@ -507,6 +510,9 @@ String SteamAudioServer::get_soundfield_debug_string(int index) {
 	s += "volume_db: " + String::num(sf->cfg.volume_db.load(std::memory_order_relaxed), 2) + "\n";
 	s += "probe_distance: " + String::num(sf->cfg.probe_distance.load(std::memory_order_relaxed), 2) + "\n";
 	s += "smoothing_time: " + String::num(sf->cfg.smoothing_time.load(std::memory_order_relaxed), 3) + "\n";
+	s += "openness_exponent: " + String::num(sf->cfg.openness_exponent.load(std::memory_order_relaxed), 2) + "\n";
+	s += "aperture_boost: " + String::num(sf->cfg.aperture_boost.load(std::memory_order_relaxed), 2) + "\n";
+	s += "portal_gain: " + String::num(sf->cfg.portal_gain.load(std::memory_order_relaxed), 2) + "\n";
 	s += "mix_generation: " + String::num_int64((int64_t)sf->mix_generation) + "\n";
 	s += "sectors: " + String::num_int64((int64_t)sf->sectors.size()) + "\n";
 	for (size_t i = 0; i < sf->sectors.size(); ++i) {
@@ -537,6 +543,12 @@ String SteamAudioServer::get_soundfield_debug_string(int index) {
 			s += " smooth_open=" + String::num(dsp.smoothed_occlusion, 3);
 			s += " trans=(" + String::num(dsp.target_transmission[0], 3) + "," + String::num(dsp.target_transmission[1], 3) + "," + String::num(dsp.target_transmission[2], 3) + ")";
 			s += " dir=(" + String::num(dsp.target_direction.x, 2) + "," + String::num(dsp.target_direction.y, 2) + "," + String::num(dsp.target_direction.z, 2) + ")\n";
+		}
+		for (int p = 0; p < SOUNDFIELD_PORTAL_COUNT; ++p) {
+			const auto &pt = sfld.portals[p];
+			s += "    portal[" + String::num_int64(p) + "] gain=" + String::num(pt.target_gain, 3);
+			s += " smooth_gain=" + String::num(pt.smoothed_gain, 3);
+			s += " dir=(" + String::num(pt.target_direction.x, 2) + "," + String::num(pt.target_direction.y, 2) + "," + String::num(pt.target_direction.z, 2) + ")\n";
 		}
 	}
 	return s;
@@ -893,15 +905,19 @@ void SteamAudioServer::init() {
 		phonon_hrtf = nullptr;
 	}
 
-	// Fibonacci hemisphere covering +0.04 through +0.98 elevation to avoid ground/floor hits.
+	// Stratified probe dome: eye-level horizon ring for doorways + upper Fibonacci dome for sky/roofs.
 	constexpr double kPi = 3.14159265358979323846;
+	for (int i = 0; i < SOUNDFIELD_HORIZON_PROBE_COUNT; ++i) {
+		double theta = (2.0 * kPi * static_cast<double>(i)) / static_cast<double>(SOUNDFIELD_HORIZON_PROBE_COUNT);
+		sky_probe_dirs[i] = Vector3(static_cast<float>(std::cos(theta)), 0.0f, static_cast<float>(std::sin(theta)));
+	}
 	const double golden_angle = kPi * (3.0 - std::sqrt(5.0));
-	for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
-		double t = (static_cast<double>(i) + 0.5) / static_cast<double>(SOUNDFIELD_PROBE_COUNT);
-		double y = 0.04 + t * 0.94;
+	for (int i = 0; i < SOUNDFIELD_DOME_PROBE_COUNT; ++i) {
+		double t = (static_cast<double>(i) + 0.5) / static_cast<double>(SOUNDFIELD_DOME_PROBE_COUNT);
+		double y = 0.22 + t * 0.76;
 		double r = std::sqrt(MAX(0.0, 1.0 - y * y));
 		double theta = golden_angle * static_cast<double>(i);
-		sky_probe_dirs[i] = Vector3(static_cast<float>(std::cos(theta) * r), static_cast<float>(y), static_cast<float>(std::sin(theta) * r)).normalized();
+		sky_probe_dirs[SOUNDFIELD_HORIZON_PROBE_COUNT + i] = Vector3(static_cast<float>(std::cos(theta) * r), static_cast<float>(y), static_cast<float>(std::sin(theta) * r)).normalized();
 	}
 
 	is_running.store(true);
@@ -1212,7 +1228,10 @@ void SteamAudioServer::tick(float delta) {
 						}
 						IPLSimulationOutputs outputs{};
 						iplSourceGetOutputs(psrc, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
-						probe_occ[i] = outputs.direct.occlusion;
+						// Reject stray volumetric rays slipping through hairline hull mesh seams.
+						constexpr float kProbeSeamFloor = 0.28f;
+						float raw_occ = CLAMP(outputs.direct.occlusion, 0.0f, 1.0f);
+						probe_occ[i] = (raw_occ > kProbeSeamFloor) ? ((raw_occ - kProbeSeamFloor) / (1.0f - kProbeSeamFloor)) : 0.0f;
 						for (int b = 0; b < 3; ++b) {
 							probe_trans[i][b] = outputs.direct.transmission[b];
 						}
@@ -1221,6 +1240,8 @@ void SteamAudioServer::tick(float delta) {
 					}
 
 					if (valid_probes > 0) {
+						const float exp_val = CLAMP(sf->cfg.openness_exponent.load(std::memory_order_relaxed), 0.1f, 3.0f);
+						const float boost = CLAMP(sf->cfg.aperture_boost.load(std::memory_order_relaxed), 0.0f, 1.0f);
 						std::lock_guard<std::mutex> st_lock(sfld.sim_state_mutex);
 						sfld.last_outdoorness = open_sum / static_cast<float>(valid_probes);
 						for (const auto &sec : sf->sectors) {
@@ -1232,6 +1253,7 @@ void SteamAudioServer::tick(float delta) {
 							float w_open = 0.0f;
 							float w_closed = 0.0f;
 							float w_trans_valid = 0.0f;
+							float peak_open = 0.0f;
 							float trans_acc[3] = { 0.0f, 0.0f, 0.0f };
 							Vector3 open_dir_acc(0.0f, 0.0f, 0.0f);
 
@@ -1239,7 +1261,8 @@ void SteamAudioServer::tick(float delta) {
 								float d = sky_probe_dirs[i].dot(nom);
 								if (d <= 0.0f)
 									continue;
-								float w = d * d;
+								float d2 = d * d;
+								float w = d2 * d;
 								w_total += w;
 								float occ = CLAMP(probe_occ[i], 0.0f, 1.0f);
 								float w_o = w * occ;
@@ -1247,6 +1270,7 @@ void SteamAudioServer::tick(float delta) {
 								w_open += w_o;
 								w_closed += w_c;
 								open_dir_acc += sky_probe_dirs[i] * w_o;
+								peak_open = MAX(peak_open, occ * d2);
 								// Volumetric transmission traces the center ray only; ignore {1,1,1} from an unoccluded center ray.
 								bool center_unoccluded = (probe_trans[i][0] >= 0.999f && probe_trans[i][1] >= 0.999f && probe_trans[i][2] >= 0.999f);
 								if (w_c > 1e-6f && !center_unoccluded) {
@@ -1257,7 +1281,12 @@ void SteamAudioServer::tick(float delta) {
 								}
 							}
 
-							float openness = (w_total > 1e-6f) ? (w_open / w_total) : 1.0f;
+							float raw_avg_open = (w_total > 1e-6f) ? (w_open / w_total) : 1.0f;
+							constexpr float kSectorOpenFloor = 0.03f;
+							float avg_open = (raw_avg_open > kSectorOpenFloor) ? ((raw_avg_open - kSectorOpenFloor) / (1.0f - kSectorOpenFloor)) : 0.0f;
+							float amp_open = std::pow(CLAMP(avg_open, 0.0f, 1.0f), exp_val);
+							float eff_peak = (avg_open > 0.0f) ? peak_open : 0.0f;
+							float openness = CLAMP(MAX(amp_open, Math::lerp(amp_open, eff_peak, boost)), 0.0f, 1.0f);
 							dsp->target_occlusion = openness;
 							if (w_trans_valid > 1e-6f) {
 								for (int b = 0; b < 3; ++b) {
@@ -1287,6 +1316,124 @@ void SteamAudioServer::tick(float delta) {
 							}
 							dsp->target_direction = dir;
 						}
+
+						// Cluster open rays into up to 2 automatic directional aperture portals.
+						const float portal_gain_cfg = CLAMP(sf->cfg.portal_gain.load(std::memory_order_relaxed), 0.0f, 2.0f);
+						const float enclosure = CLAMP((0.70f - sfld.last_outdoorness) / 0.50f, 0.0f, 1.0f);
+						struct PortalCluster {
+							bool active = false;
+							Vector3 dir = Vector3(0, 1, 0);
+							float peak = 0.0f;
+							float mass = 0.0f;
+							float strength = 0.0f;
+						};
+						PortalCluster clusters[SOUNDFIELD_PORTAL_COUNT];
+
+						if (portal_gain_cfg > 1e-4f && enclosure > 1e-4f) {
+							int seed_a = -1;
+							float best_a = 1e-4f;
+							for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+								float occ = CLAMP(probe_occ[i], 0.0f, 1.0f);
+								if (occ > best_a) {
+									best_a = occ;
+									seed_a = i;
+								}
+							}
+							if (seed_a >= 0) {
+								Vector3 seed_a_dir = sky_probe_dirs[seed_a];
+								Vector3 acc_a(0.0f, 0.0f, 0.0f);
+								for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+									float occ = CLAMP(probe_occ[i], 0.0f, 1.0f);
+									if (occ > 1e-4f && sky_probe_dirs[i].dot(seed_a_dir) >= 0.25f) {
+										acc_a += sky_probe_dirs[i] * occ;
+									}
+								}
+								Vector3 dir_a = acc_a.length_squared() > 1e-6f ? acc_a.normalized() : seed_a_dir;
+
+								int seed_b = -1;
+								float best_b = 1e-4f;
+								for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+									float occ = CLAMP(probe_occ[i], 0.0f, 1.0f);
+									if (occ > best_b && sky_probe_dirs[i].dot(dir_a) < 0.25f) {
+										best_b = occ;
+										seed_b = i;
+									}
+								}
+								Vector3 dir_b(0.0f, 1.0f, 0.0f);
+								bool has_b = (seed_b >= 0);
+								if (has_b) {
+									Vector3 seed_b_dir = sky_probe_dirs[seed_b];
+									Vector3 acc_b(0.0f, 0.0f, 0.0f);
+									for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+										float occ = CLAMP(probe_occ[i], 0.0f, 1.0f);
+										if (occ > 1e-4f && sky_probe_dirs[i].dot(dir_a) < 0.25f && sky_probe_dirs[i].dot(seed_b_dir) >= 0.25f) {
+											acc_b += sky_probe_dirs[i] * occ;
+										}
+									}
+									dir_b = acc_b.length_squared() > 1e-6f ? acc_b.normalized() : seed_b_dir;
+								}
+
+								// Symmetric reassignment pass so cluster boundaries don't depend on seed order.
+								Vector3 final_acc[SOUNDFIELD_PORTAL_COUNT];
+								for (int i = 0; i < SOUNDFIELD_PROBE_COUNT; ++i) {
+									float occ = CLAMP(probe_occ[i], 0.0f, 1.0f);
+									if (occ <= 1e-4f)
+										continue;
+									float da = sky_probe_dirs[i].dot(dir_a);
+									float db = has_b ? sky_probe_dirs[i].dot(dir_b) : -2.0f;
+									int target = -1;
+									if (da >= db && da >= 0.25f) {
+										target = 0;
+									} else if (has_b && db >= 0.25f) {
+										target = 1;
+									}
+									if (target >= 0) {
+										clusters[target].active = true;
+										clusters[target].peak = MAX(clusters[target].peak, occ);
+										clusters[target].mass += occ;
+										final_acc[target] += sky_probe_dirs[i] * occ;
+									}
+								}
+								for (int c = 0; c < SOUNDFIELD_PORTAL_COUNT; ++c) {
+									if (clusters[c].active && final_acc[c].length_squared() > 1e-6f) {
+										clusters[c].dir = final_acc[c].normalized();
+										float mass_gate = CLAMP((clusters[c].mass - 0.32f) / 0.45f, 0.0f, 1.0f);
+										if (mass_gate <= 1e-4f) {
+											clusters[c].active = false;
+											continue;
+										}
+										float mass_factor = CLAMP(clusters[c].mass / 2.5f, 0.0f, 1.0f);
+										clusters[c].strength = mass_gate * std::sqrt(CLAMP(clusters[c].peak * (0.45f + 0.55f * mass_factor), 0.0f, 1.0f));
+									} else {
+										clusters[c].active = false;
+									}
+								}
+
+								// Keep slot assignment stable across frames to avoid stereo swooshing.
+								bool prev_active[2] = { sfld.portals[0].target_gain > 1e-3f, sfld.portals[1].target_gain > 1e-3f };
+								float stay_score = (prev_active[0] && clusters[0].active ? sfld.portals[0].target_direction.dot(clusters[0].dir) : 0.0f) +
+										(prev_active[1] && clusters[1].active ? sfld.portals[1].target_direction.dot(clusters[1].dir) : 0.0f);
+								float swap_score = (prev_active[0] && clusters[1].active ? sfld.portals[0].target_direction.dot(clusters[1].dir) : 0.0f) +
+										(prev_active[1] && clusters[0].active ? sfld.portals[1].target_direction.dot(clusters[0].dir) : 0.0f);
+								if (swap_score > stay_score + 0.05f) {
+									std::swap(clusters[0], clusters[1]);
+								}
+							}
+						}
+
+						float s0 = clusters[0].active ? clusters[0].strength : 0.0f;
+						float s1 = clusters[1].active ? clusters[1].strength : 0.0f;
+						float energy_sum = s0 * s0 + s1 * s1;
+						float norm = (energy_sum > 1.0f) ? (1.0f / std::sqrt(energy_sum)) : 1.0f;
+						for (int p = 0; p < SOUNDFIELD_PORTAL_COUNT; ++p) {
+							if (clusters[p].active) {
+								sfld.portals[p].target_gain = portal_gain_cfg * enclosure * clusters[p].strength * norm;
+								sfld.portals[p].target_direction = clusters[p].dir;
+							} else {
+								sfld.portals[p].target_gain = 0.0f;
+							}
+						}
+
 						sfld.probed_once.store(true, std::memory_order_release);
 					}
 				}
@@ -1567,8 +1714,8 @@ void SteamAudioServer::tick(float delta) {
 						inputs.source = ipl_coords_from(Transform3D(Basis(), active_pos));
 						inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
 						inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
-						inputs.occlusionRadius = probe_dist * 0.10f;
-						inputs.numOcclusionSamples = 4;
+						inputs.occlusionRadius = probe_dist * 0.135f;
+						inputs.numOcclusionSamples = 12;
 						inputs.numTransmissionRays = 2;
 						inputs.baked = IPL_FALSE;
 
@@ -2663,6 +2810,12 @@ void SteamAudioServer::apply_pending_ops() {
 							cleanup_soundfield_sector_dsp(dsp);
 						}
 						sfld_ptr->sector_dsp.clear();
+						for (int p = 0; p < SOUNDFIELD_PORTAL_COUNT; ++p) {
+							cleanup_soundfield_portal_dsp(sfld_ptr->portals[p]);
+							sfld_ptr->portals[p].target_gain = 0.0f;
+						}
+						sfld_ptr->portal_delay_ring.clear();
+						sfld_ptr->portal_delay_write_pos = 0;
 					}
 					sfld_ptr->dsp_ready = false;
 					sfld_ptr->probed_once.store(false, std::memory_order_release);
@@ -3030,12 +3183,19 @@ void SteamAudioServer::process_audio(double dt) {
 					continue;
 
 				int to_pull = frame_size - pb.num_mixed_in_current_mixed_frames;
-				float gain = pb.volume_linear * sd->volume_linear;
+				const float target_gain = pb.volume_linear * sd->volume_linear;
+				const float start_gain = pb.has_applied_gain ? pb.last_applied_gain : target_gain;
+				const float gain_step = (target_gain - start_gain) / static_cast<float>(frame_size);
 				int mixed_start = pb.num_mixed_in_current_mixed_frames;
 				int pulled = pull_playback_frames<2>(pb.playback, pb.resample_state, pb.pitch_scale, to_pull,
 						[&](int idx, float l, float r) {
-							sd->mixed_frames[mixed_start + idx] += Vector2(l, r) * gain;
+							float g = start_gain + gain_step * static_cast<float>(idx + 1);
+							sd->mixed_frames[mixed_start + idx] += Vector2(l, r) * g;
 						});
+				if (pulled > 0) {
+					pb.last_applied_gain = (pulled == frame_size) ? target_gain : (start_gain + gain_step * static_cast<float>(pulled));
+					pb.has_applied_gain = true;
+				}
 
 				pb.debug_num_mixed += pulled;
 				int mixed_index = mixed_start + pulled;
@@ -3168,18 +3328,27 @@ void SteamAudioServer::process_audio(double dt) {
 				if (!sec.playback.is_valid() || !sec.playback->is_playing()) {
 					sec.mixed_frames.fill(0.0f);
 					sec.mixed_frames_ready = frame_size;
+					sec.last_applied_gain = 0.0f;
+					sec.has_applied_gain = false;
 					continue;
 				}
 
 				int to_pull = frame_size - sec.mixed_frames_ready;
 				float rate_scale = MAX(sec.pitch_scale, 0.05f);
-				float gain = sec.volume_linear * sf_volume_linear;
+				const float target_gain = sec.volume_linear * sf_volume_linear;
+				const float start_gain = sec.has_applied_gain ? sec.last_applied_gain : 0.0f;
+				const float gain_step = (target_gain - start_gain) / static_cast<float>(frame_size);
 				int mixed_start = sec.mixed_frames_ready;
 				float *dst = sec.mixed_frames.ptrw();
 				int pulled = pull_playback_frames<1>(sec.playback, sec.resample_state, rate_scale, to_pull,
 						[&](int idx, float mono) {
-							dst[mixed_start + idx] = mono * gain;
+							float g = start_gain + gain_step * static_cast<float>(idx + 1);
+							dst[mixed_start + idx] = mono * g;
 						});
+				if (pulled > 0) {
+					sec.last_applied_gain = (pulled == frame_size) ? target_gain : (start_gain + gain_step * static_cast<float>(pulled));
+					sec.has_applied_gain = true;
+				}
 
 				sec.mixed_frames_ready += pulled;
 				if (sec.mixed_frames_ready < frame_size) {
@@ -3521,6 +3690,16 @@ void SteamAudioServer::process_audio(double dt) {
 				soundfield_mix_scratch.fill(Vector2(0, 0));
 				Vector2 *sf_sum = soundfield_mix_scratch.ptrw();
 
+				const float portal_gain_cfg = sf->cfg.portal_gain.load(std::memory_order_relaxed);
+				float *portal_mono = nullptr;
+				if (portal_gain_cfg > 1e-4f) {
+					if (soundfield_portal_scratch.size() != frame_size) {
+						soundfield_portal_scratch.resize(frame_size);
+					}
+					soundfield_portal_scratch.fill(0.0f);
+					portal_mono = soundfield_portal_scratch.ptrw();
+				}
+
 				const int sr = cached_audio_settings.samplingRate;
 				const float block_dt = (sr > 0) ? (static_cast<float>(frame_size) / static_cast<float>(sr)) : 0.01f;
 				const float tau = MAX(0.005f, sf->cfg.smoothing_time.load(std::memory_order_relaxed));
@@ -3562,6 +3741,23 @@ void SteamAudioServer::process_audio(double dt) {
 						}
 					}
 
+					if (portal_mono) {
+						const float o = CLAMP(dsp->smoothed_occlusion, 0.0f, 1.0f);
+						const float target_w = std::sqrt(MAX(0.0f, 1.0f - o * o));
+						const float start_w = dsp->last_w_missing;
+						if (target_w > 1e-4f || start_w > 1e-4f) {
+							const float w_step = (target_w - start_w) / static_cast<float>(frame_size);
+							const float *sec_ptr = sec.mixed_frames.ptr();
+							for (int s = 0; s < frame_size; ++s) {
+								float w = start_w + w_step * static_cast<float>(s + 1);
+								portal_mono[s] += sec_ptr[s] * w;
+							}
+						}
+						dsp->last_w_missing = (target_w > 1e-4f) ? target_w : 0.0f;
+					} else {
+						dsp->last_w_missing = 0.0f;
+					}
+
 					memcpy(dsp->input_buffer.data[0], sec.mixed_frames.ptr(), sizeof(float) * frame_size);
 
 					IPLDirectEffectParams dp{};
@@ -3598,6 +3794,111 @@ void SteamAudioServer::process_audio(double dt) {
 						for (int s = 0; s < frame_size; ++s) {
 							sf_sum[s].x += mono[s];
 							sf_sum[s].y += mono[s];
+						}
+					}
+				}
+
+				// Write missing outdoor mix into a short delay ring so portals are time-decorrelated
+				// from dome sectors (and from each other), preventing HRTF comb-filtering on head turns.
+				size_t ring_size = 0;
+				size_t ring_mask = 0;
+				size_t block_start_pos = 0;
+				if (portal_mono) {
+					const int effective_sr = MAX(sr, 24000);
+					const size_t min_ring = static_cast<size_t>(0.060f * effective_sr) + static_cast<size_t>(frame_size) + 64;
+					if (sfld->portal_delay_ring.size() < min_ring) {
+						size_t pow2 = 1;
+						while (pow2 < min_ring) {
+							pow2 <<= 1;
+						}
+						sfld->portal_delay_ring.assign(pow2, 0.0f);
+						sfld->portal_delay_write_pos = 0;
+					}
+					ring_size = sfld->portal_delay_ring.size();
+					ring_mask = ring_size - 1;
+					block_start_pos = sfld->portal_delay_write_pos;
+					float *ring = sfld->portal_delay_ring.data();
+					for (int s = 0; s < frame_size; ++s) {
+						ring[(block_start_pos + static_cast<size_t>(s)) & ring_mask] = portal_mono[s];
+					}
+					sfld->portal_delay_write_pos = (block_start_pos + static_cast<size_t>(frame_size)) & ring_mask;
+				}
+
+				static constexpr float kPortalDelaySec[SOUNDFIELD_PORTAL_COUNT] = { 0.029f, 0.053f };
+				for (int p = 0; p < SOUNDFIELD_PORTAL_COUNT; ++p) {
+					auto &portal = sfld->portals[p];
+					float t_gain;
+					Vector3 t_dir;
+					{
+						std::lock_guard<std::mutex> st_lock(sfld->sim_state_mutex);
+						t_gain = portal.target_gain;
+						t_dir = portal.target_direction;
+					}
+
+					if (!portal.has_smoothed) {
+						portal.smoothed_gain = t_gain;
+						portal.smoothed_direction = t_dir;
+						portal.has_smoothed = true;
+					} else {
+						if (portal.smoothed_gain < 1e-3f && t_gain >= 1e-3f) {
+							portal.smoothed_direction = t_dir;
+						} else if (t_gain >= 1e-3f) {
+							Vector3 blended_dir = portal.smoothed_direction.lerp(t_dir, alpha);
+							if (blended_dir.length_squared() > 1e-6f) {
+								portal.smoothed_direction = blended_dir.normalized();
+							}
+						}
+						portal.smoothed_gain += alpha * (t_gain - portal.smoothed_gain);
+					}
+
+					const float target_g = (portal_mono && ring_size > 0 && portal.smoothed_gain >= 1e-4f) ? portal.smoothed_gain : 0.0f;
+					const float start_g = portal.last_applied_gain;
+					if (!portal_mono || ring_size == 0 || (target_g < 1e-4f && start_g < 1e-4f)) {
+						if (portal.was_active && portal.binaural_effect) {
+							iplBinauralEffectReset(portal.binaural_effect);
+						}
+						portal.was_active = false;
+						portal.last_applied_gain = 0.0f;
+						continue;
+					}
+					if (!ensure_soundfield_portal_dsp(portal))
+						continue;
+					portal.was_active = true;
+
+					const float g_step = (target_g - start_g) / static_cast<float>(frame_size);
+					const size_t delay_samples = static_cast<size_t>(kPortalDelaySec[p] * MAX(sr, 24000));
+					const size_t read_start = (block_start_pos + ring_size - (delay_samples & ring_mask)) & ring_mask;
+					const float *ring = sfld->portal_delay_ring.data();
+					float *in_ch = portal.input_buffer.data[0];
+					for (int s = 0; s < frame_size; ++s) {
+						float g = start_g + g_step * static_cast<float>(s + 1);
+						in_ch[s] = ring[(read_start + static_cast<size_t>(s)) & ring_mask] * g;
+					}
+					portal.last_applied_gain = target_g;
+
+					if (phonon_hrtf && portal.binaural_effect) {
+						IPLBinauralEffectParams bp{};
+						bp.direction = iplCalculateRelativeDirection(
+								phonon_context,
+								ipl_vec3_from(portal.smoothed_direction),
+								IPLVector3{ 0.0f, 0.0f, 0.0f },
+								ld_world_coords.ahead,
+								ld_world_coords.up);
+						bp.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
+						bp.spatialBlend = 1.0f;
+						bp.hrtf = phonon_hrtf;
+						iplBinauralEffectApply(portal.binaural_effect, &bp, &portal.input_buffer, &portal.output_buffer);
+
+						const float *out_l = portal.output_buffer.data[0];
+						const float *out_r = portal.output_buffer.data[1];
+						for (int s = 0; s < frame_size; ++s) {
+							sf_sum[s].x += out_l[s];
+							sf_sum[s].y += out_r[s];
+						}
+					} else {
+						for (int s = 0; s < frame_size; ++s) {
+							sf_sum[s].x += in_ch[s];
+							sf_sum[s].y += in_ch[s];
 						}
 					}
 				}
@@ -4301,13 +4602,53 @@ void SteamAudioServer::cleanup_soundfield_sector_dsp(SoundfieldListenerSectorDSP
 		iplAudioBufferFree(phonon_context, &dsp.output_buffer);
 		dsp.output_buffer = IPLAudioBuffer{};
 	}
+	dsp.last_w_missing = 0.0f;
 	dsp.has_smoothed = false;
+}
+
+bool SteamAudioServer::ensure_soundfield_portal_dsp(SoundfieldListenerPortalDSP &portal) {
+	if (portal.input_buffer.data)
+		return true;
+	if (!phonon_context)
+		return false;
+
+	if (phonon_hrtf) {
+		IPLBinauralEffectSettings bin_cfg{};
+		bin_cfg.hrtf = phonon_hrtf;
+		handleErr(iplBinauralEffectCreate(phonon_context, &cached_audio_settings, &bin_cfg, &portal.binaural_effect), "SteamAudio: Failed to create soundfield portal binaural effect");
+	}
+
+	iplAudioBufferAllocate(phonon_context, 1, cached_audio_settings.frameSize, &portal.input_buffer);
+	iplAudioBufferAllocate(phonon_context, 2, cached_audio_settings.frameSize, &portal.output_buffer);
+	return true;
+}
+
+void SteamAudioServer::cleanup_soundfield_portal_dsp(SoundfieldListenerPortalDSP &portal) {
+	if (portal.binaural_effect)
+		iplBinauralEffectRelease(&portal.binaural_effect);
+	if (portal.input_buffer.data) {
+		iplAudioBufferFree(phonon_context, &portal.input_buffer);
+		portal.input_buffer = IPLAudioBuffer{};
+	}
+	if (portal.output_buffer.data) {
+		iplAudioBufferFree(phonon_context, &portal.output_buffer);
+		portal.output_buffer = IPLAudioBuffer{};
+	}
+	portal.smoothed_gain = 0.0f;
+	portal.last_applied_gain = 0.0f;
+	portal.has_smoothed = false;
+	portal.was_active = false;
 }
 
 void SteamAudioServer::release_soundfield_listener_dsp(SoundfieldListenerData &sfld) {
 	for (auto &dsp : sfld.sector_dsp) {
 		cleanup_soundfield_sector_dsp(dsp);
 	}
+	for (int p = 0; p < SOUNDFIELD_PORTAL_COUNT; ++p) {
+		cleanup_soundfield_portal_dsp(sfld.portals[p]);
+	}
+	sfld.portal_delay_ring.clear();
+	sfld.portal_delay_write_pos = 0;
 	sfld.dsp_ready = false;
 }
 
@@ -4378,6 +4719,24 @@ void SteamAudioServer::soundfield_set_probe_distance(RID soundfield, float dista
 void SteamAudioServer::soundfield_set_smoothing_time(RID soundfield, float seconds) {
 	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
 		sf->cfg.smoothing_time.store(MAX(0.005f, seconds), std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_openness_exponent(RID soundfield, float exponent) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.openness_exponent.store(CLAMP(exponent, 0.1f, 3.0f), std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_aperture_boost(RID soundfield, float boost) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.aperture_boost.store(CLAMP(boost, 0.0f, 1.0f), std::memory_order_relaxed);
+	}
+}
+
+void SteamAudioServer::soundfield_set_portal_gain(RID soundfield, float gain) {
+	if (auto *sf = soundfield_owner.get_or_null(soundfield)) {
+		sf->cfg.portal_gain.store(CLAMP(gain, 0.0f, 2.0f), std::memory_order_relaxed);
 	}
 }
 
@@ -4467,6 +4826,15 @@ Dictionary SteamAudioServer::soundfield_get_debug_state(RID soundfield, RID list
 			arr.push_back(d);
 		}
 		out["sectors"] = arr;
+		Array portals_arr;
+		for (int p = 0; p < SOUNDFIELD_PORTAL_COUNT; ++p) {
+			Dictionary pd;
+			pd["gain"] = sfld_ptr->portals[p].target_gain;
+			pd["smoothed_gain"] = sfld_ptr->portals[p].smoothed_gain;
+			pd["direction"] = sfld_ptr->portals[p].target_direction;
+			portals_arr.push_back(pd);
+		}
+		out["portals"] = portals_arr;
 		break;
 	}
 	return out;

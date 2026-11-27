@@ -225,6 +225,8 @@ struct SourcePlaybackEntry {
 	int num_mixed_in_current_mixed_frames = 0;
 	float volume_linear = 1.0f;
 	float pitch_scale = 1.0f;
+	float last_applied_gain = 0.0f;
+	bool has_applied_gain = false;
 
 	uint32_t debug_num_mixed = 0;
 
@@ -348,7 +350,10 @@ struct FrameData {
 // Helper to clean up a SourceListenerData's audio-side IPL resources
 void cleanup_source_listener_data(SourceListenerData &sld, IPLContext ctx);
 
-static constexpr int SOUNDFIELD_PROBE_COUNT = 36;
+static constexpr int SOUNDFIELD_HORIZON_PROBE_COUNT = 24;
+static constexpr int SOUNDFIELD_DOME_PROBE_COUNT = 24;
+static constexpr int SOUNDFIELD_PROBE_COUNT = SOUNDFIELD_HORIZON_PROBE_COUNT + SOUNDFIELD_DOME_PROBE_COUNT;
+static constexpr int SOUNDFIELD_PORTAL_COUNT = 2;
 
 struct SoundfieldConfig {
 	std::atomic<uint32_t> layers{ 1 };
@@ -356,6 +361,9 @@ struct SoundfieldConfig {
 	std::atomic<float> volume_db{ 0.0f };
 	std::atomic<float> probe_distance{ 32.0f };
 	std::atomic<float> smoothing_time{ 0.18f };
+	std::atomic<float> openness_exponent{ 0.5f };
+	std::atomic<float> aperture_boost{ 0.15f };
+	std::atomic<float> portal_gain{ 0.9f };
 };
 
 struct SoundfieldSectorState {
@@ -363,6 +371,8 @@ struct SoundfieldSectorState {
 	godot::Vector3 nominal_direction = godot::Vector3(0, 1, 0);
 	float volume_linear = 1.0f;
 	float pitch_scale = 1.0f;
+	float last_applied_gain = 0.0f;
+	bool has_applied_gain = false;
 	godot::Ref<godot::AudioStreamPlayback> playback;
 	PlaybackResampleState resample_state;
 	godot::PackedFloat32Array mixed_frames;
@@ -385,7 +395,23 @@ struct SoundfieldListenerSectorDSP {
 	float smoothed_occlusion = 0.0f;
 	float smoothed_transmission[3] = { 0.2f, 0.05f, 0.015f };
 	godot::Vector3 smoothed_direction = godot::Vector3(0, 1, 0);
+	float last_w_missing = 0.0f;
 	bool has_smoothed = false;
+};
+
+struct SoundfieldListenerPortalDSP {
+	IPLBinauralEffect binaural_effect = nullptr;
+	IPLAudioBuffer input_buffer{};
+	IPLAudioBuffer output_buffer{};
+
+	float target_gain = 0.0f;
+	godot::Vector3 target_direction = godot::Vector3(0, 1, 0);
+
+	float smoothed_gain = 0.0f;
+	float last_applied_gain = 0.0f;
+	godot::Vector3 smoothed_direction = godot::Vector3(0, 1, 0);
+	bool has_smoothed = false;
+	bool was_active = false;
 };
 
 struct SoundfieldListenerData {
@@ -407,6 +433,10 @@ struct SoundfieldListenerData {
 
 	bool dsp_ready = false;
 	std::vector<SoundfieldListenerSectorDSP> sector_dsp;
+	SoundfieldListenerPortalDSP portals[SOUNDFIELD_PORTAL_COUNT];
+	// Short ring buffer decorrelating portal paths from dome sectors and from each other.
+	std::vector<float> portal_delay_ring;
+	size_t portal_delay_write_pos = 0;
 
 	std::mutex sim_state_mutex;
 	float last_outdoorness = 0.0f;
@@ -654,6 +684,8 @@ private:
 	SoundfieldListenerSectorDSP *find_soundfield_sector_dsp(SoundfieldListenerData &sfld, int sector_id);
 	bool ensure_soundfield_sector_dsp(SoundfieldListenerSectorDSP &dsp);
 	void cleanup_soundfield_sector_dsp(SoundfieldListenerSectorDSP &dsp);
+	bool ensure_soundfield_portal_dsp(SoundfieldListenerPortalDSP &portal);
+	void cleanup_soundfield_portal_dsp(SoundfieldListenerPortalDSP &portal);
 	void release_soundfield_listener_dsp(SoundfieldListenerData &sfld);
 	void cleanup_soundfield_listener_data(SoundfieldListenerData &sfld);
 
@@ -683,6 +715,7 @@ private:
 
 	godot::Ref<godot::AudioBuffer> mix_scratch_buffer;
 	godot::PackedVector2Array soundfield_mix_scratch;
+	godot::PackedFloat32Array soundfield_portal_scratch;
 	godot::Ref<godot::AudioBuffer> effect_src_buffer;
 	godot::Ref<godot::AudioBuffer> effect_dst_buffer;
 
@@ -789,6 +822,9 @@ public:
 	void soundfield_set_volume_db(godot::RID soundfield, float volume_db);
 	void soundfield_set_probe_distance(godot::RID soundfield, float distance);
 	void soundfield_set_smoothing_time(godot::RID soundfield, float seconds);
+	void soundfield_set_openness_exponent(godot::RID soundfield, float exponent);
+	void soundfield_set_aperture_boost(godot::RID soundfield, float boost);
+	void soundfield_set_portal_gain(godot::RID soundfield, float gain);
 	void soundfield_set_debug_name(godot::RID soundfield, const godot::String &name);
 	int soundfield_add_sector(godot::RID soundfield, const godot::Vector3 &direction, godot::Ref<godot::AudioStreamPlayback> playback, float volume_db = 0.0f, float pitch_scale = 1.0f, float from_position = 0.0f);
 	void soundfield_remove_sector(godot::RID soundfield, int sector_id);

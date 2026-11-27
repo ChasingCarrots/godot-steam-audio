@@ -64,6 +64,9 @@ private:
 	float volume_db = 0.0f;
 	float probe_distance = 32.0f;
 	float smoothing_time = 0.18f;
+	float openness_exponent = 0.5f;
+	float aperture_boost = 0.15f;
+	float portal_gain = 0.9f;
 	godot::TypedArray<SteamAudioSoundfieldSector> sectors;
 
 	std::vector<SectorDescriptor> active_sectors;
@@ -102,6 +105,15 @@ public:
 
 	float get_smoothing_time() const { return smoothing_time; }
 	void set_smoothing_time(float p_time);
+
+	float get_openness_exponent() const { return openness_exponent; }
+	void set_openness_exponent(float p_exponent);
+
+	float get_aperture_boost() const { return aperture_boost; }
+	void set_aperture_boost(float p_boost);
+
+	float get_portal_gain() const { return portal_gain; }
+	void set_portal_gain(float p_gain);
 
 	godot::TypedArray<SteamAudioSoundfieldSector> get_sectors() const { return sectors; }
 	void set_sectors(const godot::TypedArray<SteamAudioSoundfieldSector> &p_sectors);

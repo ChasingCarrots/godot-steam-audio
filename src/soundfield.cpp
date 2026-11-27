@@ -62,6 +62,18 @@ void SteamAudioSoundfield::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_smoothing_time", "seconds"), &SteamAudioSoundfield::set_smoothing_time);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "smoothing_time", PROPERTY_HINT_RANGE, "0.01,2.0,0.01,suffix:s"), "set_smoothing_time", "get_smoothing_time");
 
+	ClassDB::bind_method(D_METHOD("get_openness_exponent"), &SteamAudioSoundfield::get_openness_exponent);
+	ClassDB::bind_method(D_METHOD("set_openness_exponent", "exponent"), &SteamAudioSoundfield::set_openness_exponent);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "openness_exponent", PROPERTY_HINT_RANGE, "0.1,2.0,0.05"), "set_openness_exponent", "get_openness_exponent");
+
+	ClassDB::bind_method(D_METHOD("get_aperture_boost"), &SteamAudioSoundfield::get_aperture_boost);
+	ClassDB::bind_method(D_METHOD("set_aperture_boost", "boost"), &SteamAudioSoundfield::set_aperture_boost);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "aperture_boost", PROPERTY_HINT_RANGE, "0.0,1.0,0.02"), "set_aperture_boost", "get_aperture_boost");
+
+	ClassDB::bind_method(D_METHOD("get_portal_gain"), &SteamAudioSoundfield::get_portal_gain);
+	ClassDB::bind_method(D_METHOD("set_portal_gain", "gain"), &SteamAudioSoundfield::set_portal_gain);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "portal_gain", PROPERTY_HINT_RANGE, "0.0,1.5,0.05"), "set_portal_gain", "get_portal_gain");
+
 	ClassDB::bind_method(D_METHOD("get_sectors"), &SteamAudioSoundfield::get_sectors);
 	ClassDB::bind_method(D_METHOD("set_sectors", "sectors"), &SteamAudioSoundfield::set_sectors);
 	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "sectors", PROPERTY_HINT_TYPE_STRING, String::num(Variant::OBJECT) + "/" + String::num(PROPERTY_HINT_RESOURCE_TYPE) + ":SteamAudioSoundfieldSector"), "set_sectors", "get_sectors");
@@ -142,6 +154,9 @@ void SteamAudioSoundfield::push_config() {
 	srv->soundfield_set_volume_db(rid, volume_db);
 	srv->soundfield_set_probe_distance(rid, probe_distance);
 	srv->soundfield_set_smoothing_time(rid, smoothing_time);
+	srv->soundfield_set_openness_exponent(rid, openness_exponent);
+	srv->soundfield_set_aperture_boost(rid, aperture_boost);
+	srv->soundfield_set_portal_gain(rid, portal_gain);
 	srv->soundfield_set_debug_name(rid, get_name());
 }
 
@@ -228,6 +243,33 @@ void SteamAudioSoundfield::set_smoothing_time(float p_time) {
 	if (rid.is_valid()) {
 		if (auto *srv = SteamAudioServer::get_singleton()) {
 			srv->soundfield_set_smoothing_time(rid, smoothing_time);
+		}
+	}
+}
+
+void SteamAudioSoundfield::set_openness_exponent(float p_exponent) {
+	openness_exponent = CLAMP(p_exponent, 0.1f, 3.0f);
+	if (rid.is_valid()) {
+		if (auto *srv = SteamAudioServer::get_singleton()) {
+			srv->soundfield_set_openness_exponent(rid, openness_exponent);
+		}
+	}
+}
+
+void SteamAudioSoundfield::set_aperture_boost(float p_boost) {
+	aperture_boost = CLAMP(p_boost, 0.0f, 1.0f);
+	if (rid.is_valid()) {
+		if (auto *srv = SteamAudioServer::get_singleton()) {
+			srv->soundfield_set_aperture_boost(rid, aperture_boost);
+		}
+	}
+}
+
+void SteamAudioSoundfield::set_portal_gain(float p_gain) {
+	portal_gain = CLAMP(p_gain, 0.0f, 2.0f);
+	if (rid.is_valid()) {
+		if (auto *srv = SteamAudioServer::get_singleton()) {
+			srv->soundfield_set_portal_gain(rid, portal_gain);
 		}
 	}
 }
